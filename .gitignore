@@ -1,0 +1,10 @@
+build/
+Releases/
+Review/
+.DS_Store
+__pycache__/
+*.py[cod]
+Design/*
+!Design/MangaIcon-master.png
+!Design/Shiori-panel-light.png
+!Design/Shiori-panel-dark.png

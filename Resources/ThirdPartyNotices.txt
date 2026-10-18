@@ -1,0 +1,19 @@
+Shiori — open-source components and design references
+
+Installed separately by SETUP_OCR.command:
+Manga OCR — https://github.com/kha-white/manga-ocr — Apache-2.0
+Mokuro / Comic Text Detector — https://github.com/kha-white/mokuro
+LaMa — https://github.com/advimman/lama — Apache-2.0
+LaMa TorchScript weights — https://github.com/enesmsahin/simple-lama-inpainting/releases/tag/v0.1.0
+SHA-256: 7ba7aa7ac37a4d41fdbbeba3a2af7ead18058552997e3a3cd1a3b2210c9e6b4c
+
+Design and implementation references:
+BallonsTranslator — https://github.com/dmMaze/BallonsTranslator
+manga-image-translator — https://github.com/zyddnys/manga-image-translator
+Easydict — https://github.com/tisfeng/Easydict
+Ice — https://github.com/jordanbaird/Ice
+Settings — https://github.com/sindresorhus/Settings
+
+Model weights and Python dependencies are stored in Application Support/Shiori/OCR.
+They are not embedded in this application bundle. Their original licenses and
+package metadata are retained with the installed dependencies.

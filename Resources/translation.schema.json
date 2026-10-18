@@ -1,0 +1,12 @@
+{
+  "type": "object", "additionalProperties": false,
+  "required": ["status", "message", "translations"],
+  "properties": {
+    "status": {"type": "string", "enum": ["ok", "partial", "refused", "unreadable"]},
+    "message": {"type": "string"},
+    "translations": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["id", "text"],
+      "properties": {"id": {"type": "string"}, "text": {"type": "string"}}
+    }}
+  }
+}
