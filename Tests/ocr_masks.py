@@ -20,6 +20,36 @@ def decode(value):
     return cv2.imdecode(np.frombuffer(base64.b64decode(value), np.uint8), cv2.IMREAD_UNCHANGED)
 
 
+class UncertainFragmentTests(unittest.TestCase):
+    def run_reading(self, original, retry='未確認', budget=4):
+        image = np.full((40, 100, 3), 255, np.uint8)
+        hint = {'text': '文化祭', 'confidence': .4, 'box': [10, 5, 80, 30]}
+        calls = []
+        previous = worker['recognize_crops']
+        worker['recognize_crops'] = lambda ocr, crops: calls.append(crops[0].shape) or [retry]
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                remaining = [budget]
+                result = worker['confirm_fragments'](None, image, [0, 0, 100, 40], '文化祭の準備', original,
+                    [hint], Path(folder), remaining)
+                return result, calls, remaining
+        finally:
+            worker['recognize_crops'] = previous
+
+    def test_independent_agreement_clears_low_confidence_without_another_decode(self):
+        result, calls, remaining = self.run_reading('文化祭の準備')
+        self.assertEqual((result, calls, remaining), ([], [], [4]))
+
+    def test_only_the_doubtful_line_is_retried(self):
+        result, calls, remaining = self.run_reading('文代祭の準備', retry='文化祭')
+        self.assertEqual((result, calls, remaining), ([], [(25, 70, 3)], [3]))
+
+    def test_disagreement_and_budget_exhaustion_keep_uncertainty(self):
+        self.assertEqual(self.run_reading('文代祭')[0], ['文化祭'])
+        result, calls, remaining = self.run_reading('文代祭', retry='文化祭', budget=0)
+        self.assertEqual((result, calls, remaining), (['文化祭'], [], [0]))
+
+
 class GlyphReplacementTests(unittest.TestCase):
     def test_shaded_background_and_artwork_outside_glyphs_are_preserved(self):
         image = np.full((100, 140, 3), 210, np.uint8)

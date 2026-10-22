@@ -364,6 +364,42 @@ def reliable_hint(box, hints, original='', horizontal=False):
     return text if len(text.replace(' ', '')) >= len(original.replace(' ', '')) * .85 else None
 
 
+def confirm_fragments(ocr, image, box, text, original, hints, directory, budget):
+    """Cross-check doubtful Vision fragments, without treating confidence as illegibility.
+
+    Agreement with the independent full-block decoder needs no extra inference.
+    Otherwise retry only the relevant line crop, at most four times per page.
+    Disagreements remain explicit instead of replacing text with a new guess.
+    """
+    import unicodedata
+    def normalized(value):
+        return ''.join(c for c in unicodedata.normalize('NFKC', value) if c.isalnum())
+    unknown = []
+    for hint in hints:
+        fragment = hint['text']
+        if hint['confidence'] >= .5 or fragment not in text or not normalized(fragment):
+            continue
+        x1, y1, x2, y2 = hint['box']
+        overlap = max(0, min(box[2], x2)-max(box[0], x1))*max(0, min(box[3], y2)-max(box[1], y1))
+        if overlap < .85*max(1, (x2-x1)*(y2-y1)):
+            continue
+        target = normalized(fragment)
+        if target in normalized(original):
+            continue
+        confirmed = False
+        if budget[0] > 0 and not cancelled(directory):
+            height, width = image.shape[:2]
+            left, top = max(0, int(x1)), max(0, int(y1))
+            right, bottom = min(width, int(x2+.999)), min(height, int(y2+.999))
+            if right > left and bottom > top:
+                budget[0] -= 1
+                retry = recognize_crops(ocr, [image[top:bottom, left:right]])[0]
+                confirmed = normalized(retry) == target
+        if not confirmed and fragment not in unknown:
+            unknown.append(fragment)
+    return unknown
+
+
 def restore_voicing(text, box, hints):
     """Recover dropped dakuten only where independent OCR reads the same phrase."""
     import unicodedata
@@ -676,14 +712,17 @@ def main():
             result = []
             recognized = list(recognized_boxes(
                 ocr, image, boxes, languages, font_sizes, directory, 8 if device == 'mps' else 1, text_mask))
+            uncertainty_budget = [4]
             for index, component, box, text in sorted(recognized):
                 x1, y1, x2, y2 = box
+                original = text
                 hint = reliable_hint(box, hints, text, horizontal=not directions[component])
                 # Tight, multi-line handwriting is more reliable in Vision than a square manga crop.
                 if hint and component < 0 and len(hint) >= 4:
                     text = hint
                 text = restore_voicing(text, box, hints)
-                uncertain = [h['text'] for h in hints if h['confidence'] < .5 and h['text'] in text] if hint and component < 0 and not directions[component] else []
+                uncertain = confirm_fragments(ocr, image, box, text, original, hints, directory, uncertainty_budget) \
+                    if hint and component < 0 and not directions[component] else []
                 if not japanese_text(text, languages[component]):
                     # Keep "!!" and "…" in the original artwork; they are not failed OCR.
                     if not punctuation_only(text):

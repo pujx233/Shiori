@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import Foundation
 
 func makeFixture(_ destination: URL, vertical: Bool = false, shaded: Bool = false) throws {
@@ -182,6 +183,24 @@ func selfTest() throws {
     let recognized = OCRPage(blocks: [block], skippedCount: 0, elapsed: 0)
     let resolved = try TranslationReply(status: "ok", message: "", translations: [.init(id: "b1", text: "早上好")]).resolve(ocr: recognized)
     try check(resolved.dialogues.first?.bounds?.x == bubble.x, "translations retain local OCR coordinates")
+    let unclear = try TranslationReply(status: "partial", message: "局部待确认", translations: [
+        .init(id: "b1", text: "🌧明天[原文不清]一起去")]).resolve(ocr: recognized)
+    try check(unclear.dialogues[0].translation == "🌧明天□一起去"
+              && unclear.dialogues[0].uncertainRanges == [TextGap(location: 4, length: 1)]
+              && unclear.translatedCount == 1 && unclear.pendingCount == 1,
+              "uncertain fragments become UTF-16 presentation ranges without losing readable dialogue")
+    let unreadable = try TranslationReply(status: "partial", message: "", translations: [
+        .init(id: "b1", text: "[原文不清]")]).resolve(ocr: recognized)
+    try check(unreadable.preservedCount == 1 && unreadable.translatedCount == 0
+              && unreadable.dialogues[0].bounds?.x == bubble.x && unreadable.pendingCount == 1,
+              "an unreadable balloon keeps its original bounds and is not counted as translated")
+    let unreadablePage = try TranslationReply(status: "unreadable", message: "待确认", translations: []).resolve(ocr: recognized)
+    try check(unreadablePage.preservedCount == 1 && unreadablePage.skippedCount == 0,
+              "a reported unreadable page retains every original balloon without a repair loop")
+    try check(!TranslationReply.usable(source: "おはよう", translated: "おはよう□")
+              && TranslationReply.usable(source: "おはよう", translated: "早上□")
+              && !Dialogue.recognized(OCRBlock(id: "pause", text: "…", bounds: bubble), text: "…").needsReview,
+              "a gap cannot disguise unchanged Japanese and ordinary punctuation is not an OCR warning")
     let localPatch = OCRBlock(id: "patch", text: "おはよう", bounds: bubble, replacementPNG: Data([1, 2, 3]), textStyle: "outlinedLight")
     let patched = try TranslationReply(status: "ok", message: "", translations: [.init(id: "patch", text: "早上好")])
         .resolve(ocr: OCRPage(blocks: [localPatch], skippedCount: 0, elapsed: 0))
@@ -241,6 +260,12 @@ func selfTest() throws {
     try check(reused?.dialogues.map(\.translation) == ["早上好", "下雨了呢"], "identical ordered OCR reuses translations after window changes")
     try check(reused?.dialogues.first?.location == "new1" && reused?.dialogues.first?.bounds?.x == 10
               && reused?.dialogues.first?.replacementPNG == Data([3]), "reused text always binds to current IDs, coordinates and glyph patches")
+    try textCache.save(ocr: recognized, options: first, translation: unclear)
+    try check(textCache.lookup(ocr: recognized, options: first)?.dialogues.first?.uncertainRanges == unclear.dialogues[0].uncertainRanges,
+              "uncertain-fragment metadata survives text cache reuse")
+    try textCache.save(ocr: recognized, options: second, translation: unreadable)
+    try check(textCache.lookup(ocr: recognized, options: second)?.preservedCount == 1,
+              "an unreadable cached result cannot erase the original on return")
     try check(textCache.lookup(ocr: movedOCR, options: second) == nil
               && textCache.lookup(ocr: movedOCR, options: deep) == nil, "text cache isolates model and effort")
     let reversedOCR = OCRPage(blocks: Array(movedOCR.blocks.reversed()), skippedCount: 0, elapsed: 0)
@@ -275,11 +300,28 @@ func selfTest() throws {
     try check(finalCount == 1, "count limit also applies below the byte budget")
     try MainActor.assumeIsolated {
         try check(FittedText.make("早上好", rect: CGRect(x: 0, y: 0, width: 100, height: 50)) != nil, "complete translation fits")
+        let trimmedGap = FittedText.make(" \n🌧明□去", rect: CGRect(x: 0, y: 0, width: 150, height: 60),
+            maxFontSize: 18, gaps: [TextGap(location: 5, length: 1)])!
+        let gapRuns = (CTFrameGetLines(trimmedGap.frame) as! [CTLine]).flatMap { CTLineGetGlyphRuns($0) as! [CTRun] }
+        try check(gapRuns.contains { run in
+            let attributes = CTRunGetAttributes(run) as NSDictionary
+            let font = attributes[kCTFontAttributeName] as! CTFont
+            return CTRunGetStringRange(run).location == 3 && CTFontGetSize(font) < 14
+        }, "leading whitespace and emoji keep the small gap style on the correct character")
         try check(FittedText.make(String(repeating: "很长的译文", count: 40), rect: CGRect(x: 0, y: 0, width: 12, height: 12)) == nil,
                   "overflow keeps the original instead of truncating text")
         _ = NSApplication.shared
         let overlay = MangaOverlay()
         defer { overlay.stop() }
+        let unreadableEntry = CacheEntry(id: "unreadable-result", options: first, pageDigest: page.digest,
+            translation: unreadable, createdAt: Date(), elapsed: 1)
+        overlay.show(unreadableEntry, page: page, windowID: 0, processID: ProcessInfo.processInfo.processIdentifier, topInset: 0)
+        try check(overlay.renderedCount == 0 && overlay.omittedSummary.isEmpty,
+                  "unreadable originals are intentionally preserved, not reported as display failures")
+        try check(FittedText.flow(unclear.dialogues[0].translation,
+            regions: [CGRect(x: 0, y: 0, width: 100, height: 100), CGRect(x: 110, y: 0, width: 100, height: 100)],
+            style: nil, vertical: true, maxFontSize: 18, gaps: unclear.dialogues[0].uncertainRanges ?? [])?.count == 2,
+                  "connected balloons preserve uncertainty styling across a Unicode split")
         let hiddenTranslation = PageTranslation(summary: "", dialogues: [Dialogue(location: "b1", original: "おはよう",
             translation: "早上好", bounds: DialogueBounds(x: 550, y: 220, width: 387.5, height: 520))], notes: "")
         let hiddenEntry = CacheEntry(id: "background-result", options: first, pageDigest: page.digest,

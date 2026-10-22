@@ -44,7 +44,7 @@ final class LocalOCR: @unchecked Sendable {
     private var input: FileHandle?
     private var runtime: URL?
     private var log: FileHandle?
-    private let engineVersion = "manga-ocr-14"
+    private let engineVersion = "manga-ocr-15"
 
     init(support: URL, resources: URL, engineRoot: URL? = nil) throws {
         root = engineRoot ?? support.appendingPathComponent("OCR")

@@ -120,6 +120,8 @@ private final class TranslationCanvas: NSView {
         items = []; omissions = [:]
         var activeKeys = Set<String>()
         for dialogue in translation.dialogues {
+            // A completely unreadable balloon must keep its original pixels and bounds.
+            if dialogue.preserveOriginal == true { continue }
             guard dialogue.replacementAllowed != false else { omissions[.open, default: 0] += 1; continue }
             guard let imageRect = dialogue.bounds?.rect(in: size),
                   let rect = dialogue.bounds?.rect(in: bounds.size) else { omissions[.bounds, default: 0] += 1; continue }
@@ -130,7 +132,8 @@ private final class TranslationCanvas: NSView {
             let fontSize = dialogue.fontSize.map { CGFloat($0) * bounds.height / 1000 }
             let regions = dialogue.layoutRegions?.compactMap { $0.rect(in: bounds.size) } ?? [textRect]
             guard let texts = FittedText.flow(dialogue.translation, regions: regions.map { $0.insetBy(dx: 1, dy: 1) },
-                                            style: dialogue.textStyle, vertical: dialogue.vertical ?? false, maxFontSize: fontSize) else {
+                                            style: dialogue.textStyle, vertical: dialogue.vertical ?? false, maxFontSize: fontSize,
+                                            gaps: dialogue.uncertainRanges ?? []) else {
                 omissions[.length, default: 0] += 1; continue
             }
             let patch = dialogue.replacementPNG.flatMap { NSImage(data: $0) }
@@ -173,12 +176,17 @@ struct FittedText {
     }
 
     static func flow(_ text: String, regions: [CGRect], style: String?, vertical: Bool,
-                     maxFontSize: CGFloat?) -> [FittedText]? {
+                     maxFontSize: CGFloat?, gaps: [TextGap] = []) -> [FittedText]? {
         guard !regions.isEmpty else { return nil }
         if regions.count == 1 || text.count < regions.count*3 {
-            return make(text, rect: regions[0], style: style, vertical: vertical, maxFontSize: maxFontSize).map { [$0] }
+            return make(text, rect: regions[0], style: style, vertical: vertical, maxFontSize: maxFontSize, gaps: gaps).map { [$0] }
         }
         let characters = Array(text), area = regions.reduce(CGFloat.zero) { $0 + $1.width*$1.height }
+        func part(_ range: Range<Int>, in rect: CGRect) -> FittedText? {
+            let value = String(characters[range]), offset = String(characters[..<range.lowerBound]).utf16.count
+            let local = gaps.compactMap { $0.within(offset: offset, length: value.utf16.count) }
+            return make(value, rect: rect, style: style, vertical: vertical, maxFontSize: maxFontSize, gaps: local)
+        }
         if regions.count == 2 {
             let ideal = max(2, min(characters.count-2, Int(round(CGFloat(characters.count)*regions[0].width*regions[0].height/area))))
             let punctuation: Set<Character> = ["，", "。", "！", "？", "；", "、"]
@@ -188,12 +196,11 @@ struct FittedText {
                 return a == b ? $0 < $1 : a < b
             }
             for cut in cuts {
-                if let first = make(String(characters[..<cut]), rect: regions[0], style: style, vertical: vertical, maxFontSize: maxFontSize),
-                   let second = make(String(characters[cut...]), rect: regions[1], style: style, vertical: vertical, maxFontSize: maxFontSize) {
+                if let first = part(0..<cut, in: regions[0]), let second = part(cut..<characters.count, in: regions[1]) {
                     return [first, second]
                 }
             }
-            return vertical ? flow(text, regions: regions, style: style, vertical: false, maxFontSize: maxFontSize) : nil
+            return vertical ? flow(text, regions: regions, style: style, vertical: false, maxFontSize: maxFontSize, gaps: gaps) : nil
         }
         var start = 0, result: [FittedText] = []
         for (index, region) in regions.enumerated() {
@@ -204,17 +211,18 @@ struct FittedText {
                 let lower = max(start+2, end-3), upper = min(characters.count-2, end+4)
                 if lower < upper, let split = (lower..<upper).first(where: { punctuation.contains(characters[$0-1]) }) { end = split }
             }
-            guard end > start, let fitted = make(String(characters[start..<end]), rect: region, style: style,
-                                                vertical: vertical, maxFontSize: maxFontSize) else { return nil }
+            guard end > start, let fitted = part(start..<end, in: region) else { return nil }
             result.append(fitted); start = end
         }
         return result
     }
 
     static func make(_ text: String, rect: CGRect, style: String? = nil,
-                     vertical: Bool = false, maxFontSize: CGFloat? = nil) -> FittedText? {
+                     vertical: Bool = false, maxFontSize: CGFloat? = nil, gaps: [TextGap] = []) -> FittedText? {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, rect.width >= 8, rect.height >= 8 else { return nil }
+        let trimOffset = (text as NSString).range(of: value).location
+        let visibleGaps = gaps.compactMap { $0.within(offset: trimOffset, length: value.utf16.count) }
         let latinCount = value.unicodeScalars.filter { (65...90).contains($0.value) || (97...122).contains($0.value) }.count
         let vertical = vertical && !(latinCount >= 6 && latinCount * 2 > value.count)
         let paragraph = NSMutableParagraphStyle()
@@ -232,7 +240,13 @@ struct FittedText {
                 attributes[NSAttributedString.Key(kCTStrokeColorAttributeName as String)] = (style == "outlinedLight" ? NSColor.black : NSColor.white).cgColor
                 attributes[NSAttributedString.Key(kCTStrokeWidthAttributeName as String)] = -2
             }
-            let string = NSAttributedString(string: value, attributes: attributes)
+            let string = NSMutableAttributedString(string: value, attributes: attributes)
+            for gap in visibleGaps {
+                string.addAttributes([
+                    NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("PingFangSC-Regular" as CFString, max(6, size*0.72), nil),
+                    NSAttributedString.Key(kCTForegroundColorAttributeName as String): NSColor(white: style == "outlinedLight" ? 0.72 : 0.48, alpha: 1).cgColor
+                ], range: gap.range)
+            }
             let setter = CTFramesetterCreateWithAttributedString(string)
             func frame(_ box: CGRect) -> CTFrame {
                 CTFramesetterCreateFrame(setter, CFRange(location: 0, length: 0), CGPath(rect: box, transform: nil), frameAttributes as CFDictionary)
@@ -250,7 +264,7 @@ struct FittedText {
             }
             size -= 0.5
         }
-        return vertical ? make(text, rect: rect, style: style, vertical: false, maxFontSize: maxFontSize) : nil
+        return vertical ? make(text, rect: rect, style: style, vertical: false, maxFontSize: maxFontSize, gaps: gaps) : nil
     }
 }
 

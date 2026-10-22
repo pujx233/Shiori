@@ -56,7 +56,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             defaults.setPersistentDomain(previous.merging(current) { _, currentValue in currentValue }, forName: "local.sai.Shiori")
             defaults.set(true, forKey: "didMigrateSettings")
         }
-        defaults.removePersistentDomain(forName: "local.sai.KedaTranslate")
+        if let previous = defaults.persistentDomain(forName: "local.sai.KedaTranslate"), !previous.isEmpty {
+            defaults.removePersistentDomain(forName: "local.sai.KedaTranslate")
+        }
         defaults.removeObject(forKey: "didMigrateKedaSettings")
         defaults.removeObject(forKey: "NSWindow Frame KedaTranslateMain")
     }
@@ -605,7 +607,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                             pageDigest: page.digest, translation: partial, createdAt: Date(), elapsed: elapsed, timings: timings)
                         self.updateOverlay()
                         let rendered = self.overlay.renderedCount
-                        self.setStatus("翻译 \(partial.dialogues.count)/\(recognized.blocks.count) · 显示 \(rendered)")
+                        self.setStatus("已译 \(partial.translatedCount)/\(recognized.blocks.count) · 显示 \(rendered)")
                     }
                 }).0
                 return (translation, PageTimings(ocr: ocrTime, codex: Date().timeIntervalSince(codexStart), firstResult: firstResult))
@@ -650,18 +652,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func show(_ entry: CacheEntry, cached: Bool) {
         shownEntry = entry; modelError = nil; updateOverlay()
         if tracker.isSettling { setStatus("正在检查新页面…"); return }
-        let translated = entry.translation.dialogues.count
-        let total = translated + entry.translation.skippedCount
+        let translated = entry.translation.translatedCount
+        let total = entry.translation.dialogues.count + entry.translation.skippedCount
         let rendered = overlay.renderedCount
         let partial = overlayButton.state == .on
             ? "已译 \(translated)/\(total) · 显示 \(rendered)"
             : "已翻译 \(translated)/\(total) 处"
-        let incomplete = translated < total || (overlayButton.state == .on && rendered < translated)
-        let status = total == 0 ? "未检测到日文" : incomplete ? partial : entry.translation.unclearCount > 0
-            ? "已译 \(translated) · \(entry.translation.unclearCount) 处不清" : "翻译完成"
-        setStatus(status, error: total > 0 && translated == 0)
+        let status = total == 0 ? "未检测到日文" : entry.translation.pendingCount > 0
+            ? "已译 \(translated) · \(entry.translation.pendingCount) 处待确认"
+            : (overlayButton.state == .on && rendered < translated) ? partial : "翻译完成"
+        setStatus(status, error: total > 0 && translated == 0 && entry.translation.preservedCount == 0)
         let unrecognized = entry.translation.ocrSkippedCount ?? 0
         var details = ["检测到 \(total) 处候选文字：已译 \(translated) 处，未译 \(entry.translation.untranslatedCount) 处，未识字 \(unrecognized) 处。"]
+        if entry.translation.unclearCount > 0 {
+            details.append("\(entry.translation.unclearCount) 处待确认，其中 \(entry.translation.preservedCount) 处保留原图。")
+        }
         if overlayButton.state == .on, rendered < translated {
             details.append("\(translated-rendered) 处未显示：" + overlay.omittedSummary + "。右键可复制译文。")
         }

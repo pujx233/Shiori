@@ -36,6 +36,42 @@ enum AppError: LocalizedError {
     }
 }
 
+struct TextGap: Codable, Equatable {
+    let location: Int
+    let length: Int
+    var range: NSRange { NSRange(location: location, length: length) }
+
+    func within(offset: Int, length: Int) -> TextGap? {
+        let overlap = NSIntersectionRange(range, NSRange(location: offset, length: length))
+        return overlap.length == 0 ? nil : TextGap(location: overlap.location-offset, length: overlap.length)
+    }
+}
+
+// Convert model notation into presentation data before caching or typesetting.
+// Old replies remain readable, without placing diagnostic prose in the balloon.
+struct TranslationText {
+    let text: String
+    let gaps: [TextGap]
+    var hasReadableText: Bool { text.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) } }
+
+    init(_ raw: String) {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for marker in ["[原文不清]", "［原文不清］", "【原文不清】"] {
+            value = value.replacingOccurrences(of: marker, with: "□")
+        }
+        text = value
+        let string = value as NSString
+        var found: [TextGap] = [], start = 0
+        while start < string.length {
+            let range = string.range(of: "□", range: NSRange(location: start, length: string.length-start))
+            if range.location == NSNotFound { break }
+            found.append(TextGap(location: range.location, length: range.length))
+            start = NSMaxRange(range)
+        }
+        gaps = found
+    }
+}
+
 struct Dialogue: Codable {
     let location: String
     let original: String
@@ -48,6 +84,20 @@ struct Dialogue: Codable {
     var layoutRegions: [DialogueBounds]? = nil
     var vertical: Bool? = nil
     var fontSize: Double? = nil
+    var uncertainRanges: [TextGap]? = nil
+    var preserveOriginal: Bool? = nil
+
+    var needsReview: Bool { preserveOriginal == true || !(uncertainRanges ?? []).isEmpty }
+
+    static func recognized(_ block: OCRBlock, text: String) -> Dialogue {
+        let reading = TranslationText(text)
+        return Dialogue(location: block.id, original: block.text, translation: reading.text, bounds: block.bounds,
+                        replacementPNG: block.replacementPNG, replacementAllowed: block.replacementAllowed,
+                        textStyle: block.textStyle, layoutBounds: block.layoutBounds, layoutRegions: block.layoutRegions,
+                        vertical: block.vertical, fontSize: block.fontSize,
+                        uncertainRanges: reading.gaps.isEmpty ? nil : reading.gaps,
+                        preserveOriginal: !reading.gaps.isEmpty && !reading.hasReadableText ? true : nil)
+    }
 }
 
 struct DialogueBounds: Codable {
@@ -73,7 +123,10 @@ struct PageTranslation: Codable {
     var ocrSkippedCount: Int? = nil
 
     var untranslatedCount: Int { max(0, skippedCount - (ocrSkippedCount ?? 0)) }
-    var unclearCount: Int { dialogues.filter { $0.translation.contains("原文不清") }.count }
+    var unclearCount: Int { dialogues.filter(\.needsReview).count }
+    var preservedCount: Int { dialogues.filter { $0.preserveOriginal == true }.count }
+    var translatedCount: Int { dialogues.count - preservedCount }
+    var pendingCount: Int { skippedCount + unclearCount }
 }
 
 struct ModelInfo: Codable {
@@ -89,7 +142,7 @@ struct TranslationOptions: Codable, Equatable {
     var model: String
     var effort: String
     // Increment when the prompt, OCR grouping or reading-order rules change.
-    var promptVersion = 16
+    var promptVersion = 17
     var context = ""
     var cacheNamespace: String { "\(model)|\(effort)|zh-Hans|\(promptVersion)" }
     var readingScope: String { cacheNamespace + "|" + context }
@@ -330,11 +383,7 @@ struct TextTranslationCache: Sendable {
               entry.sources == ocr.blocks.map(\.text), entry.translations.count == ocr.blocks.count,
               entry.translations.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else { return nil }
         CacheFiles.touch(url)
-        let dialogues = zip(ocr.blocks, entry.translations).map { block, text in
-            Dialogue(location: block.id, original: block.text, translation: text,
-                     bounds: block.bounds, replacementPNG: block.replacementPNG, replacementAllowed: block.replacementAllowed,
-                     textStyle: block.textStyle, layoutBounds: block.layoutBounds, layoutRegions: block.layoutRegions, vertical: block.vertical, fontSize: block.fontSize)
-        }
+        let dialogues = zip(ocr.blocks, entry.translations).map { Dialogue.recognized($0.0, text: $0.1) }
         return PageTranslation(summary: "", dialogues: dialogues, notes: entry.notes,
                                skippedCount: ocr.skippedCount, ocrSkippedCount: ocr.skippedCount)
     }
@@ -623,7 +672,8 @@ private final class ReadingMemory: @unchecked Sendable {
         if self.scope != scope { self.scope = scope; pages = [] }
         let sources = page.dialogues.map(\.original)
         pages.removeAll { $0.sources == sources }
-        let text = page.dialogues.map { "\($0.original) → \($0.translation)" }.joined(separator: "\n")
+        let text = page.dialogues.filter { !$0.needsReview }.map { "\($0.original) → \($0.translation)" }.joined(separator: "\n")
+        guard !text.isEmpty else { return }
         pages.append((sources, String(text.prefix(900))))
         pages = Array(pages.suffix(2))
     }
@@ -636,8 +686,10 @@ struct TranslationReply: Codable {
     let translations: [Item]
 
     static func usable(source: String, translated: String) -> Bool {
-        let value = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reading = TranslationText(translated)
+        let value = reading.text
         guard !value.isEmpty else { return false }
+        if !reading.gaps.isEmpty && !reading.hasReadableText { return true }
         let hasWords = { (s: String) in s.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) } }
         if hasWords(source) && !hasWords(value) { return false }
         let letters = { (s: String) in Array(s.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }) }
@@ -646,21 +698,21 @@ struct TranslationReply: Codable {
     }
 
     func resolve(ocr: OCRPage, allowIncomplete: Bool = false) throws -> PageTranslation {
-        guard status == "ok" || status == "partial" else {
+        guard status == "ok" || status == "partial" || status == "unreadable" else {
             throw AppError.message(message.isEmpty ? "模型未能翻译此页。" : "模型未翻译：" + message)
         }
-        let expected = Set(ocr.blocks.map(\.id)), actual = translations.map(\.id)
+        let items = status == "unreadable" && translations.isEmpty
+            ? ocr.blocks.map { Item(id: $0.id, text: "□") } : translations
+        let expected = Set(ocr.blocks.map(\.id)), actual = items.map(\.id)
         guard Set(actual).count == actual.count, Set(actual).isSubset(of: expected),
               allowIncomplete || status != "ok" || Set(actual) == expected,
-              !translations.isEmpty, translations.allSatisfy({ !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+              !items.isEmpty, items.allSatisfy({ !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
             throw AppError.message("译文与气泡未能对应，请重试。")
         }
-        let mapped = Dictionary(uniqueKeysWithValues: translations.map { ($0.id, $0.text) })
+        let mapped = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0.text) })
         let dialogues = ocr.blocks.compactMap { block -> Dialogue? in
             guard let text = mapped[block.id], Self.usable(source: block.text, translated: text) else { return nil }
-            return Dialogue(location: block.id, original: block.text, translation: text, bounds: block.bounds,
-                            replacementPNG: block.replacementPNG, replacementAllowed: block.replacementAllowed, textStyle: block.textStyle,
-                            layoutBounds: block.layoutBounds, layoutRegions: block.layoutRegions, vertical: block.vertical, fontSize: block.fontSize)
+            return Dialogue.recognized(block, text: text)
         }
         return PageTranslation(summary: "", dialogues: dialogues, notes: message,
                                skippedCount: ocr.skippedCount + ocr.blocks.count - dialogues.count,

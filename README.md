@@ -5,6 +5,7 @@
 选择正在使用的软件、模型和推理，点「开始阅读」。翻页后自动识字、翻译并回填原位置；取消「显示译文」可查看原图。
 
 - 保留竖排，连体气泡分别排字，译文随返回逐步显示。
+- 局部疑点先比对并重识；仍有缺字时用小号灰色 `□`，可读部分继续翻译。整句无法辨认则保留原图，底部统一显示待确认数量。
 - 补识别气泡外的拟声词；复杂背景用本地 LaMa 修复，纯色区域直接回填。
 - 右键菜单栏图标可补齐译文、重新翻译、重新识字、复制译文和退出。
 - 识字在本地完成，Codex 只接收文字，使用已登录的 ChatGPT 账号，无需 API Key。
@@ -44,5 +45,7 @@ Apple Silicon、macOS 14+、Codex、Apple Command Line Tools 和 uv。
 识字使用 [Manga OCR](https://github.com/kha-white/manga-ocr) 和 [Mokuro / Comic Text Detector](https://github.com/kha-white/mokuro)，版本见 `Resources/ocr-requirements.txt`。
 
 背景修复使用 [LaMa](https://github.com/advimman/lama)，权重来自 [simple-lama-inpainting 的官方发布](https://github.com/enesmsahin/simple-lama-inpainting/releases/tag/v0.1.0)，安装时校验 SHA-256。OCR 按文字长度分批、局部修复与识字并行；未检测为文字框的笔画从已有分割图中补检。
+
+疑点处理参考 [manga-image-translator 的识别质量过滤](https://github.com/zyddnys/manga-image-translator/blob/main/manga_translator/ocr/model_48px.py)，以及 [Mokuro Reader 的原图与文字层分离](https://github.com/Gnathonic/mokuro-reader/blob/main/src/lib/components/Reader/MangaPage.svelte)。两套本地识别结果一致时直接确认；仍有分歧时只重识对应的小区域，每页最多四次。不确定片段单独记录，字号适配、流式回填和缓存都保留这一状态。
 
 排版参考 [BallonsTranslator](https://github.com/dmMaze/BallonsTranslator) 与 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) 的文字方向和区域适配；连接管理参考 [Easydict](https://github.com/tisfeng/Easydict)；界面参考 [Ice](https://github.com/jordanbaird/Ice) 与 [Settings](https://github.com/sindresorhus/Settings) 的对齐、分组和系统控件。
