@@ -55,6 +55,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var statusText = "选择软件"
     private var statusIsError = false
     private var operationEpoch = 0
+    private var isCorrectingBubble = false
+    private var correctionRunner: CommandRunner?
+    private var correctionID: UUID?
+    private var correctionCandidates: (digest: String, dialogues: [Dialogue])?
     private let defaults = UserDefaults.standard
 
     private func migratePreviousSettings() {
@@ -75,6 +79,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     func applicationDidFinishLaunching(_ notification: Notification) {
         migratePreviousSettings()
         buildMenu(); buildWindow(); buildStatusMenu()
+        overlay.onBubbleAction = { [weak self] id, action in self?.correctBubble(id: id, action: action) }
+        overlay.onEditingChanged = { [weak self] editing in
+            guard let self else { return }
+            self.isCorrectingBubble = editing
+            if editing {
+                self.settlingProbe?.cancel(); self.settlingProbe = nil
+                self.setStatus("点选要修正的气泡")
+            } else {
+                self.correctionRunner?.cancel(); self.correctionRunner = nil; self.correctionID = nil
+                self.settlingProbe?.cancel(); self.settlingProbe = nil; self.didConfirmCandidate = false
+                self.probeTracker.reset(); self.lastProbeDigest = nil
+                // Revalidate the underlying reader before showing any edited
+                // snapshot: the user may have scrolled while the editor was open.
+                self.overlay.hide()
+                if self.shownEntry != nil { self.setStatus("正在检查新页面…") }
+            }
+        }
         do {
             let support = try AppStorage.directory()
             cache = try TranslationCache(directory: support.appendingPathComponent("Translations"))
@@ -140,6 +161,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         appMenu.addItem(withTitle: "退出 Shiori", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let editItem = NSMenuItem(); editItem.title = "编辑"; menu.addItem(editItem)
         let edit = NSMenu(title: "编辑"); editItem.submenu = edit
+        edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         edit.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
@@ -166,6 +192,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         menu.addItem(withTitle: "重新翻译", action: #selector(retranslate), keyEquivalent: "").target = self
         menu.addItem(withTitle: "重新识字", action: #selector(rerecognize), keyEquivalent: "").target = self
+        let correction = menu.addItem(withTitle: "修正气泡…", action: #selector(editBubble), keyEquivalent: "")
+        correction.target = self
+        correction.toolTip = "点选气泡后可修改原文和译文。阅读时按住 ⌥ 查看原图。"
         menu.addItem(withTitle: "复制译文", action: #selector(copyTranslation), keyEquivalent: "").target = self
         menu.addItem(withTitle: "返回阅读窗口", action: #selector(showReader), keyEquivalent: "").target = self
         let needsScreen = !CGPreflightScreenCaptureAccess()
@@ -250,6 +279,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         add(fieldGroup)
         autoButton = NSButton(checkboxWithTitle: "自动翻译", target: self, action: #selector(toggleAuto))
         overlayButton = NSButton(checkboxWithTitle: "显示译文", target: self, action: #selector(toggleOverlay))
+        overlayButton.toolTip = "按住 ⌥ 临时查看原图；右键 Shiori 图标可修正气泡。"
         for toggle in [autoButton!, overlayButton!] {
             toggle.font = .systemFont(ofSize: 11); toggle.controlSize = .small
             toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true
@@ -411,8 +441,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(editBubble) {
+            return runner == nil && !captureBusy && correctionRunner == nil && shownEntry != nil && latestPage != nil
+        }
         if item.action == #selector(translateCurrent) || item.action == #selector(retranslate) || item.action == #selector(rerecognize) {
-            return runner == nil && !captureBusy && capture.source != nil && translationAvailable
+            return runner == nil && !captureBusy && !isCorrectingBubble && capture.source != nil && translationAvailable
         }
         if item.action == #selector(stopClicked) { return runner != nil || autoButton.state == .on }
         if item.action == #selector(copyTranslation) { return shownEntry != nil }
@@ -552,7 +585,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 }
             }
         }
-        guard !captureBusy, autoButton.state == .on || runner != nil || shownEntry != nil else { return }
+        if isCorrectingBubble { await validateCorrectionPage(); return }
+        guard correctionRunner == nil, !captureBusy,
+              autoButton.state == .on || runner != nil || shownEntry != nil else { return }
         guard let source = capture.source else { return }
         guard source.application?.isTerminated == false else { stopWork(); overlay.hide(); refreshApplications(); setStatus("阅读软件已关闭"); return }
         let foreground = NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -650,6 +685,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
               let page = latestPage, page.digest == entry.pageDigest,
               let target = capture.selectedID, let source = capture.source else { overlay.hide(); return }
         overlay.show(entry, page: page, windowID: target, processID: source.processID, topInset: capture.topInset)
+        if correctionCandidates?.digest == page.digest {
+            overlay.setCorrectionCandidates(correctionCandidates?.dialogues ?? [])
+        }
     }
 
     private func submit(_ page: CapturedPage, force: Bool, refreshOCR: Bool = false) {
@@ -665,7 +703,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         pageFailure = nil
         tracker.markSubmitted(page.digest)
         let cached = force ? nil : cache.lookup(page: page, options: selected)
+        let corrections = cached?.translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true } ?? []
         if let entry = cached {
+            if let recognized = ocr.cachedRecognition(for: page) { setCorrectionCandidates(recognized, digest: page.digest) }
             show(entry, cached: true)
             if entry.translation.untranslatedCount == 0 { return }
         }
@@ -686,14 +726,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
         }
         let group = translationGroup
+        let recognition = RecognitionSnapshot()
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             defer { group.leave() }
             let result = Result {
-                try TranslationPipeline.run(runner: jobRunner, began: began, recognize: { textReady in
+                try TranslationPipeline.run(runner: jobRunner, began: began, corrections: corrections, recognize: { textReady in
                     var ready = false
-                    return try ocr.recognize(page: page, runner: jobRunner, force: refreshOCR,
-                        progress: { if !ready { report($0) } }, onTextReady: { ready = true; textReady($0) })
+                    let final = try ocr.recognize(page: page, runner: jobRunner, force: refreshOCR,
+                        progress: { if !ready { report($0) } }, onTextReady: {
+                            let adjusted = TranslationPipeline.applyingCorrections($0, corrections: corrections)
+                            recognition.update(adjusted); ready = true; textReady(adjusted)
+                        })
+                    let adjusted = TranslationPipeline.applyingCorrections(final, corrections: corrections)
+                    recognition.update(adjusted, final: true)
+                    return adjusted
                 }, translate: { recognized, preview in
                     let accepted = DispatchQueue.main.sync { () -> Bool in
                         MainActor.assumeIsolated {
@@ -707,8 +754,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                             force: force, seed: cached?.translation, progress: report, preview: preview).0
                     }
                     guard let client else { throw AppError.configuration("请先安装并登录 Codex。") }
+                    let context = recognition.snapshot()
+                    let isWholePage = context.final && context.page?.blocks.map(\.id) == recognized.blocks.map(\.id)
                     return try client.translate(ocr: recognized, options: selected, runner: jobRunner,
-                        force: force, seed: cached?.translation, progress: report, preview: preview).0
+                        force: force, seed: cached?.translation, rememberResult: false,
+                        pageContext: context.page, cacheResult: isWholePage, progress: report, preview: preview).0
                 }, preview: { partial, timings in
                     let elapsed = Date().timeIntervalSince(began)
                     DispatchQueue.main.async {
@@ -725,9 +775,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             DispatchQueue.main.async {
                 guard let self, self.requestID == taskID else { return }
                 self.finishBusyState()
+                if let recognized = recognition.read() { self.setCorrectionCandidates(recognized, digest: page.digest) }
                 switch result {
                 case .success(let (translation, timings)):
                     do {
+                        if selected.provider == .codex {
+                            client?.remember(page: translation, options: selected, ocr: recognition.read())
+                        }
                         guard let currentCache = self.cache else { return }
                         let entry = try currentCache.save(page: page, options: selected, translation: translation,
                                                          elapsed: Date().timeIntervalSince(began), timings: timings)
@@ -798,6 +852,157 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         statusLabel.toolTip = details.joined(separator: "\n")
         detailLabel.stringValue = cached ? "" : String(format: "%.1f 秒", entry.elapsed)
     }
+    private func validateCorrectionPage() async {
+        guard !captureBusy, let page = latestPage, let source = capture.source,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == source.processID else { return }
+        captureBusy = true
+        defer { captureBusy = false }
+        let epoch = operationEpoch
+        do {
+            // ScreenCaptureKit reads only the reader window, so the editor and
+            // selection outlines cannot be mistaken for a new manga page.
+            let current = try await capture.capture()
+            guard isCorrectingBubble, operationEpoch == epoch else { return }
+            let selected = overlay.selectedBubbleID
+            let translated = shownEntry?.translation.dialogues ?? []
+            var body = translated.filter {
+                $0.location == selected || ($0.textStyle == nil && ($0.bounds?.y ?? 0) >= 100)
+            }.compactMap(\.bounds)
+            if let selected, correctionCandidates?.digest == page.digest,
+               !translated.contains(where: { $0.location == selected && $0.bounds != nil }),
+               let bounds = correctionCandidates?.dialogues.first(where: { $0.location == selected })?.bounds {
+                body.append(bounds)
+            }
+            // Reader controls can animate on pointer movement. Compare the
+            // original bubble pixels instead, including the selected bubble.
+            let unchanged = body.isEmpty ? current.hasSameContent(as: page)
+                : current.hasSameTextRegions(as: page, regions: body)
+            if !unchanged {
+                overlay.endCorrection()
+                overlay.hide()
+                setStatus("正在检查新页面…")
+            }
+        } catch {
+            guard isCorrectingBubble, operationEpoch == epoch else { return }
+            overlay.endCorrection(); overlay.hide()
+            setStatus(error is ReadingScopeError ? "等待原阅读页面…" : "等待阅读窗口…")
+        }
+    }
+
+    private func setCorrectionCandidates(_ recognized: OCRPage, digest: String) {
+        correctionCandidates = (digest, recognized.blocks.map {
+            var value = Dialogue.recognized($0, text: "")
+            value.preserveOriginal = true
+            return value
+        })
+    }
+
+    @objc private func editBubble() {
+        guard runner == nil, !captureBusy, let page = latestPage, shownEntry?.pageDigest == page.digest else { return }
+        if correctionCandidates?.digest != page.digest, let recognized = ocr?.cachedRecognition(for: page) {
+            setCorrectionCandidates(recognized, digest: page.digest)
+        }
+        popover.performClose(nil)
+        overlayButton.state = .on; defaults.set(true, forKey: "showOverlay")
+        showReader(); updateOverlay()
+        if !overlay.beginCorrection() { setStatus("这页没有可选择的气泡") }
+    }
+
+    private func saveCorrection(_ dialogue: Dialogue, page: CapturedPage, selected: TranslationOptions) throws {
+        guard let current = shownEntry, current.pageDigest == page.digest, current.options == selected,
+              let cache else { throw AppError.message("页面已改变，请重新选择气泡。") }
+        let order = correctionCandidates?.digest == page.digest
+            ? correctionCandidates!.dialogues.map(\.location) : current.translation.dialogues.map(\.location)
+        let updated = BubbleCorrection.replacing(dialogue, in: current.translation, order: order)
+        let entry = try cache.save(page: page, options: selected, translation: updated,
+                                   elapsed: current.elapsed, timings: current.timings)
+        if updated.untranslatedCount == 0, pageFailure?.digest == page.digest { pageFailure = nil }
+        show(entry, cached: true)
+    }
+
+    private func correctBubble(id: String, action: BubbleEditAction) {
+        guard isCorrectingBubble, correctionRunner == nil, let page = latestPage,
+              let entry = shownEntry, entry.pageDigest == page.digest,
+              let original = entry.translation.dialogues.first(where: { $0.location == id })
+                ?? (correctionCandidates?.digest == page.digest
+                    ? correctionCandidates?.dialogues.first(where: { $0.location == id }) : nil) else {
+            overlay.finishBubbleAction(id: id, dialogue: nil, error: "页面已改变，请重新选择气泡。")
+            return
+        }
+        let selected = options
+        do {
+            switch action {
+            case .save(let source, let translation):
+                let value = try BubbleCorrection.edited(original, source: source, translation: translation)
+                try saveCorrection(value, page: page, selected: selected)
+                overlay.finishBubbleAction(id: id, dialogue: value)
+                return
+            case .restoreOriginal:
+                let value = BubbleCorrection.restored(original)
+                try saveCorrection(value, page: page, selected: selected)
+                overlay.finishBubbleAction(id: id, dialogue: value)
+                return
+            case .recognize, .translate: break
+            }
+            guard translationAvailable, let ocr else { throw AppError.message("翻译服务尚未就绪。") }
+            let taskID = UUID(), jobRunner = CommandRunner()
+            correctionID = taskID; correctionRunner = jobRunner
+            let client = client, google = google, group = translationGroup
+            let context = OCRPage(blocks: entry.translation.dialogues.compactMap { try? BubbleCorrection.block(from: $0) },
+                                  skippedCount: 0, elapsed: 0)
+            setStatus("正在修正气泡…")
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                defer { group.leave() }
+                let result = Result { () throws -> Dialogue in
+                    try jobRunner.checkCancellation()
+                    var block: OCRBlock
+                    switch action {
+                    case .recognize:
+                        let region = try BubbleCorrection.crop(original, from: page)
+                        let text = try ocr.recognizeBubble(page: region, runner: jobRunner)
+                        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                            throw AppError.message("没有识别到文字，可以直接修改原文。")
+                        }
+                        block = try BubbleCorrection.block(from: original, source: text)
+                    case .translate(let source): block = try BubbleCorrection.block(from: original, source: source)
+                    default: throw CancellationError()
+                    }
+                    let single = OCRPage(blocks: [block], skippedCount: 0, elapsed: 0)
+                    let result: PageTranslation
+                    if selected.provider == .google, let google {
+                        result = try google.translate(ocr: single, options: selected, runner: jobRunner, force: true).0
+                    } else if let client {
+                        result = try client.translate(ocr: single, options: selected, runner: jobRunner, force: true,
+                                                      rememberResult: false, pageContext: context, cacheResult: false).0
+                    } else { throw AppError.message("翻译服务尚未就绪。") }
+                    try jobRunner.checkCancellation()
+                    guard let value = result.dialogues.first(where: { $0.location == id }) else {
+                        throw AppError.message("这个气泡未返回译文，请重试或手动填写。")
+                    }
+                    var edited = value
+                    edited.userEdited = true
+                    return edited
+                }
+                DispatchQueue.main.async {
+                    guard let self, self.correctionID == taskID else { return }
+                    self.correctionRunner = nil; self.correctionID = nil
+                    guard self.isCorrectingBubble, self.latestPage?.digest == page.digest, self.options == selected else { return }
+                    do {
+                        let value = try result.get()
+                        try self.saveCorrection(value, page: page, selected: selected)
+                        self.overlay.finishBubbleAction(id: id, dialogue: value)
+                    } catch {
+                        self.overlay.finishBubbleAction(id: id, dialogue: nil, error: error.localizedDescription)
+                        self.setStatus(error.localizedDescription, error: !(error is CancellationError))
+                    }
+                }
+            }
+        } catch {
+            overlay.finishBubbleAction(id: id, dialogue: nil, error: error.localizedDescription)
+        }
+    }
+
     private func finishBusyState() {
         runner = nil; requestID = nil; requestDigest = nil; startTime = nil
         timerStatus?.invalidate(); timerStatus = nil; spinner.stopAnimation(nil); spinner.isHidden = true
@@ -809,6 +1014,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         tracker.reset(); probeTracker.reset(); lastProbeDigest = nil
     }
     private func stopWork() {
+        overlay.endCorrection()
+        correctionRunner?.cancel(); correctionRunner = nil; correctionID = nil
         operationEpoch += 1; autoButton?.state = .off
         capture.endReading()
         resetTracking(); cancelTranslation()

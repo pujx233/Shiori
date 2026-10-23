@@ -8,6 +8,8 @@ import time
 import json
 from concurrent.futures import Future
 from types import SimpleNamespace
+from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -159,11 +161,119 @@ class TextHandoffTests(unittest.TestCase):
             self.assertEqual([b['id'] for b in draft['blocks']], ['b1'])
             self.assertEqual([b['id'] for b in final['blocks']], ['b1'])
 
+    def test_geometry_id_collision_does_not_duplicate_an_open_region(self):
+        block = dict(self.block('t1_2_3_4'), textStyle='outlinedDark')
+        self.assertEqual(len(worker['unique_blocks']([block, dict(block)])), 1)
+
     def test_repair_timeout_exception_is_not_confused_with_pending_future(self):
         with tempfile.TemporaryDirectory() as folder:
             failed = Future(); failed.set_exception(TimeoutError('repair failed'))
             with self.assertRaises(TimeoutError):
                 worker['finish_page'](Path(folder), [self.block()], 0, {'b1': failed}, time.monotonic())
+
+
+class ProgressivePageTests(unittest.TestCase):
+    def test_closed_balloon_precedes_vision_and_reuses_ocr_and_patch(self):
+        image = np.full((240, 400, 3), 220, np.uint8)
+        for box in [(240, 20, 380, 150), (20, 40, 140, 190)]:
+            cv2.rectangle(image, box[:2], box[2:], (0, 0, 0), 2)
+            cv2.rectangle(image, (box[0]+2, box[1]+2), (box[2]-2, box[3]-2), (255, 255, 255), -1)
+        detected = SimpleNamespace(xyxy=[280, 40, 330, 110], language='ja', font_size=16, vertical=True)
+        class Detector:
+            input_size = None
+            calls = 0
+            def __call__(self, image):
+                self.calls += 1
+                mask = np.zeros(image.shape[:2], np.uint8)
+                return mask, mask, [detected]
+        calls, patches, repair_release = [], [], threading.Event()
+        def recognized(ocr, image, boxes, languages, fonts, directory, batch, mask):
+            time.sleep(.025)  # Give the independent repair future a chance to complete.
+            for index, (component, box) in enumerate(boxes):
+                calls.append((component, tuple(box)))
+                yield index, component, box, 'おはよう' if box[0] > 200 else 'こんにちは'
+        def repair(image, mask, box, *args, **kwargs):
+            patches.append(tuple(box))
+            repair_release.wait(2)
+            return 'closed-png'
+        replacements = {
+            'recover_candidates': lambda *args: [], 'separate_caption_lines': lambda found: found,
+            'recognized_boxes': recognized, 'replacement_patch': repair,
+            'reliable_hint': lambda *args, **kwargs: None,
+            'restore_voicing': lambda text, box, hints: text + ('ね' if box[0] > 200 and hints else ''),
+            'reconcile_fragments': lambda ocr, image, box, text, *args: (text, []),
+            'confirm_fragments': lambda *args: [],
+        }
+        with tempfile.TemporaryDirectory() as folder, ThreadPoolExecutor(max_workers=1) as repairs, patch.dict(worker, replacements):
+            directory, detector, errors = Path(folder), Detector(), []
+            def run():
+                try:
+                    worker['recognize_page'](directory, image, detector, None, None, repairs, None,
+                        'mps', True, time.monotonic(), {})
+                except BaseException as error:
+                    errors.append(error)
+            task = threading.Thread(target=run); task.start()
+            deadline = time.monotonic()+2
+            while not (directory/'text.json').exists() and not errors and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertFalse(errors)
+            early = json.loads((directory/'text.json').read_text())
+            self.assertTrue(task.is_alive(), 'Vision is still pending while the first balloon is published')
+            self.assertEqual(len(early['blocks']), 1)
+            self.assertFalse(early['blocks'][0]['replacementAllowed'], 'unfinished repair cannot erase artwork')
+            self.assertEqual(early['blocks'][0]['text'], 'おはよう')
+            repair_release.set()
+            deadline = time.monotonic()+1
+            while time.monotonic() < deadline:
+                ready = json.loads((directory/'text.json').read_text())
+                if ready['blocks'][0]['replacementAllowed']:
+                    break
+                time.sleep(.005)
+            self.assertTrue(ready['blocks'][0]['replacementAllowed'], 'completed patch is published before Vision returns')
+            self.assertTrue(task.is_alive())
+            worker['write_json'](directory, 'hints', [{'text': 'こんにちは', 'confidence': .9, 'box': [50, 70, 100, 140]}])
+            task.join(2)
+            self.assertFalse(task.is_alive()); self.assertFalse(errors)
+            final = json.loads((directory/'state.json').read_text())['page']
+            self.assertEqual(len(final['blocks']), 2, 'Vision-only balloon is included in the final page')
+            verified = next(block for block in final['blocks'] if block['id'] == early['blocks'][0]['id'])
+            self.assertEqual(verified['text'], 'おはようね', 'final review can update text without changing bubble identity')
+            self.assertEqual(len(calls), 2, 'each unchanged crop is decoded only once')
+            self.assertEqual(len(patches), 2, 'the finished early repair is reused')
+            self.assertEqual(detector.calls, 1)
+
+    def test_identifiers_do_not_depend_on_reading_order_or_open_group_index(self):
+        identity = worker['block_identifier']
+        self.assertEqual(identity(23, [1, 2, 3, 4]), identity(23, [1, 2, 5, 6]))
+        self.assertEqual(identity(-1, [1, 2, 3, 4]), identity(-7, [1, 2, 3, 4]))
+        self.assertNotEqual(identity(-1, [1, 2, 3, 4]), identity(-1, [1, 2, 3, 5]))
+
+
+class SelectedBubbleTests(unittest.TestCase):
+    def test_full_crop_preserves_multiple_columns_without_detector(self):
+        image = np.full((100, 80, 3), 255, np.uint8)
+        image[10:80, 20:25] = 0; image[10:70, 55:60] = 0
+        crops = []
+        def ocr(crop):
+            crops.append(np.asarray(crop))
+            return '俺が顧問になったからには'
+        with tempfile.TemporaryDirectory() as folder:
+            text = worker['recognize_bubble'](ocr, image, Path(folder))
+        self.assertEqual(text, '俺が顧問になったからには')
+        self.assertEqual(len(crops), 1)
+        self.assertTrue(np.array_equal(crops[0], image))
+
+    def test_blank_and_punctuation_never_become_a_correction(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            blank = np.full((100, 80, 3), 255, np.uint8)
+            def fail(crop):
+                raise AssertionError('blank crop must not invoke decoder')
+            self.assertIsNone(worker['recognize_bubble'](fail, blank, directory))
+            blank[20:40, 20:30] = 0
+            self.assertIsNone(worker['recognize_bubble'](lambda crop: '！！', blank, directory))
+            (directory/'cancel').touch()
+            self.assertIsNone(worker['recognize_bubble'](fail, blank, directory))
 
 
 class GlyphReplacementTests(unittest.TestCase):

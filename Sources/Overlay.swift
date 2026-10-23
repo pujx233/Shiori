@@ -2,13 +2,26 @@ import AppKit
 import CoreText
 
 private final class TranslationPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    var selecting = false
+    var onCancel: (() -> Void)?
+    override var canBecomeKey: Bool { selecting }
     override var canBecomeMain: Bool { false }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { onCancel?() } else { super.keyDown(with: event) }
+    }
+}
+
+enum BubbleEditAction {
+    case recognize
+    case translate(source: String)
+    case save(source: String, translation: String)
+    case restoreOriginal
 }
 
 @MainActor
 final class MangaOverlay {
-    private let panel: NSPanel
+    private let panel: TranslationPanel
     private let canvas = TranslationCanvas()
     private var windowID: CGWindowID?
     private var processID: pid_t = 0
@@ -19,6 +32,13 @@ final class MangaOverlay {
     private var contentRect: CGRect = .zero
     private var wantsVisible = false
     private var layoutSeconds = 0.0
+    private var pageDigest: String?
+    private var selecting = false
+    private var selectedID: String?
+    private var editor: BubbleEditor?
+    private var pendingAction: BubbleEditAction?
+    var onBubbleAction: ((String, BubbleEditAction) -> Void)?
+    var onEditingChanged: ((Bool) -> Void)?
 
     init() {
         panel = TranslationPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
@@ -33,10 +53,16 @@ final class MangaOverlay {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.isReleasedWhenClosed = false
         panel.contentView = canvas
+        panel.onCancel = { [weak self] in self?.endCorrection() }
+        canvas.onSelect = { [weak self] id in self?.editBubble(id) }
+        canvas.onCancel = { [weak self] in self?.endCorrection() }
     }
 
     func show(_ entry: CacheEntry, page: CapturedPage, windowID: CGWindowID, processID: pid_t, topInset: CGFloat) {
+        if selecting && (self.windowID != windowID || pageDigest != page.digest) { endCorrection() }
+        if pageDigest != nil && pageDigest != page.digest { canvas.setCorrectionCandidates([]) }
         self.windowID = windowID; self.processID = processID; self.topInset = topInset
+        pageDigest = page.digest
         let identity = entry.id + String(entry.createdAt.timeIntervalSince1970)
         if entryID != identity || contentRect != page.contentRect {
             let began = Date()
@@ -59,9 +85,51 @@ final class MangaOverlay {
     }
 
     var renderedCount: Int { canvas.items.count }
+    var selectedBubbleID: String? { selectedID }
     var omittedSummary: String { canvas.omittedSummary }
 
-    func hide() { wantsVisible = false; panel.orderOut(nil); tracking?.invalidate(); tracking = nil }
+    func setCorrectionCandidates(_ dialogues: [Dialogue]) { canvas.setCorrectionCandidates(dialogues) }
+
+    @discardableResult
+    func beginCorrection() -> Bool {
+        guard wantsVisible, !canvas.bubbles.isEmpty else { return false }
+        if selecting { editor?.showWindow(nil); return true }
+        selecting = true
+        panel.selecting = true
+        panel.ignoresMouseEvents = false
+        canvas.selecting = true
+        onEditingChanged?(true)
+        updatePosition()
+        guard selecting, panel.isVisible else { endCorrection(); return false }
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(canvas)
+        return true
+    }
+
+    func endCorrection() {
+        guard selecting else { return }
+        selecting = false; selectedID = nil; pendingAction = nil
+        editor?.onClose = nil
+        editor?.close(); editor = nil
+        canvas.selecting = false; canvas.selectedID = nil
+        panel.selecting = false; panel.ignoresMouseEvents = true
+        panel.resignKey()
+        onEditingChanged?(false)
+        updatePosition()
+    }
+
+    func finishBubbleAction(id: String, dialogue: Dialogue?, error: String? = nil) {
+        guard selecting, selectedID == id, let editor else { return }
+        let action = pendingAction
+        pendingAction = nil
+        if let error { editor.finish(error: error); return }
+        if let dialogue { editor.update(dialogue) }
+        editor.finish(error: nil)
+        if case .save? = action { endCorrection() }
+        if case .restoreOriginal? = action { endCorrection() }
+    }
+
+    func hide() { wantsVisible = false; endCorrection(); panel.orderOut(nil); tracking?.invalidate(); tracking = nil }
 
     func stop() { hide(); tracking?.invalidate(); tracking = nil }
 
@@ -69,7 +137,29 @@ final class MangaOverlay {
         ["requested": wantsVisible, "visible": panel.isVisible, "frame": NSStringFromRect(panel.frame),
          "target": windowID ?? 0, "targetPID": processID, "items": canvas.items.count,
          "layoutSeconds": layoutSeconds, "omissions": canvas.omittedSummary,
+         "correcting": selecting, "selectedBubble": selectedID ?? "", "showingOriginal": canvas.showOriginal,
          "targetForeground": windowID.map { ReaderCapture.isForeground(windowID: $0, processID: processID) } ?? false]
+    }
+
+    private func editBubble(_ id: String) {
+        guard selecting, pendingAction == nil, let bubble = canvas.bubbles.first(where: { $0.dialogue.location == id }) else { return }
+        selectedID = id; canvas.selectedID = id
+        if editor == nil {
+            let value = BubbleEditor()
+            value.onClose = { [weak self] in self?.endCorrection() }
+            value.onAction = { [weak self] action in
+                guard let self, let selectedID = self.selectedID, let callback = self.onBubbleAction else { return }
+                self.pendingAction = action
+                self.editor?.begin(action)
+                callback(selectedID, action)
+            }
+            editor = value
+        }
+        editor?.update(bubble.dialogue)
+        let rect = bubble.rect
+        let screenRect = NSRect(x: panel.frame.minX + rect.minX, y: panel.frame.maxY - rect.maxY,
+                                width: rect.width, height: rect.height)
+        editor?.present(near: screenRect, in: panel.frame)
     }
 
     private func updatePosition() {
@@ -88,16 +178,164 @@ final class MangaOverlay {
                            width: contentRect.width, height: contentRect.height)
         // Prepare layout even when the reader is behind another app or minimized.
         if panel.frame != frame { panel.setFrame(frame, display: true) }
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let editingForeground = selecting && frontPID == ProcessInfo.processInfo.processIdentifier
+        let readerForeground = ReaderCapture.isForeground(windowID: windowID, processID: processID)
+        if selecting && !readerForeground && !editingForeground {
+            endCorrection(); return
+        }
         guard (info[kCGWindowIsOnscreen as String] as? Bool) == true,
-              ReaderCapture.isForeground(windowID: windowID, processID: processID) else {
+              readerForeground || editingForeground else {
             panel.orderOut(nil); return
         }
+        // Read current modifiers without installing a global keyboard monitor or requesting access.
+        canvas.updateModifierFlags(NSEvent.modifierFlags)
         if !panel.isVisible { panel.orderFrontRegardless() }
     }
 }
 
 @MainActor
-private final class TranslationCanvas: NSView {
+private final class BubbleEditor: NSWindowController, NSWindowDelegate {
+    private let source = NSTextView()
+    private let translation = NSTextView()
+    private let status = NSTextField(labelWithString: "")
+    private var buttons: [NSButton] = []
+    var onAction: ((BubbleEditAction) -> Void)?
+    var onClose: (() -> Void)?
+
+    init() {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 354),
+                            styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.title = "修正气泡"
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        super.init(window: panel)
+        panel.delegate = self
+        let content = NSStackView()
+        content.orientation = .vertical; content.alignment = .leading; content.spacing = 10
+        content.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        panel.contentView?.addSubview(content)
+        if let root = panel.contentView {
+            NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                                         content.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                                         content.topAnchor.constraint(equalTo: root.topAnchor),
+                                         content.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
+        }
+        for (title, view, buttonTitle, selector) in [
+            ("原文", source, "重新识别", #selector(recognize)),
+            ("译文", translation, "重新翻译", #selector(retranslate))
+        ] {
+            let label = NSTextField(labelWithString: title)
+            label.font = .systemFont(ofSize: 12, weight: .medium)
+            let action = button(buttonTitle, selector)
+            action.controlSize = .small
+            let spacer = NSView()
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            let row = NSStackView(views: [label, spacer, action])
+            row.orientation = .horizontal; row.alignment = .centerY
+            content.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: content.widthAnchor, constant: -28).isActive = true
+            let scroll = NSScrollView()
+            scroll.borderType = .bezelBorder; scroll.hasVerticalScroller = true
+            scroll.autohidesScrollers = true; scroll.drawsBackground = true
+            view.isRichText = false; view.importsGraphics = false
+            view.allowsUndo = true
+            view.isAutomaticQuoteSubstitutionEnabled = false
+            view.isAutomaticDashSubstitutionEnabled = false
+            view.isAutomaticTextReplacementEnabled = false
+            view.font = .systemFont(ofSize: 14)
+            view.textContainerInset = NSSize(width: 6, height: 7)
+            view.isVerticallyResizable = true; view.isHorizontallyResizable = false
+            view.autoresizingMask = [.width]
+            view.textContainer?.widthTracksTextView = true
+            view.setAccessibilityLabel(title)
+            scroll.documentView = view
+            content.addArrangedSubview(scroll)
+            NSLayoutConstraint.activate([scroll.widthAnchor.constraint(equalTo: content.widthAnchor, constant: -28),
+                                         scroll.heightAnchor.constraint(equalToConstant: 90)])
+        }
+        status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor
+        status.lineBreakMode = .byTruncatingTail
+        content.addArrangedSubview(status)
+        status.widthAnchor.constraint(equalTo: content.widthAnchor, constant: -28).isActive = true
+        status.heightAnchor.constraint(equalToConstant: 15).isActive = true
+        let restore = button("恢复原图", #selector(restore))
+        let cancel = NSButton(title: "取消", target: self, action: #selector(cancel))
+        cancel.bezelStyle = .rounded; cancel.keyEquivalent = "\u{1b}"
+        let done = button("完成", #selector(save))
+        done.keyEquivalent = "\r"
+        let spacer = NSView()
+        let actions = NSStackView(views: [restore, spacer, cancel, done])
+        actions.orientation = .horizontal; actions.spacing = 7
+        content.addArrangedSubview(actions)
+        actions.widthAnchor.constraint(equalTo: content.widthAnchor, constant: -28).isActive = true
+        panel.setContentSize(NSSize(width: 340, height: content.fittingSize.height))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func button(_ title: String, _ action: Selector) -> NSButton {
+        let value = NSButton(title: title, target: self, action: action)
+        value.bezelStyle = .rounded
+        buttons.append(value)
+        return value
+    }
+
+    func update(_ dialogue: Dialogue) {
+        source.string = dialogue.original
+        translation.string = dialogue.translation
+        source.undoManager?.removeAllActions()
+        translation.undoManager?.removeAllActions()
+        status.stringValue = ""
+    }
+
+    func present(near bubble: NSRect, in reader: NSRect) {
+        guard let window else { return }
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(bubble) }) ?? NSScreen.main
+        let available = screen?.visibleFrame ?? reader
+        let width = window.frame.width, height = window.frame.height
+        // Prefer beside the chosen bubble, falling back to the opposite side of the reader.
+        var x = bubble.maxX + 12
+        if x + width > available.maxX { x = bubble.minX - width - 12 }
+        x = max(available.minX + 8, min(x, available.maxX - width - 8))
+        let y = max(available.minY + 8, min(bubble.maxY - height, available.maxY - height - 8))
+        window.setFrameOrigin(NSPoint(x: x, y: y))
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(source)
+    }
+
+    func begin(_ action: BubbleEditAction) {
+        buttons.forEach { $0.isEnabled = false }
+        source.isEditable = false; translation.isEditable = false
+        switch action {
+        case .recognize: status.stringValue = "重新识别…"
+        case .translate: status.stringValue = "翻译中…"
+        case .save, .restoreOriginal: status.stringValue = "保存中…"
+        }
+        status.textColor = .secondaryLabelColor
+    }
+
+    func finish(error: String?) {
+        buttons.forEach { $0.isEnabled = true }
+        source.isEditable = true; translation.isEditable = true
+        status.stringValue = error ?? ""
+        status.toolTip = error
+        status.textColor = error == nil ? .secondaryLabelColor : .systemRed
+    }
+
+    func windowWillClose(_ notification: Notification) { onClose?() }
+    @objc private func recognize() { onAction?(.recognize) }
+    @objc private func retranslate() { onAction?(.translate(source: source.string)) }
+    @objc private func restore() { onAction?(.restoreOriginal) }
+    @objc private func save() { onAction?(.save(source: source.string, translation: translation.string)) }
+    @objc private func cancel() { close() }
+}
+
+@MainActor
+final class TranslationCanvas: NSView {
     enum Omission: String, CaseIterable {
         case bounds = "位置不完整"
         case length = "气泡空间不足"
@@ -109,7 +347,21 @@ private final class TranslationCanvas: NSView {
         let mask: NSImage
         let texts: [FittedText]
     }
+    struct Bubble {
+        let dialogue: Dialogue
+        let rect: CGRect
+    }
     var items: [Item] = []
+    var bubbles: [Bubble] = []
+    var selecting = false { didSet { hoverID = nil; needsDisplay = true; window?.invalidateCursorRects(for: self) } }
+    var selectedID: String? { didSet { needsDisplay = true } }
+    private(set) var showOriginal = false { didSet { if oldValue != showOriginal { needsDisplay = true } } }
+    var onSelect: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+    private var hoverID: String? { didSet { if oldValue != hoverID { needsDisplay = true } } }
+    private var trackingArea: NSTrackingArea?
+    private var correctionCandidates: [Dialogue] = []
+    private var translatedDialogues: [Dialogue] = []
     private var omissions: [Omission: Int] = [:]
     private var sourceImage: CGImage?
     private var cachedItems: [String: Item] = [:]
@@ -120,6 +372,8 @@ private final class TranslationCanvas: NSView {
         let size = CGSize(width: image.width, height: image.height)
         if sourceImage !== image { cachedItems = [:]; sourceImage = image }
         items = []; omissions = [:]
+        translatedDialogues = translation.dialogues
+        rebuildBubbles()
         var activeKeys = Set<String>()
         for dialogue in translation.dialogues {
             // A completely unreadable balloon must keep its original pixels and bounds.
@@ -128,11 +382,12 @@ private final class TranslationCanvas: NSView {
             guard let imageRect = dialogue.bounds?.rect(in: size),
                   let rect = dialogue.bounds?.rect(in: bounds.size) else { omissions[.bounds, default: 0] += 1; continue }
             let textRect = dialogue.layoutBounds?.rect(in: bounds.size) ?? rect
-            let key = "\(dialogue.location)|\(dialogue.translation)|\(textRect)|\(bounds.size)"
+            let regions = dialogue.layoutRegions?.compactMap { $0.rect(in: bounds.size) } ?? [textRect]
+            // A local correction or late OCR refinement can change the patch without changing its text.
+            let key = "\(dialogue.location)|\(dialogue.translation)|\(rect)|\(regions)|\(bounds.size)|\(dialogue.replacementPNG?.hashValue ?? 0)|\(dialogue.fontSize ?? 0)|\(dialogue.textStyle ?? "")|\(dialogue.vertical ?? false)|\(dialogue.uncertainRanges ?? [])"
             activeKeys.insert(key)
             if let item = cachedItems[key] { items.append(item); continue }
             let fontSize = dialogue.fontSize.map { CGFloat($0) * bounds.height / 1000 }
-            let regions = dialogue.layoutRegions?.compactMap { $0.rect(in: bounds.size) } ?? [textRect]
             guard let texts = FittedText.flow(dialogue.translation, regions: regions.map { $0.insetBy(dx: 1, dy: 1) },
                                             style: dialogue.textStyle, vertical: dialogue.vertical ?? false, maxFontSize: fontSize,
                                             gaps: dialogue.uncertainRanges ?? []) else {
@@ -149,15 +404,74 @@ private final class TranslationCanvas: NSView {
         cachedItems = cachedItems.filter { activeKeys.contains($0.key) }
         needsDisplay = true
     }
+    func setCorrectionCandidates(_ dialogues: [Dialogue]) {
+        let unchanged = dialogues.count == correctionCandidates.count && zip(dialogues, correctionCandidates).allSatisfy {
+            $0.location == $1.location && $0.original == $1.original && $0.translation == $1.translation
+                && $0.bounds?.rect(in: CGSize(width: 1000, height: 1000)) == $1.bounds?.rect(in: CGSize(width: 1000, height: 1000))
+        }
+        correctionCandidates = dialogues
+        guard !unchanged else { return }
+        rebuildBubbles()
+        if selecting { needsDisplay = true }
+    }
+    private func rebuildBubbles() {
+        let translated = Set(translatedDialogues.map(\.location))
+        let dialogues = translatedDialogues + correctionCandidates.filter { !translated.contains($0.location) }
+        bubbles = dialogues.compactMap { dialogue in
+            dialogue.bounds?.rect(in: bounds.size).map { Bubble(dialogue: dialogue, rect: $0) }
+        }
+    }
+    override var acceptsFirstResponder: Bool { selecting }
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { selecting }
+    override func resetCursorRects() {
+        if selecting { addCursorRect(bounds, cursor: .crosshair) }
+    }
+    override func updateTrackingAreas() {
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area); trackingArea = area
+        super.updateTrackingAreas()
+    }
+    private func bubble(at point: CGPoint) -> Bubble? {
+        bubbles.filter { $0.rect.insetBy(dx: -4, dy: -4).contains(point) }
+            .min { $0.rect.width * $0.rect.height < $1.rect.width * $1.rect.height }
+    }
+    override func mouseMoved(with event: NSEvent) {
+        if selecting { hoverID = bubble(at: convert(event.locationInWindow, from: nil))?.dialogue.location }
+    }
+    override func mouseExited(with event: NSEvent) { hoverID = nil }
+    override func mouseDown(with event: NSEvent) {
+        guard selecting else { return }
+        if let bubble = bubble(at: convert(event.locationInWindow, from: nil)) { onSelect?(bubble.dialogue.location) }
+        else { onCancel?() }
+    }
+    override func rightMouseDown(with event: NSEvent) { mouseDown(with: event) }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { onCancel?() } else { super.keyDown(with: event) }
+    }
+    func updateModifierFlags(_ flags: NSEvent.ModifierFlags) { showOriginal = flags.contains(.option) }
+    override func flagsChanged(with event: NSEvent) { updateModifierFlags(event.modifierFlags) }
     override func draw(_ dirtyRect: NSRect) {
         NSColor.clear.setFill(); dirtyRect.fill(using: .copy)
-        for item in items {
-            item.mask.draw(in: item.rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        if !showOriginal {
+            for item in items {
+                item.mask.draw(in: item.rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            }
+            // Erasure patches may overlap, but must never erase an already drawn translation.
+            for item in items { for text in item.texts { text.draw() } }
         }
-        // Erasure patches may overlap, but must never erase an already drawn translation.
-        for item in items { for text in item.texts { text.draw() } }
+        if selecting {
+            for bubble in bubbles {
+                let active = bubble.dialogue.location == selectedID || bubble.dialogue.location == hoverID
+                let path = NSBezierPath(roundedRect: bubble.rect.insetBy(dx: -3, dy: -3), xRadius: 5, yRadius: 5)
+                NSColor.controlAccentColor.withAlphaComponent(active ? 0.10 : 0.035).setFill(); path.fill()
+                NSColor.controlAccentColor.withAlphaComponent(active ? 0.95 : 0.40).setStroke()
+                path.lineWidth = active ? 2 : 1; path.stroke()
+            }
+        }
     }
 }
 

@@ -30,10 +30,12 @@ def cancelled(directory):
     return not directory.exists() or (directory / 'cancel').exists()
 
 
-def read_hints(directory, pending=False):
+def read_hints(directory, pending=False, on_wait=None):
     path = directory / 'hints.json'
     deadline = time.monotonic()+30
     while pending and not path.exists() and not cancelled(directory):
+        if on_wait is not None:
+            on_wait()
         if time.monotonic() >= deadline:
             raise TimeoutError('System OCR did not finish')
         time.sleep(.02)
@@ -68,6 +70,22 @@ def recognize_text(ocr, crop, languages, font_size, initial_text=None):
     border = max(4, int(font_size * .35))
     background = tuple(int(v) for v in np.median(crop.reshape(-1, 3), axis=0)[::-1])
     return ocr(ImageOps.expand(image, border=border, fill=background)).strip()
+
+
+def recognize_bubble(ocr, image, directory):
+    """The user's selected balloon is the crop; never re-detect its columns."""
+    import cv2
+    import numpy as np
+    if cancelled(directory):
+        return None
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # A blank selection must not become an invented Manga OCR sentence.
+    if min(gray.shape) < 4 or float(np.max(gray))-float(np.min(gray)) < 8:
+        return None
+    text = recognize_text(ocr, image, {'ja'}, max(8, min(gray.shape)*.16))
+    if cancelled(directory) or not japanese_text(text, {'ja'}):
+        return None
+    return text
 
 
 def recognize_crops(ocr, crops):
@@ -713,19 +731,17 @@ def unique_blocks(blocks):
                 duplicate = True; break
         if not duplicate:
             result.append(block)
-    ids = {b['id'] for b in result}
-    return [b for b in blocks if b['id'] in ids]
+    accepted = {id(block) for block in result}
+    seen, ordered = set(), []
+    for block in blocks:
+        if id(block) in accepted and block['id'] not in seen:
+            seen.add(block['id']); ordered.append(block)
+    return ordered
 
 
-def finish_page(directory, blocks, skipped, patches, start):
-    """Publish stable OCR IDs before waiting for the final background repair.
-
-    text.json is a separate durable handoff: a fast repair cannot overwrite the
-    ready event before the parent polls. Only a completed closed-balloon patch
-    can render early; pending and open-text repairs remain explicitly disabled.
-    """
+def publish_draft(directory, blocks, skipped, patches, start):
+    """Cumulative snapshots retain IDs; only real closed-balloon patches can show."""
     if cancelled(directory):
-        write_state(directory, phase='cancelled')
         return
     result = unique_blocks(blocks)
     draft = []
@@ -738,6 +754,15 @@ def finish_page(directory, blocks, skipped, patches, start):
                 candidate.update(replacementPNG=patch, replacementAllowed=True)
         draft.append(candidate)
     write_json(directory, 'text', {'blocks': draft, 'skippedCount': skipped, 'elapsed': time.monotonic()-start})
+
+
+def finish_page(directory, blocks, skipped, patches, start):
+    """Finish background work after the last durable text snapshot is published."""
+    if cancelled(directory):
+        write_state(directory, phase='cancelled')
+        return
+    result = unique_blocks(blocks)
+    publish_draft(directory, result, skipped, patches, start)
     write_state(directory, phase='repairing')
     for block in result:
         future = patches[block['id']]
@@ -758,6 +783,168 @@ def finish_page(directory, blocks, skipped, patches, start):
             return
     write_state(directory, phase='done', page={'blocks': result, 'skippedCount': skipped,
                 'elapsed': time.monotonic()-start})
+
+
+def page_groups(candidates, gray, labels, stats, exterior, ink_labels, ink_stats):
+    height, width = gray.shape
+    groups, fonts, languages = group_candidates(candidates, labels, stats, exterior)
+    filtered = reading_groups(groups, fonts)
+    skipped, groups = len(groups)-len(filtered), filtered
+    directions = group_geometry(candidates, groups)
+    extra_ink = {}
+    for component, box in groups.items():
+        if component < 0:
+            continue
+        bx, by, bw, bh, _ = stats[component]
+        radius = max(8, fonts[component] * 1.5)
+        nearby = [box[0]-radius, box[1]-radius, box[2]+radius, box[3]+radius]
+        for ink_id in nearby_ink_ids(ink_labels, nearby):
+            ix, iy, iw, ih, area = ink_stats[ink_id]
+            if (area >= 2 and bx < ix and by < iy and ix+iw < bx+bw and iy+ih < by+bh
+                and max(iw, ih) < radius*2 and ix >= nearby[0] and iy >= nearby[1]
+                and ix+iw <= nearby[2] and iy+ih <= nearby[3]
+                and labels[max(0, iy-1), max(0, ix-1)] == component):
+                extra_ink.setdefault(component, []).append(ink_id)
+                box[:] = [min(box[0], int(ix)-3), min(box[1], int(iy)-3),
+                          max(box[2], int(ix+iw)+3), max(box[3], int(iy+ih)+3)]
+    boxes = sorted(groups.items(), key=lambda pair: (int((pair[1][0]+pair[1][2])/2 < width/2) if width > height*1.1 else 0,
+                                                     int(pair[1][1]/max(40, height*.08)), -pair[1][0]))
+    targets = {component: padded_box(box, gray, labels, stats, component, fonts[component])
+               if component > 0 else box for component, box in boxes}
+    return boxes, fonts, languages, directions, extra_ink, targets, skipped
+
+
+def block_identifier(component, box):
+    # Bubble interiors depend only on page pixels, never detector/Vision order.
+    # Open text has no stable interior, so give its actual crop a geometry ID.
+    return f'c{component}' if component > 0 else 't' + '_'.join(str(int(v)) for v in box)
+
+
+def page_block(component, box, text, uncertain, target, font, direction, gray, labels, stats):
+    import numpy as np
+    height, width = gray.shape
+    closed = component > 0
+    layouts = layout_boxes(labels, stats, component, box, font) if closed else [list(box)]
+    x1, y1, x2, y2 = target
+    def bounds(rect):
+        return {'x': rect[0]/width*1000, 'y': rect[1]/height*1000,
+                'width': (rect[2]-rect[0])/width*1000, 'height': (rect[3]-rect[1])/height*1000}
+    style = None if closed else ('outlinedLight' if np.median(gray[y1:y2, x1:x2]) < 145 else 'outlinedDark')
+    return {'id': block_identifier(component, box), 'text': text,
+            'uncertainFragments': uncertain or None, 'replacementAllowed': False,
+            'vertical': direction, 'fontSize': font/height*1000,
+            'layoutRegions': [bounds(rect) for rect in layouts], 'layoutBounds': bounds(layouts[0]),
+            'replacementPNG': None, 'textStyle': style, 'bounds': bounds(target)}
+
+
+def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_mask, device, pending, start, patch_jobs):
+    import cv2
+    import numpy as np
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    labels, stats, exterior = bubble_regions(gray)
+    _, ink_labels, ink_stats, _ = cv2.connectedComponentsWithStats((gray < 215).astype(np.uint8), connectivity=8)
+    hints = read_hints(directory)
+    def resolution_for(values):
+        sizes = [min(h['box'][2]-h['box'][0], h['box'][3]-h['box'][1]) for h in values]
+        return 1536 if max(width, height) > 1800 or (sizes and np.median(sizes) < 24) else 1024
+    def detect(resolution):
+        write_state(directory, phase='detecting')
+        detector.input_size = (resolution, resolution)
+        raw, mask, found = detector(image)
+        recovered = recover_candidates(image, raw, found)
+        found = separate_caption_lines(found)
+        if recovered:
+            mask = cv2.bitwise_or(mask, refine_mask(image, raw, recovered))
+            found += recovered
+        return mask, found
+    resolution = resolution_for(hints)
+    text_mask, candidates = detect(resolution)
+    if cancelled(directory):
+        write_state(directory, phase='cancelled'); return
+    early_text, early_patches, early_result = {}, {}, []
+    early_revision = None
+    batch_size = 8 if device == 'mps' else 1
+
+    # Fast path only uses detector-confirmed Japanese inside a real closed
+    # balloon. Unknown/open/small text keeps the full independent Vision review.
+    if pending and not (directory / 'hints.json').exists():
+        boxes, fonts, languages, directions, extra, targets, skipped = page_groups(
+            candidates, gray, labels, stats, exterior, ink_labels, ink_stats)
+        first = [(c, b) for c, b in boxes if c > 0 and 'ja' in languages[c] and fonts[c] >= 10][:8]
+        for component, box in first:
+            future = repairs.submit(replacement_patch, image, text_mask, targets[component],
+                ink_labels, extra.get(component, []), False, restorer, font_size=fonts[component])
+            signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
+            early_patches[component] = (signature, future)
+            patch_jobs[('early', component)] = future
+        for index, component, box, text in recognized_boxes(
+                ocr, image, first, languages, fonts, directory, batch_size, text_mask):
+            early_text[(component, tuple(box), fonts[component])] = text
+            if japanese_text(text, languages[component]):
+                early_result.append(page_block(component, box, text, [], targets[component], fonts[component],
+                                               directions[component], gray, labels, stats))
+            # Publish a complete decoder batch, retaining reading order later.
+            if len(early_text) % batch_size == 0 or len(early_text) == len(first):
+                order = {block_identifier(c, b): i for i, (c, b) in enumerate(first)}
+                early_result.sort(key=lambda block: order[block['id']])
+                publish_draft(directory, early_result, skipped,
+                    {block_identifier(c, b): early_patches[c][1] for c, b in first}, start)
+                early_revision = tuple(future.done() for _, future in early_patches.values())
+        if cancelled(directory):
+            write_state(directory, phase='cancelled'); return
+        write_state(directory, phase='verifying')
+
+    def publish_completed_patches():
+        nonlocal early_revision
+        revision = tuple(future.done() for _, future in early_patches.values())
+        if early_result and revision != early_revision:
+            early_revision = revision
+            publish_draft(directory, early_result, skipped,
+                {block_identifier(c, b): early_patches[c][1] for c, b in first}, start)
+    # A repair can complete after decoding. Publish it while Vision is pending
+    # instead of leaving the already translated balloon hidden until final OCR.
+    hints = read_hints(directory, pending, on_wait=publish_completed_patches)
+    if cancelled(directory):
+        write_state(directory, phase='cancelled'); return
+    if resolution_for(hints) > resolution:
+        resolution = resolution_for(hints)
+        text_mask, candidates = detect(resolution)
+    candidates = supplement_candidates(candidates, hints)
+    boxes, fonts, languages, directions, extra, targets, skipped = page_groups(
+        candidates, gray, labels, stats, exterior, ink_labels, ink_stats)
+    accepted_patches = {}
+    for component, box in sorted(boxes, key=lambda pair: pair[0] < 0):
+        signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
+        earlier = early_patches.get(component)
+        future = earlier[1] if earlier and earlier[0] == signature else repairs.submit(
+            replacement_patch, image, text_mask, targets[component], ink_labels, extra.get(component, []),
+            component < 0, restorer, font_size=fonts[component])
+        patch_jobs[('final', component)] = future
+        accepted_patches[block_identifier(component, box)] = future
+    missing = [(c, b) for c, b in boxes if (c, tuple(b), fonts[c]) not in early_text]
+    for _, component, box, text in recognized_boxes(
+            ocr, image, missing, languages, fonts, directory, batch_size, text_mask):
+        early_text[(component, tuple(box), fonts[component])] = text
+    result, uncertainty_budget = [], [4]
+    for component, box in boxes:
+        if cancelled(directory):
+            write_state(directory, phase='cancelled'); return
+        text = early_text[(component, tuple(box), fonts[component])]
+        original = text
+        hint = reliable_hint(box, hints, text, horizontal=not directions[component])
+        if hint and component < 0 and len(hint) >= 4:
+            text = hint
+        text = restore_voicing(text, box, hints)
+        text, uncertain = reconcile_fragments(ocr, image, box, text, hints, directory, uncertainty_budget)
+        uncertain += confirm_fragments(ocr, image, box, text, original, hints, directory, uncertainty_budget)
+        if not japanese_text(text, languages[component]):
+            if not punctuation_only(text):
+                skipped += 1
+            continue
+        result.append(page_block(component, box, text, uncertain, targets[component], fonts[component],
+                                 directions[component], gray, labels, stats))
+    finish_page(directory, result, skipped, accepted_patches, start)
 
 
 def main():
@@ -793,103 +980,18 @@ def main():
             image = cv2.imread(str(directory / 'page.png'))
             if image is None:
                 raise ValueError('无法读取截图')
-            height, width = image.shape[:2]
-            # Full-size page detection runs while macOS Vision reads the image.
-            # Smaller captures still use Vision's font sizes to choose resolution.
-            hints = read_hints(directory, request.get('hintsPending', False)) if max(width,height) <= 1800 else []
-            hint_sizes = [min(h['box'][2]-h['box'][0], h['box'][3]-h['box'][1]) for h in hints]
-            resolution = 1536 if max(width, height) > 1800 or (hint_sizes and np.median(hint_sizes) < 24) else 1024
-            detector.input_size = (resolution, resolution)
-            raw_mask, text_mask, candidates = detector(image)
-            if max(width,height) > 1800:
-                hints = read_hints(directory, request.get('hintsPending', False))
-            if cancelled(directory):
-                write_state(directory, phase='cancelled'); continue
-            recovered = recover_candidates(image, raw_mask, candidates)
-            candidates = separate_caption_lines(candidates)
-            if recovered:
-                text_mask = cv2.bitwise_or(text_mask, refine_mask(image, raw_mask, recovered))
-                candidates += recovered
-            candidates = supplement_candidates(candidates, hints)
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            labels, stats, exterior = bubble_regions(gray)
-            _, ink_labels, ink_stats, _ = cv2.connectedComponentsWithStats((gray < 215).astype(np.uint8), connectivity=8)
-            groups, font_sizes, languages = group_candidates(candidates, labels, stats, exterior)
-            filtered = reading_groups(groups, font_sizes)
-            skipped = len(groups)-len(filtered)
-            groups = filtered
-            directions = group_geometry(candidates, groups)
-            # Include small punctuation/furigana just outside the detector box.
-            # The bubble outline is excluded because it extends beyond its interior.
-            extra_ink = {}
-            for component, box in groups.items():
-                if component < 0:
-                    continue
-                bx, by, bw, bh, _ = stats[component]
-                radius = max(8, font_sizes[component] * 1.5)
-                nearby = [box[0]-radius, box[1]-radius, box[2]+radius, box[3]+radius]
-                for ink_id in nearby_ink_ids(ink_labels, nearby):
-                    ix, iy, iw, ih, area = ink_stats[ink_id]
-                    if (area >= 2 and bx < ix and by < iy and ix+iw < bx+bw and iy+ih < by+bh
-                        and max(iw, ih) < radius*2 and ix >= nearby[0] and iy >= nearby[1]
-                        and ix+iw <= nearby[2] and iy+ih <= nearby[3]
-                        and labels[max(0, iy-1), max(0, ix-1)] == component):
-                        extra_ink.setdefault(component, []).append(ink_id)
-                        box[:] = [min(box[0], int(ix)-3), min(box[1], int(iy)-3),
-                                  max(box[2], int(ix+iw)+3), max(box[3], int(iy+ih)+3)]
-            # Right page before left page for a spread, then top-to-bottom rows.
-            boxes = sorted(groups.items(), key=lambda pair: (int((pair[1][0]+pair[1][2])/2 < width/2) if width > height*1.1 else 0,
-                                                             int(pair[1][1]/max(40, height*.08)), -pair[1][0]))
-            # CPU background repair overlaps MPS decoding. A single repair worker
-            # keeps memory bounded and avoids competing neural inference threads.
-            patch_boxes = {}
-            # Closed balloon repairs are cheap and must not queue behind a LaMa
-            # background. They can then travel with text-ready as real PNGs.
-            for component, box in sorted(boxes, key=lambda pair: pair[0] < 0):
-                target = padded_box(box, gray, labels, stats, component, font_sizes[component]) if component > 0 else box
-                patch_boxes[component] = target
-                patch_jobs[component] = repairs.submit(replacement_patch, image, text_mask, target,
-                    ink_labels, extra_ink.get(component, []), component < 0, restorer,
-                    font_size=font_sizes[component])
-            result, accepted_patches = [], {}
-            recognized = list(recognized_boxes(
-                ocr, image, boxes, languages, font_sizes, directory, 8 if device == 'mps' else 1, text_mask))
-            uncertainty_budget = [4]
-            for index, component, box, text in sorted(recognized):
-                x1, y1, x2, y2 = box
-                original = text
-                hint = reliable_hint(box, hints, text, horizontal=not directions[component])
-                # Tight, multi-line handwriting is more reliable in Vision than a square manga crop.
-                if hint and component < 0 and len(hint) >= 4:
-                    text = hint
-                text = restore_voicing(text, box, hints)
-                text, uncertain = reconcile_fragments(ocr, image, box, text, hints, directory, uncertainty_budget)
-                uncertain += confirm_fragments(ocr, image, box, text, original, hints, directory, uncertainty_budget)
-                if not japanese_text(text, languages[component]):
-                    # Keep "!!" and "…" in the original artwork; they are not failed OCR.
-                    if not punctuation_only(text):
-                        skipped += 1
-                    continue
-                closed = component > 0
-                layouts = layout_boxes(labels, stats, component, box, font_sizes[component]) if closed else [list(box)]
-                layout = layouts[0]
-                x1, y1, x2, y2 = patch_boxes[component]
-                # Open lettering uses only the detected glyph mask, never a solid
-                # white rectangle. An outline keeps Chinese readable over artwork.
-                style = None if closed else ('outlinedLight' if np.median(gray[y1:y2, x1:x2]) < 145 else 'outlinedDark')
-                result.append({'id': f'b{index+1}', 'text': text,
-                    'uncertainFragments': uncertain or None,
-                    'replacementAllowed': False,
-                    'vertical': directions[component], 'fontSize': font_sizes[component]/height*1000,
-                    'layoutRegions': [{'x': b[0]/width*1000, 'y': b[1]/height*1000,
-                                       'width': (b[2]-b[0])/width*1000, 'height': (b[3]-b[1])/height*1000} for b in layouts],
-                    'layoutBounds': {'x': layout[0]/width*1000, 'y': layout[1]/height*1000,
-                                     'width': (layout[2]-layout[0])/width*1000, 'height': (layout[3]-layout[1])/height*1000},
-                    'replacementPNG': None, 'textStyle': style,
-                    'bounds': {'x': x1/width*1000, 'y': y1/height*1000,
-                               'width': (x2-x1)/width*1000, 'height': (y2-y1)/height*1000}})
-                accepted_patches[f'b{index+1}'] = patch_jobs[component]
-            finish_page(directory, result, skipped, accepted_patches, start)
+            if request.get('kind') == 'bubble':
+                write_state(directory, phase='recognizing')
+                text = recognize_bubble(ocr, image, directory)
+                if cancelled(directory):
+                    write_state(directory, phase='cancelled')
+                elif text:
+                    write_state(directory, phase='done', text=text, elapsed=time.monotonic()-start)
+                else:
+                    write_state(directory, phase='error', message='没能读出文字，可以直接修改原文。')
+                continue
+            recognize_page(directory, image, detector, ocr, restorer, repairs, refine_mask,
+                           device, request.get('hintsPending', False), start, patch_jobs)
         except Exception:
             traceback.print_exc(file=sys.stderr)
             write_state(directory, phase='error', message='本地识字失败，请重试。')

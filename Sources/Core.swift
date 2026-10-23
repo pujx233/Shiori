@@ -86,8 +86,10 @@ struct Dialogue: Codable {
     var fontSize: Double? = nil
     var uncertainRanges: [TextGap]? = nil
     var preserveOriginal: Bool? = nil
+    var userRestoredOriginal: Bool? = nil
+    var userEdited: Bool? = nil
 
-    var needsReview: Bool { preserveOriginal == true || !(uncertainRanges ?? []).isEmpty }
+    var needsReview: Bool { userRestoredOriginal != true && (preserveOriginal == true || !(uncertainRanges ?? []).isEmpty) }
 
     static func recognized(_ block: OCRBlock, text: String) -> Dialogue {
         let reading = TranslationText(text)
@@ -606,13 +608,19 @@ final class CodexClient: Sendable {
         try session.models()
     }
 
+    func remember(page: PageTranslation, options: TranslationOptions, ocr: OCRPage? = nil) {
+        memory.remember(page, scope: options.readingScope)
+        if let ocr { try? textCache.save(ocr: ocr, options: options, translation: page) }
+    }
+
     func translate(ocr: OCRPage, options: TranslationOptions, runner: CommandRunner, force: Bool = false,
                    seed: PageTranslation? = nil,
+                   rememberResult: Bool = true, pageContext: OCRPage? = nil, cacheResult: Bool = true,
                    progress: @escaping (String) -> Void = { _ in },
                    preview: ((PageTranslation) -> Void)? = nil) throws -> (PageTranslation, Double) {
         try runner.checkCancellation()
-        if !force, let cached = textCache.lookup(ocr: ocr, options: options) {
-            memory.remember(cached, scope: options.readingScope)
+        if cacheResult, !force, let cached = textCache.lookup(ocr: ocr, options: options) {
+            if rememberResult { memory.remember(cached, scope: options.readingScope) }
             progress("正在回填…")
             return (cached, 0)
         }
@@ -645,6 +653,10 @@ final class CodexClient: Sendable {
             let input = String(decoding: try JSONEncoder().encode(blocks.map(inputBlock)), as: UTF8.self)
             var prompt = "逐条翻译为简体中文。一个 ID 对应一个气泡，译文只包含该 ID 的原文含义；不要把相邻气泡合并，也不要把有正文的气泡替换成省略号。\n"
             if !history.isEmpty { prompt += "前页文字，仅用于人名和语气参考：\n" + history + "\n" }
+            if let pageContext, pageContext.blocks.count > blocks.count {
+                let context = String(decoding: try JSONEncoder().encode(pageContext.blocks.map(inputBlock)), as: UTF8.self)
+                prompt += "本页其他文字仅供理解，不要返回其他 ID：" + context + "\n"
+            }
             if repair {
                 let context = String(decoding: try JSONEncoder().encode(ocr.blocks.map(inputBlock)), as: UTF8.self)
                 prompt += "本页上下文（仅供理解）：" + context + "\n以下条目需要补译或重新拆分，其他 ID 不要返回。\n"
@@ -697,8 +709,8 @@ final class CodexClient: Sendable {
         }
         try runner.checkCancellation()
         let translation = page()
-        try? textCache.save(ocr: ocr, options: options, translation: translation)
-        memory.remember(translation, scope: options.readingScope)
+        if cacheResult { try? textCache.save(ocr: ocr, options: options, translation: translation) }
+        if rememberResult { memory.remember(translation, scope: options.readingScope) }
         preview?(translation)
         return (translation, Date().timeIntervalSince(began))
     }

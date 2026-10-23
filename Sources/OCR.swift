@@ -47,6 +47,41 @@ final class OCRVisionPreparation: @unchecked Sendable {
     }
 }
 
+// The Vision request can outlive a cancelled job while the framework unwinds.
+// Closing the mailbox under its write lock makes deleting the job directory safe
+// without making a new page wait for that request to finish.
+private final class OCRVisionMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private let directory: URL
+    private let runner = CommandRunner()
+    private let parent: CommandRunner
+    private var cancellation: UUID?
+    private var closed = false
+
+    init(directory: URL, parent: CommandRunner) {
+        self.directory = directory; self.parent = parent
+        cancellation = parent.addCancellationHandler { [runner] in runner.cancel() }
+    }
+
+    func start(image: CGImage, recognize: @escaping @Sendable (CGImage, CommandRunner) -> [[String: Any]]) {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            guard !runner.isCancelled else { return }
+            let hints = recognize(image, runner)
+            lock.lock(); defer { lock.unlock() }
+            guard !closed, !runner.isCancelled, !parent.isCancelled else { return }
+            if let data = try? JSONSerialization.data(withJSONObject: hints) {
+                try? data.write(to: directory.appendingPathComponent("hints.json"), options: .atomic)
+            }
+        }
+    }
+
+    func close() {
+        lock.lock(); closed = true; lock.unlock()
+        if let cancellation { parent.removeCancellationHandler(cancellation); self.cancellation = nil }
+        runner.cancel()
+    }
+}
+
 struct OCRBlock: Codable {
     let id: String
     let text: String
@@ -82,6 +117,7 @@ struct OCRPage: Codable {
 final class LocalOCR: @unchecked Sendable {
     private let serial = NSLock()
     private let visionPreparation: OCRVisionPreparation
+    private let visionHints: @Sendable (CGImage, CommandRunner) -> [[String: Any]]
     private let root: URL
     private let script: URL
     private let cache: URL
@@ -89,11 +125,13 @@ final class LocalOCR: @unchecked Sendable {
     private var input: FileHandle?
     private var runtime: URL?
     private var log: FileHandle?
-    static let engineVersion = "manga-ocr-17"
+    static let engineVersion = "manga-ocr-18"
 
     init(support: URL, resources: URL, engineRoot: URL? = nil,
-         visionPreparation: OCRVisionPreparation = OCRVisionPreparation()) throws {
+         visionPreparation: OCRVisionPreparation = OCRVisionPreparation(),
+         visionHints: @escaping @Sendable (CGImage, CommandRunner) -> [[String: Any]] = { LocalOCR.textHints(in: $0, runner: $1) }) throws {
         self.visionPreparation = visionPreparation
+        self.visionHints = visionHints
         root = engineRoot ?? support.appendingPathComponent("OCR")
         cache = support.appendingPathComponent("Recognition")
         script = resources.appendingPathComponent("ocr_worker.py")
@@ -159,9 +197,75 @@ final class LocalOCR: @unchecked Sendable {
         visionPreparation.schedule()
     }
 
-    // Called on the recognition queue. Text-ready may include completed closed
-    // balloon patches; all other blocks remain replacementAllowed=false until
-    // the returned final page. The pipeline validates patches before previewing.
+    // Atomic cache files can be inspected by the UI without joining the active
+    // recognition job or starting either OCR engine.
+    func cachedRecognition(for page: CapturedPage) -> OCRPage? {
+        let url = cache.appendingPathComponent(page.digest + "-" + Self.engineVersion + ".json")
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(OCRPage.self, from: data)
+    }
+
+    // A selected region is already localized. Running page detection on this
+    // small crop can drop an entire text column; decode the complete crop once.
+    func recognizeBubble(page: CapturedPage, runner: CommandRunner) throws -> String {
+        serial.lock(); defer { serial.unlock() }
+        try runner.checkCancellation()
+        visionPreparation.cancel()
+        try start()
+        let job = runtime!.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: job) }
+        try page.encoded(.png).write(to: job.appendingPathComponent("page.png"))
+        var request = try JSONSerialization.data(withJSONObject: ["directory": job.path, "kind": "bubble"])
+        request.append(10)
+        do { try input!.write(contentsOf: request) }
+        catch {
+            stopProcess(); cleanup()
+            try runner.checkCancellation()
+            throw AppError.message("本地识字连接已断开，请重试。")
+        }
+        let cancelJob = runner.addCancellationHandler {
+            try? Data().write(to: job.appendingPathComponent("cancel"), options: .atomic)
+        }
+        defer { runner.removeCancellationHandler(cancelJob) }
+        struct State: Decodable { let phase: String; var text: String?; var message: String? }
+        let deadline = Date().addingTimeInterval(45)
+        var cancelStart: Date?
+        while Date() < deadline {
+            if runner.isCancelled, cancelStart == nil { cancelStart = Date() }
+            if let start = cancelStart, Date().timeIntervalSince(start) > 3 {
+                stopProcess(); cleanup(); throw CancellationError()
+            }
+            guard process?.isRunning == true else {
+                cleanup(); try runner.checkCancellation()
+                throw AppError.message("本地识字未能启动，请重新打开助手。")
+            }
+            if let data = try? Data(contentsOf: job.appendingPathComponent("state.json")),
+               let state = try? JSONDecoder().decode(State.self, from: data) {
+                switch state.phase {
+                case "cancelled": throw CancellationError()
+                case "error":
+                    try runner.checkCancellation()
+                    throw AppError.message(state.message ?? "没能读出文字，可以直接修改原文。")
+                case "done":
+                    try runner.checkCancellation()
+                    guard let text = state.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+                        throw AppError.message("没能读出文字，可以直接修改原文。")
+                    }
+                    return text
+                default: break
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        stopProcess(); cleanup()
+        throw AppError.message("这个气泡识字超时，请重试。")
+    }
+
+    // Called on the recognition queue. Text-ready emits cumulative snapshots as
+    // reliable balloons finish and Vision supplements/rechecks the page. IDs are
+    // stable; text can change after verification. Only completed closed-balloon
+    // patches can render before the final page.
     func recognize(page: CapturedPage, runner: CommandRunner, force: Bool = false, progress: (String) -> Void,
                    onTextReady: ((OCRPage) -> Void)? = nil) throws -> OCRPage {
         serial.lock(); defer { serial.unlock() }
@@ -195,14 +299,15 @@ final class LocalOCR: @unchecked Sendable {
             try? Data().write(to: job.appendingPathComponent("cancel"), options: .atomic)
         }
         defer { runner.removeCancellationHandler(cancelJob) }
-        // Vision supplies independent Japanese evidence for unframed text and
-        // small text missed by the comic detector. Images remain on this Mac.
-        let hints = Self.textHints(in: page.image, runner: runner)
-        try JSONSerialization.data(withJSONObject: hints).write(to: job.appendingPathComponent("hints.json"), options: .atomic)
+        // Poll while Vision runs: reliable detector balloons do not wait for the
+        // framework's cold initialization. The final pass still uses its evidence.
+        let vision = OCRVisionMailbox(directory: job, parent: runner)
+        defer { vision.close() }
+        vision.start(image: page.image, recognize: visionHints)
         let deadline = Date().addingTimeInterval(90)
         var cancelStart: Date?
         var lastProgress = ""
-        var deliveredText = false
+        var deliveredText: Data?
         struct State: Decodable {
             let phase: String
             var completed: Int?; var total: Int?; var page: OCRPage?; var message: String?
@@ -219,10 +324,11 @@ final class LocalOCR: @unchecked Sendable {
             }
             let state = (try? Data(contentsOf: job.appendingPathComponent("state.json")))
                 .flatMap { try? JSONDecoder().decode(State.self, from: $0) }
-            if !deliveredText, !runner.isCancelled,
+            if !runner.isCancelled,
                let data = try? Data(contentsOf: job.appendingPathComponent("text.json")),
+               data != deliveredText,
                let text = try? JSONDecoder().decode(OCRPage.self, from: data) {
-                deliveredText = true
+                deliveredText = data
                 onTextReady?(text)
             }
             if let state {
@@ -234,7 +340,7 @@ final class LocalOCR: @unchecked Sendable {
                 case "done":
                     try runner.checkCancellation()
                     guard let result = state.page else { throw AppError.message("识字结果不完整。") }
-                    if !deliveredText { onTextReady?(result) }
+                    if deliveredText == nil { onTextReady?(result) }
                     try runner.checkCancellation()
                     try JSONEncoder().encode(result).write(to: cached, options: .atomic)
                     trimCache()
@@ -249,6 +355,7 @@ final class LocalOCR: @unchecked Sendable {
             let message = state?.phase == "detecting" ? "查找气泡…" : state?.phase == "recognizing"
                 ? "识字 \(state?.completed ?? 0)/\(state?.total ?? 0)"
                 : state?.phase == "repairing" ? "整理画面…"
+                : state?.phase == "verifying" ? "补充识字…"
                 : "加载识字模型…"
             if message != lastProgress { progress(message); lastProgress = message }
             Thread.sleep(forTimeInterval: 0.1)
