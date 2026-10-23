@@ -106,6 +106,28 @@ struct LocalOCRTests {
         try mode("normal")
         _ = try ocr.recognize(page: page, runner: CommandRunner(), force: true, progress: { _ in })
         try check(true, "warm worker accepts the page after cancellation")
+        try mode("cancel")
+        let beforeVision = CommandRunner()
+        let newImage = NSImage(size: NSSize(width: 81, height: 80), flipped: false) { rect in
+            NSColor.white.setFill(); rect.fill(); return true
+        }.cgImage(forProposedRect: nil, context: nil, hints: nil)!
+        let newPage = try CapturedPage(image: newImage)
+        let beforeVisionStart = Date()
+        var earlyCallbacks = 0
+        do {
+            _ = try ocr.recognize(page: newPage, runner: beforeVision, force: true, progress: { text in
+                if text == "检查文字…" { beforeVision.cancel() }
+            }, onTextReady: { _ in earlyCallbacks += 1 })
+            throw AppError.message("FAIL: pre-Vision cancellation ignored")
+        } catch is CancellationError {
+            let cacheFiles = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("Recognition"), includingPropertiesForKeys: nil)
+            try check(earlyCallbacks == 0 && !cacheFiles.contains { $0.lastPathComponent.hasPrefix(newPage.digest) }
+                      && Date().timeIntervalSince(beforeVisionStart) < 1.5,
+                      "cancellation before Vision still acknowledges the worker and never emits or caches the cancelled page")
+        }
+        try mode("normal")
+        _ = try ocr.recognize(page: newPage, runner: CommandRunner(), force: true, progress: { _ in })
+        try check(true, "worker and serial OCR queue remain usable after cancellation before Vision")
         let alreadyCancelled = CommandRunner(); alreadyCancelled.cancel()
         var badCallbacks = 0
         do {
@@ -114,6 +136,53 @@ struct LocalOCRTests {
         } catch is CancellationError {
             try check(badCallbacks == 0, "cancelled cache lookup never emits text")
         }
+
+        try mode("fast")
+        let preparationQueue = DispatchQueue(label: "test.ocr.preparation")
+        let preparationEntered = DispatchSemaphore(value: 0), preparationCancelled = DispatchSemaphore(value: 0)
+        let preparationRelease = DispatchSemaphore(value: 0), preparationFinished = DispatchSemaphore(value: 0)
+        let preparation = OCRVisionPreparation(queue: preparationQueue) { runner in
+            let token = runner.addCancellationHandler { preparationCancelled.signal() }
+            defer { runner.removeCancellationHandler(token); preparationFinished.signal() }
+            preparationEntered.signal()
+            _ = preparationRelease.wait(timeout: .now() + 4)
+        }
+        let preparedOCR = try LocalOCR(support: root, resources: root, visionPreparation: preparation)
+        defer { preparedOCR.shutdown() }
+        try preparedOCR.prepare(); try preparedOCR.prepare()
+        try check(preparationEntered.wait(timeout: .now() + 2) == .success, "prepare launches one asynchronous Vision initialization attempt")
+        let hitStart = ProcessInfo.processInfo.systemUptime
+        _ = try preparedOCR.recognize(page: page, runner: CommandRunner(), progress: { _ in })
+        try check(ProcessInfo.processInfo.systemUptime - hitStart < 0.2 && preparationCancelled.wait(timeout: .now()) == .timedOut,
+                  "cached page returns immediately while preparation continues")
+        var cancelledBeforeRecognition = false
+        _ = try preparedOCR.recognize(page: page, runner: CommandRunner(), force: true, progress: { text in
+            if text == "检查文字…" { cancelledBeforeRecognition = preparationCancelled.wait(timeout: .now()) == .success }
+        })
+        try check(cancelledBeforeRecognition && preparationFinished.wait(timeout: .now()) == .timedOut,
+                  "uncached page cancels preparation before Vision without waiting for its completion")
+        preparationRelease.signal(); preparationQueue.sync {}
+        try preparedOCR.prepare(); preparationQueue.sync {}
+        try check(preparationEntered.wait(timeout: .now()) == .timedOut, "prepare after real recognition cannot schedule a replacement warmup")
+        preparedOCR.shutdown()
+
+        let shutdownQueue = DispatchQueue(label: "test.ocr.preparation.shutdown")
+        let shutdownEntered = DispatchSemaphore(value: 0), shutdownCancelled = DispatchSemaphore(value: 0)
+        let shutdownRelease = DispatchSemaphore(value: 0), shutdownFinished = DispatchSemaphore(value: 0)
+        let shutdownPreparation = OCRVisionPreparation(queue: shutdownQueue) { runner in
+            let token = runner.addCancellationHandler { shutdownCancelled.signal() }
+            defer { runner.removeCancellationHandler(token); shutdownFinished.signal() }
+            shutdownEntered.signal()
+            _ = shutdownRelease.wait(timeout: .now() + 4)
+        }
+        let shutdownOCR = try LocalOCR(support: root, resources: root, visionPreparation: shutdownPreparation)
+        try shutdownOCR.prepare()
+        try check(shutdownEntered.wait(timeout: .now() + 2) == .success, "shutdown test begins with preparation still running")
+        shutdownOCR.shutdown()
+        try check(shutdownCancelled.wait(timeout: .now()) == .success && shutdownFinished.wait(timeout: .now()) == .timedOut,
+                  "shutdown cancels preparation and cleans the worker without joining the warmup")
+        shutdownRelease.signal(); shutdownQueue.sync {}
+
         ocr.shutdown()
         try mode("broken-pipe")
         try ocr.prepare()

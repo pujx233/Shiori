@@ -196,6 +196,48 @@ class GlyphReplacementTests(unittest.TestCase):
         image = np.full((40, 40, 3), 228, np.uint8)
         self.assertIsNone(replacement_patch(image, np.zeros((40, 40), np.uint8), [2, 2, 38, 38]))
 
+    def small_caption(self):
+        image = np.full((60, 100, 3), 254, np.uint8)
+        mask = np.zeros((60, 100), np.uint8)
+        mask[20:40, 20:80] = 255
+        for x in range(23, 79, 7):
+            cv2.rectangle(image, (x, 23), (x+3, 36), (0, 0, 0), -1)
+        return image, mask, [20, 20, 80, 40]
+
+    def test_small_flat_caption_does_not_require_a_solid_erasure_or_neural_repair(self):
+        image, mask, box = self.small_caption()
+        self.assertIsNone(replacement_patch(image, mask, box, open_text=True))
+        def unexpected_repair(*args):
+            self.fail('verified flat caption must not run neural inpainting')
+        patch = decode(replacement_patch(image, mask, box, open_text=True,
+                                        restorer=unexpected_repair, font_size=12))
+        alpha = patch[:, :, 3] > 0
+        self.assertLessEqual(np.mean(alpha), .95)
+        result = image.copy()
+        result[20:40, 20:80][alpha] = patch[:, :, :3][alpha]
+        self.assertFalse(np.any(result[20:40, 20:80] < 190))
+        self.assertTrue(np.array_equal(result[mask == 0], image[mask == 0]))
+        self.assertIsNone(replacement_patch(image, mask, box, open_text=True, font_size=24))
+
+    def test_small_caption_fallback_rejects_diagonal_and_mismatching_backgrounds(self):
+        image, mask, box = self.small_caption()
+        cv2.line(image, (10, 10), (90, 50), (0, 0, 0), 3)
+        self.assertIsNone(replacement_patch(image, mask, box, open_text=True, font_size=12))
+        image, mask, box = self.small_caption()
+        crop = image[20:40, 20:80]
+        crop[np.all(crop > 200, axis=2)] = 220
+        self.assertIsNone(replacement_patch(image, mask, box, open_text=True, font_size=12))
+
+    def test_small_caption_keeps_neighboring_ink_outside_its_patch(self):
+        image, mask, box = self.small_caption()
+        cv2.rectangle(image, (80, 23), (84, 36), (0, 0, 0), -1)
+        patch = decode(replacement_patch(image, mask, box, open_text=True, font_size=12))
+        alpha = patch[:, :, 3] > 0
+        result = image.copy()
+        result[20:40, 20:80][alpha] = patch[:, :, :3][alpha]
+        self.assertEqual(patch.shape[:2], (20, 60))
+        self.assertTrue(np.array_equal(result[:, 80:], image[:, 80:]))
+
 
 class RecognitionTests(unittest.TestCase):
     def test_parallel_detector_waits_for_complete_hints_and_cancel_does_not_hang(self):

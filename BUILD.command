@@ -17,8 +17,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Shiori</string>
 <key>CFBundleExecutable</key><string>Shiori</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.2.1</string>
-<key>CFBundleVersion</key><string>39</string>
+<key>CFBundleShortVersionString</key><string>1.2.2</string>
+<key>CFBundleVersion</key><string>40</string>
 <key>LSUIElement</key><true/>
 <key>CFBundleIconFile</key><string>MangaIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>

@@ -2,6 +2,50 @@ import AppKit
 import Foundation
 import Vision
 import CoreImage
+import CoreText
+
+// A single optional initialization attempt. Uncached reading closes this
+// gate, including when prepare's queued closure has not begun running yet.
+final class OCRVisionPreparation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private let work: @Sendable (CommandRunner) -> Void
+    private var decided = false
+    private var runner: CommandRunner?
+
+    init(queue: DispatchQueue = .global(qos: .utility),
+         work: @escaping @Sendable (CommandRunner) -> Void = { LocalOCR.prepareVision(runner: $0) }) {
+        self.queue = queue; self.work = work
+    }
+
+    func schedule() {
+        lock.lock()
+        guard !decided else { lock.unlock(); return }
+        decided = true
+        let runner = CommandRunner()
+        self.runner = runner
+        lock.unlock()
+        queue.async { [weak self] in
+            guard let self else { return }
+            defer {
+                self.lock.lock()
+                if self.runner === runner { self.runner = nil }
+                self.lock.unlock()
+            }
+            guard !runner.isCancelled else { return }
+            self.work(runner)
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        decided = true
+        let runner = self.runner
+        self.runner = nil
+        lock.unlock()
+        runner?.cancel()
+    }
+}
 
 struct OCRBlock: Codable {
     let id: String
@@ -37,6 +81,7 @@ struct OCRPage: Codable {
 // progress use per-job files, so no stale result can be consumed by a newer job.
 final class LocalOCR: @unchecked Sendable {
     private let serial = NSLock()
+    private let visionPreparation: OCRVisionPreparation
     private let root: URL
     private let script: URL
     private let cache: URL
@@ -44,9 +89,11 @@ final class LocalOCR: @unchecked Sendable {
     private var input: FileHandle?
     private var runtime: URL?
     private var log: FileHandle?
-    private let engineVersion = "manga-ocr-16"
+    static let engineVersion = "manga-ocr-17"
 
-    init(support: URL, resources: URL, engineRoot: URL? = nil) throws {
+    init(support: URL, resources: URL, engineRoot: URL? = nil,
+         visionPreparation: OCRVisionPreparation = OCRVisionPreparation()) throws {
+        self.visionPreparation = visionPreparation
         root = engineRoot ?? support.appendingPathComponent("OCR")
         cache = support.appendingPathComponent("Recognition")
         script = resources.appendingPathComponent("ocr_worker.py")
@@ -56,6 +103,7 @@ final class LocalOCR: @unchecked Sendable {
     deinit { shutdown() }
 
     func shutdown() {
+        visionPreparation.cancel()
         serial.lock(); defer { serial.unlock() }
         stopProcess(); cleanup()
     }
@@ -105,8 +153,10 @@ final class LocalOCR: @unchecked Sendable {
     }
 
     func prepare() throws {
-        serial.lock(); defer { serial.unlock() }
-        try start()
+        serial.lock()
+        do { try start(); serial.unlock() }
+        catch { serial.unlock(); throw error }
+        visionPreparation.schedule()
     }
 
     // Called on the recognition queue. Text-ready may include completed closed
@@ -116,7 +166,7 @@ final class LocalOCR: @unchecked Sendable {
                    onTextReady: ((OCRPage) -> Void)? = nil) throws -> OCRPage {
         serial.lock(); defer { serial.unlock() }
         try runner.checkCancellation()
-        let key = page.digest + "-" + engineVersion + ".json"
+        let key = page.digest + "-" + Self.engineVersion + ".json"
         let cached = cache.appendingPathComponent(key)
         if !force, let data = try? Data(contentsOf: cached), let result = try? JSONDecoder().decode(OCRPage.self, from: data) {
             CacheFiles.touch(cached)
@@ -125,6 +175,7 @@ final class LocalOCR: @unchecked Sendable {
             try runner.checkCancellation()
             return result
         }
+        visionPreparation.cancel()
         try start()
         let job = runtime!.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
@@ -138,9 +189,15 @@ final class LocalOCR: @unchecked Sendable {
             try runner.checkCancellation()
             throw AppError.message("本地识字连接已断开，请重试。")
         }
+        // The worker can stop while Vision is still unwinding its request. Keep
+        // the normal acknowledgement/cleanup loop below before deleting the job.
+        let cancelJob = runner.addCancellationHandler {
+            try? Data().write(to: job.appendingPathComponent("cancel"), options: .atomic)
+        }
+        defer { runner.removeCancellationHandler(cancelJob) }
         // Vision supplies independent Japanese evidence for unframed text and
         // small text missed by the comic detector. Images remain on this Mac.
-        let hints = Self.textHints(in: page.image)
+        let hints = Self.textHints(in: page.image, runner: runner)
         try JSONSerialization.data(withJSONObject: hints).write(to: job.appendingPathComponent("hints.json"), options: .atomic)
         let deadline = Date().addingTimeInterval(90)
         var cancelStart: Date?
@@ -171,7 +228,9 @@ final class LocalOCR: @unchecked Sendable {
             if let state {
                 switch state.phase {
                 case "cancelled": throw CancellationError()
-                case "error": throw AppError.message(state.message ?? "本地识字失败。")
+                case "error":
+                    try runner.checkCancellation()
+                    throw AppError.message(state.message ?? "本地识字失败。")
                 case "done":
                     try runner.checkCancellation()
                     guard let result = state.page else { throw AppError.message("识字结果不完整。") }
@@ -179,6 +238,10 @@ final class LocalOCR: @unchecked Sendable {
                     try runner.checkCancellation()
                     try JSONEncoder().encode(result).write(to: cached, options: .atomic)
                     trimCache()
+                    if runner.isCancelled {
+                        try? FileManager.default.removeItem(at: cached)
+                        throw CancellationError()
+                    }
                     return result
                 default: break
                 }
@@ -198,17 +261,62 @@ final class LocalOCR: @unchecked Sendable {
         CacheFiles.trim(cache, maxBytes: 128 * 1024 * 1024)
     }
 
-    static func textHints(in image: CGImage) -> [[String: Any]] {
+    // Internal fixture only: no screen capture, files, or AppKit drawing. It
+    // attempts initialization early; page recognition never joins this work.
+    static func visionPreparationImage() -> CGImage? {
+        guard let context = CGContext(data: nil, width: 320, height: 96, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 320, height: 96))
+        let attributes: [NSAttributedString.Key: Any] = [
+            NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("HiraginoSans-W3" as CFString, 30, nil),
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1)
+        ]
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: "今日は晴れです。", attributes: attributes))
+        context.textPosition = CGPoint(x: 10, y: 34)
+        CTLineDraw(line, context)
+        return context.makeImage()
+    }
+
+    static func prepareVision(runner: CommandRunner) {
+        guard !runner.isCancelled, let image = visionPreparationImage(), !runner.isCancelled else { return }
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["ja-JP", "en-US"]
         request.usesLanguageCorrection = false
         request.minimumTextHeight = 0.004
-        guard (try? VNImageRequestHandler(cgImage: image).perform([request])) != nil else { return [] }
+        _ = performVision(request, runner: runner) {
+            try VNImageRequestHandler(cgImage: image).perform([request])
+        }
+    }
+
+    // Each request gets its own registration, including refinement requests.
+    // The callback cannot cancel a later page after this request is finished.
+    static func performVision(_ request: VNRequest, runner: CommandRunner?, perform: () throws -> Void) -> Bool {
+        let registration = runner?.addCancellationHandler { request.cancel() }
+        defer { if let registration { runner?.removeCancellationHandler(registration) } }
+        guard runner?.isCancelled != true else { return false }
+        do { try perform() } catch { return false }
+        return runner?.isCancelled != true
+    }
+
+    static func textHints(in image: CGImage, runner: CommandRunner? = nil) -> [[String: Any]] {
+        guard runner?.isCancelled != true else { return [] }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["ja-JP", "en-US"]
+        request.usesLanguageCorrection = false
+        request.minimumTextHeight = 0.004
+        guard performVision(request, runner: runner, perform: {
+            try VNImageRequestHandler(cgImage: image).perform([request])
+        }) else { return [] }
         var refinements = 0
-        return (request.results ?? []).compactMap { observation in
+        var hints: [[String: Any]] = []
+        for observation in request.results ?? [] {
+            guard runner?.isCancelled != true else { return [] }
             guard var candidate = observation.topCandidates(1).first, candidate.confidence >= 0.3,
-                  candidate.string.unicodeScalars.contains(where: { (0x3040...0x30FF).contains($0.value) || (0x3400...0x9FFF).contains($0.value) }) else { return nil }
+                  candidate.string.unicodeScalars.contains(where: { (0x3040...0x30FF).contains($0.value) || (0x3400...0x9FFF).contains($0.value) }) else { continue }
             let rect = observation.boundingBox
             // Small slanted signs benefit from a level, enlarged line crop. Keep
             // ordinary dialogue on the single full-page pass.
@@ -222,16 +330,20 @@ final class LocalOCR: @unchecked Sendable {
                 ]).transformed(by: CGAffineTransform(scaleX: 2, y: 2))
                 let line = VNRecognizeTextRequest()
                 line.recognitionLevel = .accurate; line.recognitionLanguages = ["ja-JP"]; line.usesLanguageCorrection = true
-                if (try? VNImageRequestHandler(ciImage: straight).perform([line])) != nil,
+                if performVision(line, runner: runner, perform: {
+                    try VNImageRequestHandler(ciImage: straight).perform([line])
+                }),
                    let improved = line.results?.first?.topCandidates(1).first,
                    improved.confidence > candidate.confidence, improved.string.count >= candidate.string.count / 2 {
                     candidate = improved
                 }
             }
-            return ["text": candidate.string, "confidence": candidate.confidence,
+            guard runner?.isCancelled != true else { return [] }
+            hints.append(["text": candidate.string, "confidence": candidate.confidence,
                     "box": [rect.minX * Double(image.width), (1-rect.maxY) * Double(image.height),
-                            rect.maxX * Double(image.width), (1-rect.minY) * Double(image.height)]]
+                            rect.maxX * Double(image.width), (1-rect.minY) * Double(image.height)]])
         }
+        return runner?.isCancelled == true ? [] : hints
     }
 
 }

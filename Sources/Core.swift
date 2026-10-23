@@ -357,7 +357,9 @@ final class TranslationCache {
     }
 
     static func key(_ digest: String, _ options: TranslationOptions) -> String {
-        SHA256.hash(data: Data((digest + options.cacheNamespace).utf8)).map { String(format: "%02x", $0) }.joined()
+        // Whole-page entries include OCR geometry and erasure patches. Rebuild
+        // those after an engine update while retaining independent text caches.
+        SHA256.hash(data: Data((digest + options.cacheNamespace + "|" + LocalOCR.engineVersion).utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     func save(page: CapturedPage, options: TranslationOptions, translation: PageTranslation, elapsed: Double,
@@ -456,12 +458,41 @@ final class CommandRunner: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
     private var cancelled = false
+    private var cancellationHandlers: [UUID: () -> Void] = [:]
 
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
     func checkCancellation() throws { if isCancelled { throw CancellationError() } }
 
+    // Handlers capture one operation, never mutable "current request" state.
+    // Removing a handler releases its capture; a cancellation already executing
+    // that handler may still finish, so its operation must not be reused.
+    @discardableResult
+    func addCancellationHandler(_ handler: @escaping () -> Void) -> UUID {
+        let id = UUID()
+        lock.lock()
+        let invokeNow = cancelled
+        if !invokeNow { cancellationHandlers[id] = handler }
+        lock.unlock()
+        if invokeNow { handler() }
+        return id
+    }
+
+    func removeCancellationHandler(_ id: UUID) {
+        lock.lock()
+        let removed = cancellationHandlers.removeValue(forKey: id)
+        lock.unlock()
+        // Keep destruction of captured objects outside the runner lock too.
+        withExtendedLifetime(removed) {}
+    }
+
     func cancel() {
-        lock.lock(); cancelled = true; let running = process; lock.unlock()
+        lock.lock()
+        guard !cancelled else { lock.unlock(); return }
+        cancelled = true
+        let running = process, handlers = Array(cancellationHandlers.values)
+        cancellationHandlers.removeAll()
+        lock.unlock()
+        handlers.forEach { $0() }
         if let running, running.isRunning {
             running.terminate()
             DispatchQueue.global().asyncAfter(deadline: .now() + 2) {

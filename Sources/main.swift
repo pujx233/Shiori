@@ -1,5 +1,6 @@
 import AppKit
 import CoreText
+import CryptoKit
 import Foundation
 
 func makeFixture(_ destination: URL, vertical: Bool = false, shaded: Bool = false) throws {
@@ -101,6 +102,12 @@ func selfTest() throws {
     try check(bubble.rect(in: CGSize(width: 800, height: 500)) == CGRect(x: 600, y: 50, width: 160, height: 200),
               "bubble coordinates follow window scaling")
     let translation = PageTranslation(summary: "测试", dialogues: [Dialogue(location: "右", original: "おはよう", translation: "早上好", bounds: bubble)], notes: "")
+    let legacyKey = SHA256.hash(data: Data((page.digest + first.cacheNamespace).utf8)).map { String(format: "%02x", $0) }.joined()
+    let legacyEntry = CacheEntry(id: legacyKey, options: first, pageDigest: page.digest,
+                                translation: translation, createdAt: Date(), elapsed: 1)
+    try JSONEncoder().encode(legacyEntry).write(to: cache.directory.appendingPathComponent(legacyKey + ".json"))
+    try check(cache.lookup(page: page, options: first) == nil,
+              "old full-page cache cannot restore geometry or erasure patches from a previous OCR engine")
     _ = try cache.save(page: page, options: first, translation: translation, elapsed: 1)
     try check(cache.lookup(page: page, options: first) != nil, "same page and model reuse cache")
     try check(cache.lookup(page: page, options: second) == nil, "switching models does not reuse another model's translation")

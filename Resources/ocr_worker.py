@@ -511,7 +511,27 @@ class BackgroundRestorer:
         return cv2.resize(restored, (width,height), interpolation=cv2.INTER_CUBIC) if scale < 1 else restored
 
 
-def replacement_patch(image, text_mask, box, ink_labels=None, ink_ids=(), open_text=False, restorer=None):
+def surrounding_flat_color(image, box, mask):
+    """Verify a small caption's background without sampling a neighboring glyph."""
+    import numpy as np
+    x1, y1, x2, y2 = box
+    bands = [image[max(0,y1-3):y1, x1:x2], image[y2:y2+3, x1:x2],
+             image[y1:y2, max(0,x1-3):x1], image[y1:y2, x2:x2+3]]
+    samples = [band.reshape(-1, 3) for band in bands if band.size >= 36]
+    if len(samples) < 3:
+        return None
+    color = np.median(np.concatenate(samples), axis=0)
+    consistent = lambda pixels: np.max(np.abs(pixels.astype(float)-color), axis=1) <= 10
+    if sum(np.mean(consistent(band)) >= .95 for band in samples) < 3:
+        return None
+    background = image[y1:y2, x1:x2][mask == 0]
+    if len(background) < 12 or np.mean(consistent(background)) < .90:
+        return None
+    return color
+
+
+def replacement_patch(image, text_mask, box, ink_labels=None, ink_ids=(), open_text=False, restorer=None,
+                      font_size=None):
     """Use surrounding pixels for repair; composite only the original glyph mask."""
     import cv2
     import numpy as np
@@ -529,9 +549,21 @@ def replacement_patch(image, text_mask, box, ink_labels=None, ink_ids=(), open_t
         extra = np.isin(ink_labels[y1:y2, x1:x2], ink_ids).astype(np.uint8) * 255
         extra = cv2.dilate(extra, np.ones((3, 3), np.uint8), iterations=1)
         mask = cv2.bitwise_or(mask, extra)
+    flat_color = None
     if open_text:
         # Include white outlines around black letters, not just their dark cores.
-        mask = cv2.dilate(mask, np.ones((7, 7), np.uint8))
+        original = mask
+        mask = cv2.dilate(original, np.ones((7, 7), np.uint8))
+        if np.mean(mask > 0) > .95 and font_size is not None and 6 <= font_size <= 18:
+            # Fixed dilation can consume a tiny caption's entire crop. Only
+            # reduce it when the remaining pixels and three outside edges agree
+            # on a flat background; textured lettering keeps the original rule.
+            size = max(3, min(5, int(font_size * .3) // 2 * 2 + 1))
+            smaller = cv2.dilate(original, np.ones((size, size), np.uint8))
+            if np.any(smaller) and np.mean(smaller > 0) <= .95:
+                flat_color = surrounding_flat_color(image, box, smaller)
+                if flat_color is not None:
+                    mask = smaller
     if not np.any(mask) or np.mean(mask > 0) > .95:
         return None
     pad = max(32, min(72, min(x2-x1,y2-y1)))
@@ -543,7 +575,9 @@ def replacement_patch(image, text_mask, box, ink_labels=None, ink_ids=(), open_t
     ring = cv2.dilate(mask, np.ones((11, 11), np.uint8)) > 0
     background = crop[ring & (mask == 0)]
     flat = len(background) >= 12 and np.max(np.std(background, axis=0)) < 10
-    if flat:
+    if flat_color is not None:
+        restored = np.empty_like(crop); restored[:] = flat_color
+    elif flat:
         restored = np.empty_like(crop); restored[:] = np.median(background, axis=0)
     else:
         restored = (restorer(context, context_mask) if open_text and restorer is not None
@@ -815,7 +849,8 @@ def main():
                 target = padded_box(box, gray, labels, stats, component, font_sizes[component]) if component > 0 else box
                 patch_boxes[component] = target
                 patch_jobs[component] = repairs.submit(replacement_patch, image, text_mask, target,
-                    ink_labels, extra_ink.get(component, []), component < 0, restorer)
+                    ink_labels, extra_ink.get(component, []), component < 0, restorer,
+                    font_size=font_sizes[component])
             result, accepted_patches = [], {}
             recognized = list(recognized_boxes(
                 ocr, image, boxes, languages, font_sizes, directory, 8 if device == 'mps' else 1, text_mask))

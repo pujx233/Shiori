@@ -167,10 +167,16 @@ struct FittedText {
     let frame: CTFrame
     let origin: CGPoint
     let height: CGFloat
+    let clipRect: CGRect?
+
+    init(frame: CTFrame, origin: CGPoint, height: CGFloat, clipRect: CGRect? = nil) {
+        self.frame = frame; self.origin = origin; self.height = height; self.clipRect = clipRect
+    }
 
     func draw() {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         context.saveGState(); defer { context.restoreGState() }
+        if let clipRect { context.clip(to: clipRect) }
         context.textMatrix = .identity
         context.translateBy(x: origin.x, y: origin.y + height)
         context.scaleBy(x: 1, y: -1)
@@ -179,6 +185,36 @@ struct FittedText {
 
     static func flow(_ text: String, regions: [CGRect], style: String?, vertical: Bool,
                      maxFontSize: CGFloat?, gaps: [TextGap] = []) -> [FittedText]? {
+        let display = displayText(text, gaps: gaps)
+        return flowPrepared(display.text, regions: regions, style: style, vertical: vertical,
+                            maxFontSize: maxFontSize, gaps: display.gaps)
+    }
+
+    private static let punctuationSpacing = try! NSRegularExpression(pattern: "(?<=[。．…])[\\p{Zs}\\t]+(?=[．…])")
+
+    // Remove only horizontal spacing inside CJK dot sequences, without editing cached text.
+    // Positions are UTF-16 offsets, matching TextGap and Core Text even after emoji.
+    static func displayText(_ text: String, gaps: [TextGap]) -> (text: String, gaps: [TextGap]) {
+        let length = text.utf16.count
+        let removed = punctuationSpacing.matches(in: text, range: NSRange(location: 0, length: length)).map(\.range)
+        guard !removed.isEmpty else { return (text, gaps) }
+        let value = NSMutableString(string: text)
+        for range in removed.reversed() { value.deleteCharacters(in: range) }
+        func offset(_ position: Int) -> Int {
+            let position = min(length, max(0, position))
+            return position - removed.reduce(0) { total, range in
+                total + max(0, min(position, NSMaxRange(range)) - range.location)
+            }
+        }
+        let mapped = gaps.compactMap { gap -> TextGap? in
+            let start = offset(gap.location), end = offset(gap.location + gap.length)
+            return end > start ? TextGap(location: start, length: end-start) : nil
+        }
+        return (value as String, mapped)
+    }
+
+    private static func flowPrepared(_ text: String, regions: [CGRect], style: String?, vertical: Bool,
+                                     maxFontSize: CGFloat?, gaps: [TextGap]) -> [FittedText]? {
         guard !regions.isEmpty else { return nil }
         if regions.count == 1 || text.count < regions.count*3 {
             return make(text, rect: regions[0], style: style, vertical: vertical, maxFontSize: maxFontSize, gaps: gaps).map { [$0] }
@@ -202,7 +238,7 @@ struct FittedText {
                     return [first, second]
                 }
             }
-            return vertical ? flow(text, regions: regions, style: style, vertical: false, maxFontSize: maxFontSize, gaps: gaps) : nil
+            return vertical ? flowPrepared(text, regions: regions, style: style, vertical: false, maxFontSize: maxFontSize, gaps: gaps) : nil
         }
         var start = 0, result: [FittedText] = []
         for (index, region) in regions.enumerated() {
@@ -230,25 +266,12 @@ struct FittedText {
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center; paragraph.lineBreakMode = latinCount >= 6 ? .byWordWrapping : .byCharWrapping; paragraph.lineSpacing = 1
         let frameAttributes: [CFString: Any] = vertical ? [kCTFrameProgressionAttributeName: CTFrameProgression.rightToLeft.rawValue] : [:]
-        var size = min(max(12, maxFontSize ?? 18), style == nil ? 22 : 40)
-        while size >= (style == nil ? 7 : 8) {
-            let color = style == "outlinedLight" ? NSColor.white : NSColor.black
-            var attributes: [NSAttributedString.Key: Any] = [
-                NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("PingFangSC-Medium" as CFString, size, nil),
-                NSAttributedString.Key(kCTForegroundColorAttributeName as String): color.cgColor,
-                NSAttributedString.Key(kCTVerticalFormsAttributeName as String): vertical,
-                .paragraphStyle: paragraph]
-            if style != nil {
-                attributes[NSAttributedString.Key(kCTStrokeColorAttributeName as String)] = (style == "outlinedLight" ? NSColor.black : NSColor.white).cgColor
-                attributes[NSAttributedString.Key(kCTStrokeWidthAttributeName as String)] = -2
-            }
-            let string = NSMutableAttributedString(string: value, attributes: attributes)
-            for gap in visibleGaps {
-                string.addAttributes([
-                    NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("PingFangSC-Regular" as CFString, max(6, size*0.72), nil),
-                    NSAttributedString.Key(kCTForegroundColorAttributeName as String): NSColor(white: style == "outlinedLight" ? 0.72 : 0.48, alpha: 1).cgColor
-                ], range: gap.range)
-            }
+        let maximum = min(max(12, maxFontSize ?? 18), style == nil ? 22 : 40)
+        let minimum: CGFloat = style == nil ? 7 : 8
+        var size = maximum
+        while true {
+            let string = attributedText(value, size: size, style: style, vertical: vertical,
+                                        paragraph: paragraph, gaps: visibleGaps)
             let setter = CTFramesetterCreateWithAttributedString(string)
             func frame(_ box: CGRect) -> CTFrame {
                 CTFramesetterCreateFrame(setter, CFRange(location: 0, length: 0), CGPath(rect: box, transform: nil), frameAttributes as CFDictionary)
@@ -264,9 +287,90 @@ struct FittedText {
                 return FittedText(frame: fitted, origin: CGPoint(x: rect.minX+(rect.width-box.width)/2,
                     y: rect.minY+(rect.height-box.height)/2), height: box.height)
             }
+            if size == minimum { break }
+            size = max(minimum, size - 0.5)
+        }
+        if vertical { return make(text, rect: rect, style: style, vertical: false, maxFontSize: maxFontSize, gaps: gaps) }
+        return compactHorizontal(value, rect: rect, style: style, maximum: maximum, minimum: minimum,
+                                 lineBreakMode: paragraph.lineBreakMode, gaps: visibleGaps)
+    }
+
+    private static func attributedText(_ value: String, size: CGFloat, style: String?, vertical: Bool,
+                                       paragraph: NSParagraphStyle, gaps: [TextGap]) -> NSAttributedString {
+        let color = style == "outlinedLight" ? NSColor.white : NSColor.black
+        var attributes: [NSAttributedString.Key: Any] = [
+            NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("PingFangSC-Medium" as CFString, size, nil),
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): color.cgColor,
+            NSAttributedString.Key(kCTVerticalFormsAttributeName as String): vertical,
+            .paragraphStyle: paragraph]
+        if style != nil {
+            attributes[NSAttributedString.Key(kCTStrokeColorAttributeName as String)] = (style == "outlinedLight" ? NSColor.black : NSColor.white).cgColor
+            attributes[NSAttributedString.Key(kCTStrokeWidthAttributeName as String)] = -2
+        }
+        let string = NSMutableAttributedString(string: value, attributes: attributes)
+        for gap in gaps {
+            string.addAttributes([
+                NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("PingFangSC-Regular" as CFString, max(6, size*0.72), nil),
+                NSAttributedString.Key(kCTForegroundColorAttributeName as String): NSColor(white: style == "outlinedLight" ? 0.72 : 0.48, alpha: 1).cgColor
+            ], range: gap.range)
+        }
+        return string
+    }
+
+    // Short annotations can fit their ink while Core Text's default leading does not.
+    // Retry only failed horizontal layouts, retaining the same region and font floor.
+    private static func compactHorizontal(_ value: String, rect: CGRect, style: String?, maximum: CGFloat,
+                                          minimum: CGFloat, lineBreakMode: NSLineBreakMode, gaps: [TextGap]) -> FittedText? {
+        func fit(_ size: CGFloat) -> FittedText? {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center; paragraph.lineBreakMode = lineBreakMode
+            paragraph.minimumLineHeight = size * 1.05
+            paragraph.maximumLineHeight = size * 1.05
+            let string = attributedText(value, size: size, style: style, vertical: false, paragraph: paragraph, gaps: gaps)
+            // Extra frame height admits the font's top/bottom leading; it never enlarges the safe drawing region.
+            let height = rect.height + size * 3
+            let frame = CTFramesetterCreateFrame(CTFramesetterCreateWithAttributedString(string), CFRange(location: 0, length: 0),
+                CGPath(rect: CGRect(x: 0, y: 0, width: rect.width, height: height), transform: nil), nil)
+            if CTFrameGetVisibleStringRange(frame).length == string.length,
+               let ink = compactInkBounds(frame, stroke: style == nil ? 0 : size * 0.01),
+               ink.width <= rect.width, ink.height <= rect.height {
+                return FittedText(frame: frame, origin: CGPoint(x: rect.midX - ink.midX,
+                    y: rect.midY + ink.midY - height), height: height, clipRect: rect)
+            }
+            return nil
+        }
+        // A failed minimum-size layout cannot be rescued by enlarging the same text.
+        // In particular, do not repeat the whole search at every two-region split.
+        guard let smallest = fit(minimum) else { return nil }
+        var size = floor(maximum * 2) / 2
+        while size > minimum {
+            if let fitted = fit(size) { return fitted }
             size -= 0.5
         }
-        return vertical ? make(text, rect: rect, style: style, vertical: false, maxFontSize: maxFontSize, gaps: gaps) : nil
+        return smallest
+    }
+
+    private static func compactInkBounds(_ frame: CTFrame, stroke: CGFloat) -> CGRect? {
+        let lines = CTFrameGetLines(frame) as! [CTLine]
+        var origins = [CGPoint](repeating: .zero, count: lines.count)
+        CTFrameGetLineOrigins(frame, CFRange(location: 0, length: 0), &origins)
+        var union = CGRect.null, previous = CGRect.null
+        for (line, origin) in zip(lines, origins) {
+            // Bitmap/color glyphs do not have reliable path bounds; leave those to the regular layout.
+            for run in CTLineGetGlyphRuns(line) as! [CTRun] {
+                let attributes = CTRunGetAttributes(run) as NSDictionary
+                if let font = attributes[kCTFontAttributeName] {
+                    let traits = CTFontGetSymbolicTraits(font as! CTFont)
+                    if traits.contains(.traitColorGlyphs) { return nil }
+                }
+            }
+            let path = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
+            guard !path.isNull else { continue }
+            let ink = path.offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: -stroke, dy: -stroke)
+            if !previous.isNull, previous.minY - ink.maxY < 0.25 { return nil }
+            previous = ink; union = union.union(ink)
+        }
+        return union.isNull || union.isEmpty ? nil : union
     }
 }
 
