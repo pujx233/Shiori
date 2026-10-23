@@ -923,9 +923,23 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
         patch_jobs[('final', component)] = future
         accepted_patches[block_identifier(component, box)] = future
     missing = [(c, b) for c, b in boxes if (c, tuple(b), fonts[c]) not in early_text]
-    for _, component, box, text in recognized_boxes(
-            ocr, image, missing, languages, fonts, directory, batch_size, text_mask):
+    for completed, (_, component, box, text) in enumerate(recognized_boxes(
+            ocr, image, missing, languages, fonts, directory, batch_size, text_mask), 1):
         early_text[(component, tuple(box), fonts[component])] = text
+        if completed % batch_size == 0 or completed == len(missing):
+            # A fast Vision response must not turn the whole page back into a
+            # barrier. Publish completed decoder batches on this path too;
+            # independent verification below retains its original reading order
+            # and retry budget, and can still correct these provisional strings.
+            draft = []
+            for known, bounds in boxes:
+                value = early_text.get((known, tuple(bounds), fonts[known]))
+                if (known > 0 and fonts[known] >= 10 and 'ja' in languages[known]
+                        and value is not None and japanese_text(value, languages[known])):
+                    draft.append(page_block(known, bounds, value, [], targets[known], fonts[known],
+                                            directions[known], gray, labels, stats))
+            if draft:
+                publish_draft(directory, draft, skipped, accepted_patches, start)
     result, uncertainty_budget = [], [4]
     for component, box in boxes:
         if cancelled(directory):
@@ -947,6 +961,29 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
     finish_page(directory, result, skipped, accepted_patches, start)
 
 
+def load_manga_ocr(model_type, path):
+    """Load the upstream model, leaving its first decode for a real crop.
+
+    MangaOcr's constructor decodes example.jpg before we can apply the page
+    decoder settings. That throwaway decode delayed first-page results without
+    improving the measured real batch; keep the upstream package unmodified.
+    """
+    class FirstRealCropMangaOcr(model_type):
+        def __init__(self, model_path):
+            self._shiori_loading = True
+            try:
+                super().__init__(model_path)
+            finally:
+                self._shiori_loading = False
+
+        def __call__(self, image):
+            if self._shiori_loading:
+                return ''
+            return super().__call__(image)
+
+    return FirstRealCropMangaOcr(str(path))
+
+
 def main():
     import cv2
     import numpy as np
@@ -962,7 +999,7 @@ def main():
     runtime = Path(sys.argv[2])
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
     detector = TextDetector(root / 'models/comictextdetector.pt', device=device, input_size=1024, act='leaky')
-    ocr = MangaOcr(str(root / 'models/manga'))
+    ocr = load_manga_ocr(MangaOcr, root / 'models/manga')
     ocr.model.generation_config.num_beams = 2
     restorer = BackgroundRestorer(root / 'models/big-lama.pt')
     repairs = ThreadPoolExecutor(max_workers=1, thread_name_prefix='background-repair')

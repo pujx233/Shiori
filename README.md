@@ -39,6 +39,7 @@ Apple Silicon、macOS 14+、Apple Command Line Tools 和 uv。选择 Codex 时�
 ```
 
 应用位于 `build/Shiori.app`。本地识字组件保存在 `~/Library/Application Support/Shiori/OCR`。
+Vision 编译为独立的 `Contents/Helpers/ShioriVision`，使用固定签名，避免无关的主程序更新改变其可执行文件身份。首次运行仍需由系统初始化识字模型；后续启动可复用系统缓存。
 安装前退出 Shiori。安装脚本会核对名称和签名，避免更新时更换系统授权所绑定的身份。
 
 默认使用固定的本地签名，保存在 `~/Library/Application Support/Shiori Development/Signing`；后续构建复用同一身份。首次从临时签名迁移时需重新授权。签名不会修改系统信任设置。设置 `MANGA_SIGNING_IDENTITY` 可改用已有开发者证书。
@@ -48,6 +49,8 @@ Apple Silicon、macOS 14+、Apple Command Line Tools 和 uv。选择 Codex 时�
 ## 开源组件与参考
 
 识字使用 [Manga OCR](https://github.com/kha-white/manga-ocr) 和 [Mokuro / Comic Text Detector](https://github.com/kha-white/mokuro)，版本见 `Resources/ocr-requirements.txt`。
+
+Manga OCR 初始化时跳过上游构造器的示例图片推理，首次推理直接处理真实漫画；两条识字路径都按批次交付可靠气泡，最终复核仍会补充或纠正结果。
 
 背景修复使用 [LaMa](https://github.com/advimman/lama)，权重来自 [simple-lama-inpainting 的官方发布](https://github.com/enesmsahin/simple-lama-inpainting/releases/tag/v0.1.0)，安装时校验 SHA-256。OCR 按文字长度分批、局部修复与识字并行；未检测为文字框的笔画从已有分割图中补检。
 

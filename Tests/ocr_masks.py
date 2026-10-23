@@ -173,6 +173,62 @@ class TextHandoffTests(unittest.TestCase):
 
 
 class ProgressivePageTests(unittest.TestCase):
+    def test_ready_vision_publishes_a_closed_batch_before_the_remaining_page(self):
+        image = np.full((540, 750, 3), 220, np.uint8)
+        detected = []
+        for index in range(9):
+            x, y = (index % 3)*250+20, (index // 3)*180+20
+            cv2.rectangle(image, (x, y), (x+200, y+130), (0, 0, 0), 2)
+            cv2.rectangle(image, (x+2, y+2), (x+198, y+128), (255, 255, 255), -1)
+            detected.append(SimpleNamespace(xyxy=[x+60, y+25, x+120, y+100],
+                                            language='ja', font_size=16, vertical=True))
+        class Detector:
+            input_size = None
+            def __call__(self, value):
+                mask = np.zeros(value.shape[:2], np.uint8)
+                return mask, mask, detected
+        release, blocked = threading.Event(), threading.Event()
+        def recognized(ocr, image, boxes, languages, fonts, directory, batch, mask):
+            self.assertEqual(len(boxes), 9)
+            time.sleep(.025)
+            for index, (component, box) in enumerate(boxes):
+                if index == 8:
+                    blocked.set(); release.wait(2)
+                yield index, component, box, 'おはよう'
+        replacements = {
+            'recover_candidates': lambda *args: [], 'separate_caption_lines': lambda found: found,
+            'recognized_boxes': recognized, 'replacement_patch': lambda *args, **kwargs: 'closed-png',
+            'reliable_hint': lambda *args, **kwargs: None,
+            'restore_voicing': lambda text, *args: text,
+            'reconcile_fragments': lambda ocr, image, box, text, *args: (text, []),
+            'confirm_fragments': lambda *args: [],
+        }
+        with tempfile.TemporaryDirectory() as folder, ThreadPoolExecutor(max_workers=1) as repairs, patch.dict(worker, replacements):
+            directory, errors = Path(folder), []
+            (directory/'hints.json').write_text('[]')
+            def run():
+                try:
+                    worker['recognize_page'](directory, image, Detector(), None, None, repairs, None,
+                        'mps', True, time.monotonic(), {})
+                except BaseException as error:
+                    errors.append(error)
+            task = threading.Thread(target=run); task.start()
+            try:
+                self.assertTrue(blocked.wait(2))
+                self.assertFalse(errors)
+                draft = json.loads((directory/'text.json').read_text())
+                self.assertEqual(len(draft['blocks']), 8)
+                self.assertTrue(all(block['replacementAllowed'] for block in draft['blocks']))
+                self.assertTrue(task.is_alive(), 'the first batch is available before the ninth crop')
+            finally:
+                release.set(); task.join(2)
+            self.assertFalse(task.is_alive()); self.assertFalse(errors)
+            final = json.loads((directory/'state.json').read_text())['page']
+            self.assertEqual(len(final['blocks']), 9)
+            self.assertEqual([block['id'] for block in final['blocks'][:8]],
+                             [block['id'] for block in draft['blocks']])
+            self.assertTrue(all(block['text'] == 'おはよう' for block in final['blocks']))
+
     def test_closed_balloon_precedes_vision_and_reuses_ocr_and_patch(self):
         image = np.full((240, 400, 3), 220, np.uint8)
         for box in [(240, 20, 380, 150), (20, 40, 140, 190)]:
@@ -350,6 +406,26 @@ class GlyphReplacementTests(unittest.TestCase):
 
 
 class RecognitionTests(unittest.TestCase):
+    def test_model_loading_skips_only_the_constructor_example_decode(self):
+        calls = []
+        class UpstreamOCR:
+            def __init__(self, path):
+                calls.append(('load', path))
+                self.model = SimpleNamespace(generation_config=SimpleNamespace(num_beams=1))
+                self('upstream-example')
+
+            def __call__(self, value):
+                calls.append(('decode', value, self.model.generation_config.num_beams))
+                return 'おはよう'
+
+        ocr = worker['load_manga_ocr'](UpstreamOCR, Path('/local/model'))
+        self.assertEqual(calls, [('load', '/local/model')])
+        ocr.model.generation_config.num_beams = 2
+        self.assertEqual(ocr('real-crop'), 'おはよう')
+        self.assertEqual(calls[-1], ('decode', 'real-crop', 2))
+        self.assertEqual(ocr('next-crop'), 'おはよう')
+        self.assertEqual(calls[-1], ('decode', 'next-crop', 2))
+
     def test_parallel_detector_waits_for_complete_hints_and_cancel_does_not_hang(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)

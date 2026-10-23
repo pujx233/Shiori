@@ -3,6 +3,7 @@ import Foundation
 import Vision
 import CoreImage
 import CoreText
+import ImageIO
 
 // A single optional initialization attempt. Uncached reading closes this
 // gate, including when prepare's queued closure has not begun running yet.
@@ -63,10 +64,11 @@ private final class OCRVisionMailbox: @unchecked Sendable {
         cancellation = parent.addCancellationHandler { [runner] in runner.cancel() }
     }
 
-    func start(image: CGImage, recognize: @escaping @Sendable (CGImage, CommandRunner) -> [[String: Any]]) {
+    func start(image: CGImage, imageFile: URL,
+               recognize: @escaping @Sendable (CGImage, URL, CommandRunner) -> [[String: Any]]) {
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             guard !runner.isCancelled else { return }
-            let hints = recognize(image, runner)
+            let hints = recognize(image, imageFile, runner)
             lock.lock(); defer { lock.unlock() }
             guard !closed, !runner.isCancelled, !parent.isCancelled else { return }
             if let data = try? JSONSerialization.data(withJSONObject: hints) {
@@ -117,7 +119,7 @@ struct OCRPage: Codable {
 final class LocalOCR: @unchecked Sendable {
     private let serial = NSLock()
     private let visionPreparation: OCRVisionPreparation
-    private let visionHints: @Sendable (CGImage, CommandRunner) -> [[String: Any]]
+    private let visionHints: @Sendable (CGImage, URL, CommandRunner) -> [[String: Any]]
     private let root: URL
     private let script: URL
     private let cache: URL
@@ -128,10 +130,22 @@ final class LocalOCR: @unchecked Sendable {
     static let engineVersion = "manga-ocr-18"
 
     init(support: URL, resources: URL, engineRoot: URL? = nil,
-         visionPreparation: OCRVisionPreparation = OCRVisionPreparation(),
-         visionHints: @escaping @Sendable (CGImage, CommandRunner) -> [[String: Any]] = { LocalOCR.textHints(in: $0, runner: $1) }) throws {
-        self.visionPreparation = visionPreparation
-        self.visionHints = visionHints
+         visionPreparation: OCRVisionPreparation? = nil,
+         visionHints: (@Sendable (CGImage, CommandRunner) -> [[String: Any]])? = nil,
+         visionFileHints: (@Sendable (CGImage, URL, CommandRunner) -> [[String: Any]])? = nil) throws {
+        let helper = Self.visionHelperURL(resources: resources)
+        self.visionPreparation = visionPreparation ?? OCRVisionPreparation {
+            LocalOCR.prepareVision(runner: $0, helperURL: helper)
+        }
+        if let visionFileHints {
+            self.visionHints = visionFileHints
+        } else if let visionHints {
+            self.visionHints = { image, _, runner in visionHints(image, runner) }
+        } else {
+            self.visionHints = { image, file, runner in
+                LocalOCR.textHints(in: image, runner: runner, helperURL: helper, imageFile: file)
+            }
+        }
         root = engineRoot ?? support.appendingPathComponent("OCR")
         cache = support.appendingPathComponent("Recognition")
         script = resources.appendingPathComponent("ocr_worker.py")
@@ -303,7 +317,7 @@ final class LocalOCR: @unchecked Sendable {
         // framework's cold initialization. The final pass still uses its evidence.
         let vision = OCRVisionMailbox(directory: job, parent: runner)
         defer { vision.close() }
-        vision.start(image: page.image, recognize: visionHints)
+        vision.start(image: page.image, imageFile: job.appendingPathComponent("page.png"), recognize: visionHints)
         let deadline = Date().addingTimeInterval(90)
         var cancelStart: Date?
         var lastProgress = ""
@@ -368,34 +382,29 @@ final class LocalOCR: @unchecked Sendable {
         CacheFiles.trim(cache, maxBytes: 128 * 1024 * 1024)
     }
 
-    // Internal fixture only: no screen capture, files, or AppKit drawing. It
-    // attempts initialization early; page recognition never joins this work.
-    static func visionPreparationImage() -> CGImage? {
-        guard let context = CGContext(data: nil, width: 320, height: 96, bitsPerComponent: 8,
-                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        context.setFillColor(CGColor(gray: 1, alpha: 1))
-        context.fill(CGRect(x: 0, y: 0, width: 320, height: 96))
-        let attributes: [NSAttributedString.Key: Any] = [
-            NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("HiraginoSans-W3" as CFString, 30, nil),
-            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1)
-        ]
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: "今日は晴れです。", attributes: attributes))
-        context.textPosition = CGPoint(x: 10, y: 34)
-        CTLineDraw(line, context)
-        return context.makeImage()
+    static func visionHelperURL(resources: URL) -> URL {
+        resources.deletingLastPathComponent().appendingPathComponent("Helpers/ShioriVision")
     }
 
-    static func prepareVision(runner: CommandRunner) {
-        guard !runner.isCancelled, let image = visionPreparationImage(), !runner.isCancelled else { return }
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["ja-JP", "en-US"]
-        request.usesLanguageCorrection = false
-        request.minimumTextHeight = 0.004
-        _ = performVision(request, runner: runner) {
-            try VNImageRequestHandler(cgImage: image).perform([request])
+    private static var bundledVisionHelper: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/ShioriVision")
+    }
+
+    // Kept available to standalone tests. Packaged builds prepare the same stable
+    // helper executable used by actual pages; no screenshots are needed here.
+    static func visionPreparationImage() -> CGImage? { VisionRecognition.visionPreparationImage() }
+
+    static func prepareVision(runner: CommandRunner, helperURL: URL? = nil) {
+        let helper = helperURL ?? bundledVisionHelper
+        if FileManager.default.fileExists(atPath: helper.path) {
+            guard FileManager.default.isExecutableFile(atPath: helper.path), !runner.isCancelled else { return }
+            _ = try? runner.run(executable: helper, arguments: ["--prepare"],
+                                directory: helper.deletingLastPathComponent(), timeout: 45)
+            return
         }
+        VisionRecognition.prepare(isCancelled: { runner.isCancelled }, perform: { request, work in
+            performVision(request, runner: runner, perform: work)
+        })
     }
 
     // Each request gets its own registration, including refinement requests.
@@ -408,49 +417,57 @@ final class LocalOCR: @unchecked Sendable {
         return runner?.isCancelled != true
     }
 
-    static func textHints(in image: CGImage, runner: CommandRunner? = nil) -> [[String: Any]] {
+    static func textHints(in image: CGImage, runner: CommandRunner? = nil,
+                          helperURL: URL? = nil, imageFile: URL? = nil,
+                          helperTimeout: TimeInterval = 25) -> [[String: Any]] {
+        let helper = helperURL ?? bundledVisionHelper
         guard runner?.isCancelled != true else { return [] }
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["ja-JP", "en-US"]
-        request.usesLanguageCorrection = false
-        request.minimumTextHeight = 0.004
-        guard performVision(request, runner: runner, perform: {
-            try VNImageRequestHandler(cgImage: image).perform([request])
-        }) else { return [] }
-        var refinements = 0
-        var hints: [[String: Any]] = []
-        for observation in request.results ?? [] {
-            guard runner?.isCancelled != true else { return [] }
-            guard var candidate = observation.topCandidates(1).first, candidate.confidence >= 0.3,
-                  candidate.string.unicodeScalars.contains(where: { (0x3040...0x30FF).contains($0.value) || (0x3400...0x9FFF).contains($0.value) }) else { continue }
-            let rect = observation.boundingBox
-            // Small slanted signs benefit from a level, enlarged line crop. Keep
-            // ordinary dialogue on the single full-page pass.
-            if candidate.confidence < 0.7, rect.width * CGFloat(image.width) > rect.height * CGFloat(image.height) * 1.6,
-               rect.height < 0.10, candidate.string.count >= 3, refinements < 6 {
-                refinements += 1
-                func point(_ p: CGPoint) -> CIVector { CIVector(x: p.x * CGFloat(image.width), y: p.y * CGFloat(image.height)) }
-                let straight = CIImage(cgImage: image).applyingFilter("CIPerspectiveCorrection", parameters: [
-                    "inputTopLeft": point(observation.topLeft), "inputTopRight": point(observation.topRight),
-                    "inputBottomLeft": point(observation.bottomLeft), "inputBottomRight": point(observation.bottomRight)
-                ]).transformed(by: CGAffineTransform(scaleX: 2, y: 2))
-                let line = VNRecognizeTextRequest()
-                line.recognitionLevel = .accurate; line.recognitionLanguages = ["ja-JP"]; line.usesLanguageCorrection = true
-                if performVision(line, runner: runner, perform: {
-                    try VNImageRequestHandler(ciImage: straight).perform([line])
-                }),
-                   let improved = line.results?.first?.topCandidates(1).first,
-                   improved.confidence > candidate.confidence, improved.string.count >= candidate.string.count / 2 {
-                    candidate = improved
-                }
-            }
-            guard runner?.isCancelled != true else { return [] }
-            hints.append(["text": candidate.string, "confidence": candidate.confidence,
-                    "box": [rect.minX * Double(image.width), (1-rect.maxY) * Double(image.height),
-                            rect.maxX * Double(image.width), (1-rect.minY) * Double(image.height)]])
+        // A missing helper is expected in standalone source tests. A present but
+        // failed helper never falls back into another expensive in-process run.
+        guard FileManager.default.fileExists(atPath: helper.path) else {
+            return VisionRecognition.textHints(in: image, isCancelled: { runner?.isCancelled == true },
+                perform: { request, work in performVision(request, runner: runner, perform: work) })
         }
-        return runner?.isCancelled == true ? [] : hints
+        guard FileManager.default.isExecutableFile(atPath: helper.path) else { return [] }
+        // Recognition already owns a PNG in its unique job directory. Borrow it
+        // for this request; only the job's owner may remove this file.
+        if let imageFile {
+            return helperTextHints(imageFile: imageFile, helper: helper, runner: runner, timeout: helperTimeout)
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("shiori-vision-" + UUID().uuidString)
+        do {
+            try runner?.checkCancellation()
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let file = directory.appendingPathComponent("page.png")
+            guard let destination = CGImageDestinationCreateWithURL(file as CFURL, "public.png" as CFString, 1, nil) else { return [] }
+            CGImageDestinationAddImage(destination, image, nil)
+            guard CGImageDestinationFinalize(destination) else { return [] }
+            return helperTextHints(imageFile: file, helper: helper, runner: runner, timeout: helperTimeout)
+        } catch {
+            return []
+        }
+    }
+
+    private static func helperTextHints(imageFile: URL, helper: URL, runner: CommandRunner?,
+                                        timeout: TimeInterval) -> [[String: Any]] {
+        // A helper timeout must not cancel the page's mailbox: it still needs
+        // to deliver [] so detector/Manga OCR results can finish normally.
+        let childRunner = CommandRunner()
+        let cancellation = runner?.addCancellationHandler { childRunner.cancel() }
+        defer { if let cancellation { runner?.removeCancellationHandler(cancellation) } }
+        do {
+            try childRunner.checkCancellation()
+            let result = try childRunner.run(executable: helper, arguments: ["--image", imageFile.path],
+                                             directory: helper.deletingLastPathComponent(), timeout: timeout)
+            try childRunner.checkCancellation()
+            guard result.status == 0,
+                  let hints = try JSONSerialization.jsonObject(with: result.stdout) as? [[String: Any]] else { return [] }
+            return hints
+        } catch {
+            return []
+        }
     }
 
 }

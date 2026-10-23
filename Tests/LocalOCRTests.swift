@@ -1,7 +1,8 @@
 import AppKit
 import Foundation
 
-// Compile with Core.swift, CodexSession.swift, GoogleTranslation.swift and OCR.swift.
+// Compile with Core.swift, CodexSession.swift, GoogleTranslation.swift,
+// VisionRecognition.swift and OCR.swift.
 // Exercises the real per-job file protocol without loading OCR models or capturing a screen.
 @main
 struct LocalOCRTests {
@@ -226,11 +227,13 @@ struct LocalOCRTests {
 
         let lateRelease = DispatchSemaphore(value: 0), lateEntered = DispatchSemaphore(value: 0)
         let lateFinished = DispatchSemaphore(value: 0), lateCancelled = DispatchSemaphore(value: 0)
-        let lateOCR = try LocalOCR(support: root, resources: root, visionHints: { _, runner in
+        let lateOCR = try LocalOCR(support: root, resources: root, visionFileHints: { _, imageFile, runner in
             let registration = runner.addCancellationHandler { lateCancelled.signal() }
             defer { runner.removeCancellationHandler(registration); lateFinished.signal() }
+            precondition(imageFile.lastPathComponent == "page.png" && FileManager.default.fileExists(atPath: imageFile.path))
             lateEntered.signal()
             _ = lateRelease.wait(timeout: .now() + 4)
+            precondition(!FileManager.default.fileExists(atPath: imageFile.path))
             return [["text": "遅れた結果"]]
         })
         defer { lateOCR.shutdown() }
