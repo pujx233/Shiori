@@ -31,12 +31,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private let capture = ReaderCapture()
     private let overlay = MangaOverlay()
     private var models: [ModelInfo] = []
+    private var trackingSelectionMenus = Set<ObjectIdentifier>()
+    private var pendingModelCatalog: [ModelInfo]?
+    private var pendingApplicationRefresh = false
     private var timer: Timer?
     private var modelTimer: Timer?
     private var timerStatus: Timer?
     private var tracker = PageTracker()
     private var probeTracker = PageTracker()
     private var lastProbeDigest: String?
+    private var settlingProbe: Task<Void, Never>?
+    private var didConfirmCandidate = false
     private var probeCaptures = 0
     private var fullCaptures = 0
     private var latestPage: CapturedPage?
@@ -374,6 +379,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
     private func applyModels(_ catalog: [ModelInfo]) {
+        guard trackingSelectionMenus.isEmpty else { pendingModelCatalog = catalog; return }
         let old = options
         models = catalog
         let previousModel = modelBox.titleOfSelectedItem ?? defaults.string(forKey: "selectedModel") ?? ""
@@ -389,7 +395,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let selected = effortBox.titleOfSelectedItem ?? "low"
         let supported = models.first(where: { $0.slug == modelBox.titleOfSelectedItem })?.supported_reasoning_levels?.map(\.effort)
              ?? ["low", "medium", "high"]
-        effortBox.removeAllItems(); effortBox.addItems(withTitles: supported.isEmpty ? ["low"] : supported)
+        let levels = supported.isEmpty ? ["low"] : supported
+        guard effortBox.itemTitles != levels else { return }
+        effortBox.removeAllItems(); effortBox.addItems(withTitles: levels)
         effortBox.selectItem(withTitle: selected)
         if effortBox.indexOfSelectedItem < 0 { effortBox.selectItem(at: 0) }
     }
@@ -415,36 +423,66 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         if menu === sourceActions {
             menu.appearance = NSApp.effectiveAppearance
             rebuildSourceActions(menu)
+        } else if menu === sourceBox.menu {
+            // Update before AppKit computes menu geometry or starts tracking.
+            refreshApplications()
         }
     }
     func menuWillOpen(_ menu: NSMenu) {
-        if menu === sourceActions { return }
-        if menu === sourceBox.menu { refreshApplications() }
-        if let control = [sourceBox, providerBox, modelBox, effortBox].compactMap({ $0 }).first(where: { $0.menu === menu }) {
-            for item in menu.items { item.state = item === control.selectedItem ? .on : .off }
+        if [sourceBox, providerBox, modelBox, effortBox].compactMap({ $0 }).contains(where: { $0.menu === menu }) {
+            trackingSelectionMenus.insert(ObjectIdentifier(menu))
         }
     }
     func menuDidClose(_ menu: NSMenu) {
-        guard menu === sourceActions else { return }
+        if menu === sourceActions {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.statusItem.menu === menu else { return }
+                self.statusItem.menu = nil
+            }
+            return
+        }
+        guard trackingSelectionMenus.remove(ObjectIdentifier(menu)) != nil else { return }
+        // Menu tracking and the selected item's action must both finish before
+        // an asynchronous catalog or application refresh can replace items.
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.statusItem.menu === menu else { return }
-            self.statusItem.menu = nil
+            guard let self, self.trackingSelectionMenus.isEmpty else { return }
+            if let catalog = self.pendingModelCatalog {
+                self.pendingModelCatalog = nil
+                self.applyModels(catalog)
+            }
+            if self.pendingApplicationRefresh {
+                self.pendingApplicationRefresh = false
+                self.refreshApplications()
+            }
         }
     }
     private func refreshApplications() {
-        applications = CaptureSource.running()
+        guard trackingSelectionMenus.isEmpty else { pendingApplicationRefresh = true; return }
+        let running = CaptureSource.running()
         let legacy = defaults.string(forKey: "captureSource") == "chrome" ? "com.google.Chrome" : "com.xiaogd.kedamanga"
         let preferred = defaults.string(forKey: "captureApplication") ?? legacy
-        let selected = applications.first { $0.processID == capture.source?.processID } ?? applications.first { $0.identity == preferred }
+        let selected = running.first { $0.processID == capture.source?.processID } ?? running.first { $0.identity == preferred }
+        let items = sourceBox.itemArray.dropFirst()
+        let unchanged = items.count == running.count && zip(items, running).allSatisfy { item, app in
+            item.representedObject as? pid_t == app.processID && item.title == app.title
+        }
+        applications = running
         if selected?.processID != capture.source?.processID {
             stopWork(); capture.source = selected; latestPage = nil; shownEntry = nil; overlay.hide()
         }
-        sourceBox.removeAllItems(); sourceBox.addItem(withTitle: "选择软件"); sourceBox.item(at: 0)?.isEnabled = false
-        for app in applications {
-            sourceBox.addItem(withTitle: app.title); sourceBox.lastItem?.representedObject = app.processID
-            if let icon = app.application?.icon?.copy() as? NSImage { icon.size = NSSize(width: 16, height: 16); sourceBox.lastItem?.image = icon }
+        if !unchanged {
+            sourceBox.removeAllItems(); sourceBox.addItem(withTitle: "选择软件"); sourceBox.item(at: 0)?.isEnabled = false
+            for app in applications {
+                // Distinct processes can have the same display name. Adding the
+                // menu item directly preserves each process and its stable ID.
+                let item = NSMenuItem(title: app.title, action: nil, keyEquivalent: "")
+                item.representedObject = app.processID
+                if let icon = app.application?.icon?.copy() as? NSImage { icon.size = NSSize(width: 16, height: 16); item.image = icon }
+                sourceBox.menu?.addItem(item)
+            }
         }
-        sourceBox.selectItem(at: selected.flatMap { source in applications.firstIndex { $0.processID == source.processID }.map { $0 + 1 } } ?? 0)
+        let index = selected.flatMap { source in sourceBox.itemArray.firstIndex { $0.representedObject as? pid_t == source.processID } } ?? 0
+        if sourceBox.indexOfSelectedItem != index { sourceBox.selectItem(at: index) }
     }
     @objc private func refreshSources() { refreshApplications(); connectReader() }
     @objc private func connectReader() {
@@ -546,8 +584,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             guard let probe = probeTracker.observe(sample) else {
                 overlay.hide()
                 if runner == nil, autoButton.state == .on { setStatus("正在检查新页面…") }
+                // Confirm a page turn promptly, without increasing the idle
+                // screenshot rate or continuously chasing an animation.
+                if !didConfirmCandidate {
+                    didConfirmCandidate = true
+                    settlingProbe?.cancel()
+                    settlingProbe = Task { @MainActor [weak self] in
+                        do { try await Task.sleep(nanoseconds: 200_000_000) }
+                        catch { return }
+                        guard let self, self.operationEpoch == epoch else { return }
+                        self.settlingProbe = nil
+                        await self.poll()
+                    }
+                }
                 return
             }
+            settlingProbe?.cancel(); settlingProbe = nil; didConfirmCandidate = false
             if lastProbeDigest == probe.digest {
                 updateOverlay()
                 if runner == nil, ["正在检查新页面…", "等待阅读窗口…", "等待原阅读窗口…", "等待原阅读页面…"].contains(statusText), let entry = shownEntry { show(entry, cached: true) }
@@ -752,7 +804,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         updateStatus()
     }
     private func cancelTranslation() { runner?.cancel(); finishBusyState() }
-    private func resetTracking() { tracker.reset(); probeTracker.reset(); lastProbeDigest = nil }
+    private func resetTracking() {
+        settlingProbe?.cancel(); settlingProbe = nil; didConfirmCandidate = false
+        tracker.reset(); probeTracker.reset(); lastProbeDigest = nil
+    }
     private func stopWork() {
         operationEpoch += 1; autoButton?.state = .off
         capture.endReading()
@@ -841,21 +896,52 @@ private final class PanelGroup: NSView {
     }
 }
 
+// A pull-down anchors the menu below its field. The display item lives outside
+// the menu, so every menu row is a real option and indexes have no placeholder.
+private final class PanelSelectionCell: NSPopUpButtonCell {
+    private var synchronizing = false
+    private func refreshSelection() {
+        guard !synchronizing else { return }
+        synchronizing = true; defer { synchronizing = false }
+        usesItemFromMenu = false
+        let display = NSMenuItem(title: selectedItem?.title ?? "", action: nil, keyEquivalent: "")
+        display.image = selectedItem?.image
+        menuItem = display
+        for item in itemArray {
+            item.isHidden = false
+            item.state = item === selectedItem ? .on : .off
+        }
+        controlView?.needsDisplay = true
+    }
+    override func select(_ item: NSMenuItem?) { super.select(item); refreshSelection() }
+    override func selectItem(at index: Int) { super.selectItem(at: index); refreshSelection() }
+    override func selectItem(withTitle title: String) { super.selectItem(withTitle: title); refreshSelection() }
+    override func synchronizeTitleAndSelectedItem() { super.synchronizeTitleAndSelectedItem(); refreshSelection() }
+}
+
 private final class PanelPopUpButton: NSPopUpButton {
     var contextActions: NSMenu?
     override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
     init(showsIcon: Bool = false) {
-        super.init(frame: .zero, pullsDown: false)
+        super.init(frame: .zero, pullsDown: true)
+        let selection = PanelSelectionCell(textCell: "", pullsDown: true)
+        selection.usesItemFromMenu = false; selection.preferredEdge = .maxY
+        cell = selection
         isBordered = false; controlSize = .small; font = .systemFont(ofSize: 12)
+        autoenablesItems = false
         imagePosition = showsIcon ? .imageLeading : .noImage
         alignment = .left
         setAccessibilityRole(.popUpButton)
-        (cell as? NSPopUpButtonCell)?.preferredEdge = .maxY
         cell?.lineBreakMode = .byTruncatingTail
         setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
-    override func menu(for event: NSEvent) -> NSMenu? { contextActions }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        if event.type == .rightMouseDown || event.modifierFlags.contains(.control), let contextActions {
+            return contextActions
+        }
+        return super.menu(for: event)
+    }
     override func rightMouseDown(with event: NSEvent) {
         guard let contextActions else { super.rightMouseDown(with: event); return }
         contextActions.update()

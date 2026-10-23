@@ -2,9 +2,95 @@ import AppKit
 import ScreenCaptureKit
 import ApplicationServices
 
+// Cache a route through the current accessibility tree, never a document URL.
+// Rewalking that short route also detects tab replacement while an old AXWebArea
+// reference remains valid in the browser's background accessibility tree.
+struct BrowserViewportSearch<Node, Value> {
+    let role: (Node) -> String?
+    let hidden: (Node) -> Bool
+    let children: (Node) -> [Node]
+    let value: (Node) -> Value?
+    let withinBudget: () -> Bool
+
+    static func selectWindow(from windows: [Node], focused: Node?, same: (Node, Node) -> Bool,
+                             matches: (Node) -> Bool) -> Node? {
+        if let focused, let current = windows.first(where: { same($0, focused) }), matches(current) {
+            return current
+        }
+        // Without a validated focused window, equal frames are ambiguous. An
+        // old cached window must not win over the screenshot's new window.
+        let candidates = windows.filter(matches)
+        return candidates.count == 1 ? candidates[0] : nil
+    }
+
+    private func canDescend(_ role: String?) -> Bool {
+        !["AXToolbar", "AXMenuBar", "AXMenu", "AXMenuItem", "AXButton", "AXTextField",
+          "AXComboBox", "AXStaticText", "AXImage", "AXLink", "AXScrollBar"].contains(role ?? "")
+    }
+
+    func resolve(root: Node, cachedPath: [Int]?) -> (value: Value, path: [Int])? {
+        if let cachedPath, cachedPath.count <= 12 {
+            var current = root, valid = true
+            for index in cachedPath {
+                guard withinBudget(), !hidden(current), canDescend(role(current)) else { valid = false; break }
+                let nodes = children(current)
+                guard nodes.indices.contains(index) else { valid = false; break }
+                current = nodes[index]
+            }
+            if valid, withinBudget(), !hidden(current), role(current) == "AXWebArea", let found = value(current) {
+                return (found, cachedPath)
+            }
+        }
+        var queue: [(Node, [Int])] = [(root, [])], index = 0
+        while index < queue.count, index < 160, withinBudget() {
+            let (element, path) = queue[index]; index += 1
+            guard !hidden(element) else { continue }
+            let kind = role(element)
+            if kind == "AXWebArea" {
+                if let found = value(element) { return (found, path) }
+                continue
+            }
+            if path.count < 12, queue.count < 160, canDescend(kind), withinBudget() {
+                queue.append(contentsOf: children(element).prefix(160-queue.count).enumerated().map { ($0.element, path + [$0.offset]) })
+            }
+        }
+        return nil
+    }
+}
+
+struct BrowserViewportRetryPolicy {
+    struct Limits { let total: TimeInterval; let message: TimeInterval }
+    private var processID: pid_t?
+    private var windowFrame: CGRect?
+    private var failures = 0
+    private var lastRecovery: TimeInterval?
+
+    mutating func begin(processID: pid_t, windowFrame: CGRect, now: TimeInterval) -> Limits {
+        if self.processID != processID || self.windowFrame != windowFrame {
+            self.processID = processID; self.windowFrame = windowFrame
+            failures = 0; lastRecovery = nil
+        }
+        // A busy browser may need longer for its first accessibility response.
+        // Retry that discovery occasionally without making every probe expensive.
+        if failures >= 2, lastRecovery.map({ now - $0 >= 2 }) ?? true {
+            lastRecovery = now
+            return Limits(total: 1.2, message: 0.2)
+        }
+        return Limits(total: 0.45, message: 0.08)
+    }
+
+    mutating func finish(success: Bool) {
+        if success { failures = 0; lastRecovery = nil }
+        else { failures = min(failures + 1, 3) }
+    }
+}
+
 enum BrowserContent {
     struct Region { let rect: CGRect; let toolbarEditing: Bool; let documentURL: URL? }
     private static let viewportLock = NSLock()
+    private struct CachedViewport { let processID: pid_t; let window: AXUIElement; let path: [Int] }
+    private static var cachedViewport: CachedViewport?
+    private static var retryPolicy = BrowserViewportRetryPolicy()
     static func isBrowser(_ identity: String?) -> Bool {
         guard let identity else { return false }
         return ["com.google.Chrome", "com.apple.Safari", "com.microsoft.edgemac", "com.brave.Browser",
@@ -26,11 +112,25 @@ enum BrowserContent {
 
     static func viewport(processID: pid_t, windowFrame: CGRect) -> Region? {
         viewportLock.lock(); defer { viewportLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        let limits = retryPolicy.begin(processID: processID, windowFrame: windowFrame, now: now)
+        let deadline = now + limits.total
+        var succeeded = false
+        defer { retryPolicy.finish(success: succeeded) }
+        var unavailable = false
+        func withinBudget() -> Bool { !unavailable && ProcessInfo.processInfo.systemUptime < deadline }
         let app = AXUIElementCreateApplication(processID)
-        AXUIElementSetMessagingTimeout(app, 0.25)
         func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+            guard withinBudget() else { return nil }
+            // Apple applies this timeout only to this exact AX object, not its
+            // descendants or equivalent references returned by later queries.
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { return nil }
+            guard AXUIElementSetMessagingTimeout(element, Float(min(limits.message, remaining))) == .success else { return nil }
             var result: CFTypeRef?
-            return AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success ? result : nil
+            let error = AXUIElementCopyAttributeValue(element, name as CFString, &result)
+            if error == .cannotComplete { unavailable = true }
+            return error == .success ? result : nil
         }
         func frame(_ element: AXUIElement) -> CGRect? {
             guard let p = attribute(element, kAXPositionAttribute), CFGetTypeID(p) == AXValueGetTypeID(),
@@ -45,37 +145,42 @@ enum BrowserContent {
             guard let web = frame(element) else { return nil }
             let rect = web.intersection(windowFrame)
             guard !rect.isNull, rect.width >= windowFrame.width * 0.4, rect.height >= 100 else { return nil }
+            let rawURL = attribute(element, kAXURLAttribute)
+            let url = (rawURL as? URL) ?? (rawURL as? String).flatMap(URL.init(string:))
             var editing = false
             if let focused = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID() {
                 let element = focused as! AXUIElement
                 editing = isToolbarEditor(role: attribute(element, kAXRoleAttribute) as? String,
                                           frame: frame(element), viewport: rect)
             }
-            let rawURL = attribute(element, kAXURLAttribute)
-            let url = (rawURL as? URL) ?? (rawURL as? String).flatMap(URL.init(string:))
+            guard withinBudget() else { return nil }
             return Region(rect: rect.offsetBy(dx: -windowFrame.minX, dy: -windowFrame.minY), toolbarEditing: editing, documentURL: url)
         }
-        guard let windows = attribute(app, kAXWindowsAttribute) as? [AXUIElement],
-              let window = windows.first(where: {
-                  guard let f = frame($0) else { return false }
-                  return abs(f.minX-windowFrame.minX) < 3 && abs(f.minY-windowFrame.minY) < 3
-                      && abs(f.width-windowFrame.width) < 3 && abs(f.height-windowFrame.height) < 3
-              }) else { return nil }
-        var queue: [(AXUIElement, Int)] = [(window, 0)], index = 0
-        while index < queue.count && index < 160 {
-            let (element, depth) = queue[index]; index += 1
-            let role = attribute(element, kAXRoleAttribute) as? String
-            if role == "AXWebArea" {
-                if let result = region(element) {
-                    return result
-                }
-                continue
-            }
-            if depth < 12, queue.count < 160, let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] {
-                queue.append(contentsOf: children.prefix(160-queue.count).map { ($0, depth+1) })
-            }
+        func matches(_ window: AXUIElement) -> Bool {
+            guard let f = frame(window) else { return false }
+            return abs(f.minX-windowFrame.minX) < 3 && abs(f.minY-windowFrame.minY) < 3
+                && abs(f.width-windowFrame.width) < 3 && abs(f.height-windowFrame.height) < 3
         }
-        return nil
+        // Retain only the route after a transient failure. Its current window,
+        // nodes, frame and URL are all revalidated on the next attempt.
+        guard let windows = attribute(app, kAXWindowsAttribute) as? [AXUIElement] else { return nil }
+        let previous = cachedViewport.flatMap { $0.processID == processID ? $0 : nil }
+        let focusedValue = attribute(app, kAXFocusedWindowAttribute)
+        let focused = focusedValue.flatMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil }
+        guard let window = BrowserViewportSearch<AXUIElement, Region>.selectWindow(from: windows, focused: focused,
+            same: { CFEqual($0, $1) }, matches: matches) else { return nil }
+        let sameWindow = previous.map { CFEqual($0.window, window) } ?? false
+        let search = BrowserViewportSearch<AXUIElement, Region>(
+            role: { attribute($0, kAXRoleAttribute) as? String },
+            hidden: { (attribute($0, "AXHidden") as? Bool) == true },
+            children: { attribute($0, kAXChildrenAttribute) as? [AXUIElement] ?? [] },
+            value: region, withinBudget: withinBudget)
+        guard let found = search.resolve(root: window, cachedPath: sameWindow ? previous?.path : nil) else {
+            return nil
+        }
+        cachedViewport = CachedViewport(processID: processID, window: window, path: found.path)
+        succeeded = true
+        return found.value
     }
 
     static func crop(_ image: CGImage, displaySize: CGSize, viewport: CGRect) throws -> CapturedPage {

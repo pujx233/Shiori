@@ -31,6 +31,57 @@ struct PipelineTests {
         try check(result.0.skippedCount == 1 && result.0.untranslatedCount == 0, "OCR omissions retain their own count")
         try check(result.1.firstResult != nil, "first visible result is timed after geometry is ready")
         try check(previews.allSatisfy { $0.dialogues.first?.replacementAllowed == true }, "all previews use repaired geometry")
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 8, bitsPerPixel: 32)!
+        for (index, value) in [UInt8](arrayLiteral: 0, 0, 0, 0, 255, 255, 255, 255,
+                                     255, 255, 255, 255, 0, 0, 0, 0).enumerated() {
+            bitmap.bitmapData![index] = value
+        }
+        let validPatch = bitmap.representation(using: .png, properties: [:])!
+        let safe = OCRBlock(id: "safe", text: "おはよう", bounds: bounds, replacementPNG: validPatch, replacementAllowed: true)
+        let pending = OCRBlock(id: "pending", text: "こんにちは", bounds: bounds, replacementAllowed: false)
+        let open = OCRBlock(id: "open", text: "ざわざわ", bounds: bounds, replacementPNG: validPatch,
+                            replacementAllowed: true, textStyle: "outlinedDark")
+        let mixed = OCRPage(blocks: [safe, pending, open], skippedCount: 1, elapsed: 0)
+        var repairedPending = pending; repairedPending.replacementPNG = validPatch; repairedPending.replacementAllowed = true
+        let repaired = OCRPage(blocks: [safe, repairedPending, open], skippedCount: 1, elapsed: 0)
+        let allText = PageTranslation(summary: "", dialogues: zip(mixed.blocks, ["早安", "你好", "沙沙"]).map {
+            Dialogue.recognized($0.0, text: $0.1)
+        }, notes: "")
+        let firstVisible = DispatchSemaphore(value: 0)
+        var mixedPreviews: [PageTranslation] = []
+        let fast = try TranslationPipeline.run(runner: CommandRunner(), recognize: { ready in
+            ready(mixed)
+            guard firstVisible.wait(timeout: .now() + 2) == .success else { throw AppError.message("Safe balloon waited for complex background") }
+            lock.lock(); let early = mixedPreviews; lock.unlock()
+            try check(!early.isEmpty && early.allSatisfy { $0.dialogues.map(\.location) == ["safe"] }, "only a verified closed-balloon PNG appears before complex repairs")
+            try check(early[0].skippedCount == 3 && early[0].ocrSkippedCount == 1, "unready backgrounds remain pending without losing OCR omissions")
+            Thread.sleep(forTimeInterval: 0.04)
+            return repaired
+        }, translate: { _, preview in preview(allText); return allText }, preview: { page, _ in
+            lock.lock(); mixedPreviews.append(page); lock.unlock(); firstVisible.signal()
+        })
+        try check(fast.0.dialogues.count == 3 && fast.0.untranslatedCount == 0, "final repairs add remaining backgrounds without losing early text")
+        try check(fast.1.firstResult! < fast.1.ocr, "first visible balloon is timed before all-page repair completion")
+        var broken = safe; broken.replacementPNG = Data([1, 2, 3])
+        var missing = safe; missing.replacementPNG = nil
+        try check(!TranslationPipeline.earlyPatchIsReady(broken) && !TranslationPipeline.earlyPatchIsReady(missing)
+                  && !TranslationPipeline.earlyPatchIsReady(open), "missing, damaged and open-background patches cannot enable a draft preview")
+        let cancelledEarly = CommandRunner(), earlyShown = DispatchSemaphore(value: 0)
+        var cancelPreviews = 0
+        do {
+            _ = try TranslationPipeline.run(runner: cancelledEarly, recognize: { ready in
+                ready(mixed)
+                guard earlyShown.wait(timeout: .now() + 2) == .success else { throw AppError.message("No early preview") }
+                cancelledEarly.cancel(); return repaired
+            }, translate: { _, preview in
+                preview(allText); Thread.sleep(forTimeInterval: 0.08); preview(allText); return allText
+            }, preview: { _, _ in lock.lock(); cancelPreviews += 1; lock.unlock(); earlyShown.signal() })
+            throw AppError.message("FAIL: cancelled early pipeline succeeded")
+        } catch is CancellationError {
+            try check(cancelPreviews == 1, "cancelled early page suppresses late translation and final geometry previews")
+        }
         let wrong = OCRPage(blocks: [OCRBlock(id: "a", text: "違うページ", bounds: bounds)], skippedCount: 0, elapsed: 0)
         try check(TranslationPipeline.bind(result.0, to: wrong).dialogues.isEmpty, "different OCR text cannot inherit an old translation")
         var invoked = false

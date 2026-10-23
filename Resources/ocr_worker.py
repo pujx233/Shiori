@@ -687,13 +687,22 @@ def finish_page(directory, blocks, skipped, patches, start):
     """Publish stable OCR IDs before waiting for the final background repair.
 
     text.json is a separate durable handoff: a fast repair cannot overwrite the
-    ready event before the parent polls. Drafts cannot erase source pixels.
+    ready event before the parent polls. Only a completed closed-balloon patch
+    can render early; pending and open-text repairs remain explicitly disabled.
     """
     if cancelled(directory):
         write_state(directory, phase='cancelled')
         return
     result = unique_blocks(blocks)
-    draft = [dict(block, replacementPNG=None, replacementAllowed=False) for block in result]
+    draft = []
+    for block in result:
+        candidate = dict(block, replacementPNG=None, replacementAllowed=False)
+        future = patches[block['id']]
+        if block['textStyle'] is None and future.done() and not future.cancelled():
+            patch = future.result()
+            if patch is not None:
+                candidate.update(replacementPNG=patch, replacementAllowed=True)
+        draft.append(candidate)
     write_json(directory, 'text', {'blocks': draft, 'skippedCount': skipped, 'elapsed': time.monotonic()-start})
     write_state(directory, phase='repairing')
     for block in result:
@@ -800,7 +809,9 @@ def main():
             # CPU background repair overlaps MPS decoding. A single repair worker
             # keeps memory bounded and avoids competing neural inference threads.
             patch_boxes = {}
-            for component, box in boxes:
+            # Closed balloon repairs are cheap and must not queue behind a LaMa
+            # background. They can then travel with text-ready as real PNGs.
+            for component, box in sorted(boxes, key=lambda pair: pair[0] < 0):
                 target = padded_box(box, gray, labels, stats, component, font_sizes[component]) if component > 0 else box
                 patch_boxes[component] = target
                 patch_jobs[component] = repairs.submit(replacement_patch, image, text_mask, target,

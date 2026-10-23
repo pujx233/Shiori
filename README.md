@@ -10,7 +10,7 @@
 - 右键菜单栏图标可补齐译文、重新翻译、重新识字、复制译文和退出。
 - 识字和背景修复在本地完成，翻译服务只接收文字。Codex 使用已登录的 ChatGPT 账号；Google 无需 API Key。
 - 自动阅读绑定当前窗口和网页；切换软件或离开该页时暂停处理，返回后继续。支持同章翻页。
-- 文字就绪即可送译，背景修复同时进行；修复完成后再回填。
+- 文字就绪即可送译，背景修复同时进行；已擦除原文的气泡先显示，复杂背景随后补齐。
 - 同页复用缓存，翻页取消旧任务并保留连接；缺失条目补译一次。
 - 缓存合计上限 258 MiB。近期两页文字用于人名和语气衔接，关闭后清空。
 
@@ -58,4 +58,4 @@ Apple Silicon、macOS 14+、Apple Command Line Tools 和 uv。选择 Codex 时�
 
 Google 接入参考 [Easydict GTX](https://github.com/tisfeng/Easydict/blob/dev/Easydict/Swift/Service/Google/GoogleService%2BTranslate.swift)。每个气泡独立对应请求和结果，最多六个并行请求；连接复用，重复文字复用本地缓存，服务限流时停止。该网页端点不提供 Cloud API 的服务保证。
 
-面板采用原生 AppKit 选择器和按钮，参考 [Apple 的选择器规范](https://developer.apple.com/design/human-interface-guidelines/pop-up-buttons) 与 [Ice 的分组设置](https://github.com/jordanbaird/Ice/blob/main/Ice/UI/IceUI/IceSection.swift)。Google 模式自动收起模型与推理，浅色、深色均跟随系统。
+面板采用原生 AppKit 下拉菜单和按钮，参考 [Apple 的菜单规范](https://developer.apple.com/design/human-interface-guidelines/pull-down-buttons) 与 [Ice 的分组设置](https://github.com/jordanbaird/Ice/blob/main/Ice/UI/IceUI/IceSection.swift)。菜单从选择框下方展开；Google 模式自动收起模型与推理，浅色、深色均跟随系统。

@@ -109,8 +109,9 @@ final class LocalOCR: @unchecked Sendable {
         try start()
     }
 
-    // Called on the recognition queue. Start asynchronous text translation here;
-    // only the returned page has finished repair patches and is safe to render.
+    // Called on the recognition queue. Text-ready may include completed closed
+    // balloon patches; all other blocks remain replacementAllowed=false until
+    // the returned final page. The pipeline validates patches before previewing.
     func recognize(page: CapturedPage, runner: CommandRunner, force: Bool = false, progress: (String) -> Void,
                    onTextReady: ((OCRPage) -> Void)? = nil) throws -> OCRPage {
         serial.lock(); defer { serial.unlock() }

@@ -125,6 +125,30 @@ class TextHandoffTests(unittest.TestCase):
             self.assertEqual(json.loads((directory / 'state.json').read_text())['phase'], 'cancelled')
             self.assertFalse(pending.done())
 
+    def test_finished_closed_patch_is_ready_while_open_background_is_pending(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory, ready, pending, open_ready = Path(folder), Future(), Future(), Future()
+            ready.set_result('verified-closed-png'); open_ready.set_result('verified-open-png')
+            closed = self.block()
+            other = dict(self.block('b2'), text='こんにちは')
+            opened = dict(self.block('b3'), text='ざわざわ', textStyle='outlinedDark')
+            task = threading.Thread(target=worker['finish_page'], args=(directory,
+                [closed, other, opened], 1, {'b1': ready, 'b2': pending, 'b3': open_ready}, time.monotonic()))
+            task.start()
+            deadline = time.monotonic()+1
+            while not (directory / 'text.json').exists() and time.monotonic() < deadline:
+                time.sleep(.005)
+            draft = json.loads((directory / 'text.json').read_text())
+            self.assertTrue(task.is_alive())
+            self.assertEqual([b['replacementAllowed'] for b in draft['blocks']], [True, False, False])
+            self.assertEqual([b['replacementPNG'] for b in draft['blocks']], ['verified-closed-png', None, None])
+            pending.set_result('second-closed-png'); task.join(1)
+            final = json.loads((directory / 'state.json').read_text())['page']
+            self.assertEqual([b['id'] for b in final['blocks']], [b['id'] for b in draft['blocks']])
+            self.assertEqual([b['replacementPNG'] for b in final['blocks']],
+                             ['verified-closed-png', 'second-closed-png', 'verified-open-png'])
+            self.assertEqual(final['skippedCount'], 1)
+
     def test_deduplication_is_identical_before_and_after_repair(self):
         with tempfile.TemporaryDirectory() as folder:
             directory, ready = Path(folder), Future()
