@@ -10,6 +10,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var modelBox: NSPopUpButton!
     private var effortBox: NSPopUpButton!
     private var sourceBox: NSPopUpButton!
+    private var providerBox: NSPopUpButton!
+    private var modelRow: NSView!
+    private var effortRow: NSView!
     private var autoButton: NSButton!
     private var overlayButton: NSButton!
     private var translateButton: NSButton!
@@ -19,6 +22,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var statusDot: NSImageView!
     private var statusItem: NSStatusItem!
     private var client: CodexClient?
+    private var google: GoogleTranslationClient?
     private var cache: TranslationCache?
     private var ocr: LocalOCR?
     private var requestDigest: String?
@@ -69,36 +73,40 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         do {
             let support = try AppStorage.directory()
             cache = try TranslationCache(directory: support.appendingPathComponent("Translations"))
-            client = try CodexClient(resources: Bundle.main.resourceURL!, workspace: support.appendingPathComponent("Jobs"),
-                                    textCacheDirectory: support.appendingPathComponent("TextTranslations"))
+            google = try GoogleTranslationClient(cacheDirectory: support.appendingPathComponent("GoogleTranslations"), concurrency: 6)
             ocr = try LocalOCR(support: support, resources: Bundle.main.resourceURL!)
             if let ocr { DispatchQueue.global(qos: .utility).async { try? ocr.prepare() } }
-            if let client { DispatchQueue.global(qos: .utility).async { try? client.prepare() } }
+            do {
+                client = try CodexClient(resources: Bundle.main.resourceURL!, workspace: support.appendingPathComponent("Jobs"),
+                                        textCacheDirectory: support.appendingPathComponent("TextTranslations"))
+                if options.provider == .codex, let client { DispatchQueue.global(qos: .utility).async { try? client.prepare() } }
+            } catch { modelError = error.localizedDescription }
             if let data = defaults.data(forKey: "modelCatalog"),
                let saved = try? JSONDecoder().decode([ModelInfo].self, from: data), !saved.isEmpty {
                 applyModels(saved)
             }
-            if models.isEmpty { refreshModels() }
+            if models.isEmpty, options.provider == .codex { refreshModels() }
             let refresh = Timer(fire: Date(timeIntervalSinceNow: models.isEmpty ? 24 * 60 * 60 : 5),
                                 interval: 24 * 60 * 60, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.refreshModels() }
+                Task { @MainActor in if self?.options.provider == .codex { self?.refreshModels() } }
             }
             modelTimer = refresh; RunLoop.main.add(refresh, forMode: .common)
         } catch { setStatus(error.localizedDescription, error: true) }
         timer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.poll() }
         }
-        showSettings(); refreshSources()
+        updateProviderUI(); showSettings(); refreshSources()
     }
 
-    func renderPanel(to destination: URL, dark: Bool = false) throws {
+    func renderPanel(to destination: URL, dark: Bool = false, provider: TranslationProvider? = nil) throws {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
         NSApplication.shared.appearance = appearance
         migratePreviousSettings()
         buildWindow(); refreshApplications()
+        if let provider { providerBox.selectItem(at: provider == .google ? 0 : 1) }
         if let data = defaults.data(forKey: "modelCatalog"),
            let saved = try? JSONDecoder().decode([ModelInfo].self, from: data), !saved.isEmpty { applyModels(saved) }
-        setStatus("就绪")
+        updateProviderUI(); setStatus("就绪")
         let view = popover.contentViewController!.view
         view.appearance = appearance
         view.setFrameSize(popover.contentSize); view.layoutSubtreeIfNeeded()
@@ -111,6 +119,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         stopWork(); timer?.invalidate(); modelTimer?.invalidate(); overlay.stop()
         _ = translationGroup.wait(timeout: .now() + 4)
         client?.shutdown()
+        google?.shutdown()
         ocr?.shutdown()
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -179,7 +188,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func buildWindow() {
         let controller = NSViewController()
-        let panelSize = NSSize(width: 240, height: 236)
+        let panelSize = NSSize(width: 240, height: 270)
         let background = PanelCanvas(frame: NSRect(origin: .zero, size: panelSize))
         controller.view = background
         let root = NSStackView(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 8
@@ -196,28 +205,36 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         sourceBox = PanelPopUpButton(showsIcon: true); sourceBox.addItem(withTitle: "选择软件")
         sourceBox.target = self; sourceBox.action = #selector(sourceChanged); sourceBox.menu?.delegate = self
         sourceBox.setAccessibilityLabel("软件")
-        modelBox = PanelPopUpButton(); modelBox.addItem(withTitle: "")
-        modelBox.addItem(withTitle: defaults.string(forKey: "selectedModel") ?? "gpt-6.1-sol"); modelBox.selectItem(at: 1)
+        providerBox = PanelPopUpButton(); providerBox.addItems(withTitles: ["Google", "Codex"])
+        providerBox.item(at: 0)?.representedObject = "google"
+        providerBox.item(at: 1)?.representedObject = "codex"
+        providerBox.selectItem(at: defaults.string(forKey: "translationProvider") == "google" ? 0 : 1)
+        providerBox.target = self; providerBox.action = #selector(providerChanged); providerBox.menu?.delegate = self
+        providerBox.setAccessibilityLabel("翻译服务")
+        modelBox = PanelPopUpButton()
+        modelBox.addItem(withTitle: defaults.string(forKey: "selectedModel") ?? "gpt-6.1-sol")
         modelBox.target = self; modelBox.action = #selector(optionsChanged); modelBox.isEnabled = false
-        modelBox.menu?.delegate = self
-        modelBox.setAccessibilityLabel("翻译模型")
-        effortBox = PanelPopUpButton(); effortBox.addItems(withTitles: ["", "low", "medium", "high", "xhigh", "max"])
+        modelBox.menu?.delegate = self; modelBox.setAccessibilityLabel("翻译模型")
+        effortBox = PanelPopUpButton(); effortBox.addItems(withTitles: ["low", "medium", "high", "xhigh", "max"])
         effortBox.selectItem(withTitle: defaults.string(forKey: "effort") ?? "low")
         effortBox.target = self; effortBox.action = #selector(optionsChanged); effortBox.setAccessibilityLabel("推理")
         effortBox.menu?.delegate = self
         let fields = NSStackView()
         fields.orientation = .vertical; fields.alignment = .leading; fields.spacing = 0
-        for (caption, control) in [("软件", sourceBox!), ("模型", modelBox!), ("推理", effortBox!)] {
+        fields.detachesHiddenViews = true
+        for (caption, control) in [("软件", sourceBox!), ("翻译", providerBox!), ("模型", modelBox!), ("推理", effortBox!)] {
             let name = label(caption); name.font = .systemFont(ofSize: 11)
             name.widthAnchor.constraint(equalToConstant: 24).isActive = true
             let field = row([name, control]); field.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 0)
             fields.addArrangedSubview(field)
-            control.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            control.heightAnchor.constraint(equalToConstant: 28).isActive = true
             control.widthAnchor.constraint(equalTo: field.widthAnchor, constant: -42).isActive = true
             field.heightAnchor.constraint(equalToConstant: 34).isActive = true
             field.widthAnchor.constraint(equalTo: fields.widthAnchor).isActive = true
+            if control === modelBox { modelRow = field }
+            if control === effortBox { effortRow = field }
         }
-        let fieldGroup = PanelGroup()
+        let fieldGroup = PanelGroup(rows: fields)
         fieldGroup.addSubview(fields); fields.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             fields.leadingAnchor.constraint(equalTo: fieldGroup.leadingAnchor),
@@ -228,11 +245,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         add(fieldGroup)
         autoButton = NSButton(checkboxWithTitle: "自动翻译", target: self, action: #selector(toggleAuto))
         overlayButton = NSButton(checkboxWithTitle: "显示译文", target: self, action: #selector(toggleOverlay))
-        for toggle in [autoButton!, overlayButton!] { toggle.font = .systemFont(ofSize: 11); toggle.controlSize = .small; toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true }
+        for toggle in [autoButton!, overlayButton!] {
+            toggle.font = .systemFont(ofSize: 11); toggle.controlSize = .small
+            toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        }
         overlayButton.state = defaults.object(forKey: "showOverlay") as? Bool == false ? .off : .on
         let toggles = row([autoButton, overlayButton]); toggles.distribution = .fillEqually; toggles.spacing = 6
         toggles.heightAnchor.constraint(equalToConstant: 24).isActive = true; add(toggles)
-        translateButton = PanelActionButton(title: "开始阅读", target: self, action: #selector(startReading))
+        let action = PanelActionButton(frame: .zero)
+        action.title = "开始阅读"; action.target = self; action.action = #selector(startReading)
+        action.active = false; translateButton = action
         translateButton.keyEquivalent = "\r"
         translateButton.heightAnchor.constraint(equalToConstant: 34).isActive = true; add(translateButton)
         spinner = NSProgressIndicator(); spinner.style = .spinning; spinner.controlSize = .mini
@@ -279,18 +301,39 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     @objc private func startReading() {
         if runner != nil || autoButton.state == .on { stopClicked(); return }
         guard capture.source != nil else { setStatus("请先选择软件", error: true); return }
-        guard models.contains(where: { $0.slug == options.model }) else { setStatus("请先加载可用模型", error: true); return }
+        guard translationAvailable else { setStatus("请先加载可用模型", error: true); return }
         autoButton.state = .on; toggleAuto()
     }
     private var options: TranslationOptions {
-        TranslationOptions(model: modelBox.titleOfSelectedItem ?? "", effort: effortBox.titleOfSelectedItem ?? "low", context: capture.contextKey)
+        let provider = TranslationProvider(rawValue: providerBox?.selectedItem?.representedObject as? String ?? "codex") ?? .codex
+        return TranslationOptions(model: provider == .google ? "google-translate" : modelBox.titleOfSelectedItem ?? "",
+                                  effort: provider == .google ? "none" : effortBox.titleOfSelectedItem ?? "low",
+                                  context: capture.contextKey, provider: provider)
+    }
+    private var translationAvailable: Bool {
+        options.provider == .google ? google != nil : client != nil && models.contains(where: { $0.slug == options.model })
+    }
+    private func updateProviderUI() {
+        let codex = options.provider == .codex
+        modelRow.isHidden = !codex; effortRow.isHidden = !codex
+        popover.contentSize = NSSize(width: 240, height: codex ? 270 : 202)
+        popover.contentViewController?.view.layoutSubtreeIfNeeded()
+        updateStatus()
+    }
+    @objc private func providerChanged() {
+        defaults.set(options.provider.rawValue, forKey: "translationProvider")
+        operationEpoch += 1; cancelTranslation(); resetTracking(); shownEntry = nil; overlay.hide()
+        detailLabel.stringValue = ""
+        updateProviderUI()
+        if options.provider == .codex, models.isEmpty { refreshModels() }
+        setStatus(autoButton.state == .on ? "等待翻译…" : "就绪")
     }
     private func setStatus(_ text: String, error: Bool = false) {
         statusText = text; statusIsError = error; updateStatus()
     }
     private func updateStatus() {
         var text = statusText, error = statusIsError
-        if !error, runner == nil {
+        if !error, runner == nil, options.provider == .codex {
             if let modelError { text = modelError; error = true }
             else if refreshingModels, models.isEmpty { text = "正在加载模型…" }
         }
@@ -333,9 +376,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func applyModels(_ catalog: [ModelInfo]) {
         let old = options
         models = catalog
-        modelBox.removeAllItems(); modelBox.addItems(withTitles: [""] + catalog.map(\.slug))
-        modelBox.selectItem(withTitle: old.model)
-        if modelBox.indexOfSelectedItem < 1 { modelBox.selectItem(at: catalog.isEmpty ? 0 : 1) }
+        let previousModel = modelBox.titleOfSelectedItem ?? defaults.string(forKey: "selectedModel") ?? ""
+        modelBox.removeAllItems(); modelBox.addItems(withTitles: catalog.map(\.slug))
+        modelBox.selectItem(withTitle: previousModel)
+        if modelBox.indexOfSelectedItem < 0, !catalog.isEmpty { modelBox.selectItem(at: 0) }
         modelBox.isEnabled = !catalog.isEmpty; modelBox.toolTip = nil
         modelError = catalog.isEmpty ? "账号没有可用模型" : nil
         updateEfforts()
@@ -343,15 +387,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
     private func updateEfforts() {
         let selected = effortBox.titleOfSelectedItem ?? "low"
-        let supported = models.first(where: { $0.slug == options.model })?.supported_reasoning_levels?.map(\.effort)
+        let supported = models.first(where: { $0.slug == modelBox.titleOfSelectedItem })?.supported_reasoning_levels?.map(\.effort)
              ?? ["low", "medium", "high"]
-        effortBox.removeAllItems(); effortBox.addItems(withTitles: [""] + (supported.isEmpty ? ["low"] : supported))
+        effortBox.removeAllItems(); effortBox.addItems(withTitles: supported.isEmpty ? ["low"] : supported)
         effortBox.selectItem(withTitle: selected)
-        if effortBox.indexOfSelectedItem < 1 { effortBox.selectItem(at: 1) }
+        if effortBox.indexOfSelectedItem < 0 { effortBox.selectItem(at: 0) }
     }
     @objc private func optionsChanged() {
         operationEpoch += 1; updateEfforts()
-        defaults.set(options.model, forKey: "selectedModel"); defaults.set(options.effort, forKey: "effort")
+        defaults.set(modelBox.titleOfSelectedItem, forKey: "selectedModel"); defaults.set(effortBox.titleOfSelectedItem, forKey: "effort")
         cancelTranslation(); resetTracking(); overlay.hide()
         detailLabel.stringValue = ""
         shownEntry = nil
@@ -360,7 +404,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(translateCurrent) || item.action == #selector(retranslate) || item.action == #selector(rerecognize) {
-            return runner == nil && !captureBusy && capture.source != nil && !models.isEmpty
+            return runner == nil && !captureBusy && capture.source != nil && translationAvailable
         }
         if item.action == #selector(stopClicked) { return runner != nil || autoButton.state == .on }
         if item.action == #selector(copyTranslation) { return shownEntry != nil }
@@ -376,7 +420,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     func menuWillOpen(_ menu: NSMenu) {
         if menu === sourceActions { return }
         if menu === sourceBox.menu { refreshApplications() }
-        if let control = [sourceBox, modelBox, effortBox].compactMap({ $0 }).first(where: { $0.menu === menu }) {
+        if let control = [sourceBox, providerBox, modelBox, effortBox].compactMap({ $0 }).first(where: { $0.menu === menu }) {
             for item in menu.items { item.state = item === control.selectedItem ? .on : .off }
         }
     }
@@ -427,7 +471,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     @objc private func rerecognize() { captureAndTranslate(force: true, refreshOCR: true) }
     private func captureAndTranslate(force: Bool, refreshOCR: Bool = false) {
         guard !captureBusy, runner == nil, ensureCaptureAccess() else { return }
-        window?.makeFirstResponder(nil); captureBusy = true
+        window?.makeFirstResponder(nil); capture.beginReading(); captureBusy = true
         let epoch = operationEpoch; setStatus("正在读取页面…")
         Task { [weak self] in
             guard let self else { return }
@@ -442,11 +486,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
     @objc private func toggleAuto() {
         if autoButton.state == .on {
-            guard capture.source != nil, models.contains(where: { $0.slug == options.model }) else {
+            guard capture.source != nil, translationAvailable else {
                 stopWork(); setStatus(capture.source == nil ? "请先选择软件" : "请先加载可用模型", error: true); return
             }
             guard ensureCaptureAccess() else { stopWork(); return }
-            window?.makeFirstResponder(nil); resetTracking(); setStatus("自动翻译已开启")
+            window?.makeFirstResponder(nil); capture.beginReading(); resetTracking(); setStatus("自动翻译已开启")
             showReader(); Task { await poll() }
         } else { stopWork(); setStatus("已暂停") }
     }
@@ -473,10 +517,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         guard !captureBusy, autoButton.state == .on || runner != nil || shownEntry != nil else { return }
         guard let source = capture.source else { return }
         guard source.application?.isTerminated == false else { stopWork(); overlay.hide(); refreshApplications(); setStatus("阅读软件已关闭"); return }
-        guard let visibleWindow = ReaderCapture.visibleWindowID(processID: source.processID) else {
+        let foreground = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        guard foreground == source.processID else {
             overlay.hide()
-            if autoButton.state == .on { setStatus("等待阅读窗口…") }
+            // Opening our own panel must not interrupt a translation already
+            // requested. Other applications suspend reading without taking screenshots.
+            if foreground != ProcessInfo.processInfo.processIdentifier {
+                suspendReading("等待阅读窗口…")
+            }
             return
+        }
+        guard let visibleWindow = ReaderCapture.visibleWindowID(processID: source.processID) else {
+            suspendReading("等待阅读窗口…")
+            return
+        }
+        if let scope = capture.readingScope, scope.windowID != visibleWindow {
+            suspendReading("等待原阅读窗口…"); return
         }
         if visibleWindow != capture.selectedID {
             cancelTranslation(); resetTracking(); latestPage = nil; shownEntry = nil; overlay.hide()
@@ -494,7 +550,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
             if lastProbeDigest == probe.digest {
                 updateOverlay()
-                if runner == nil, statusText == "正在检查新页面…", let entry = shownEntry { show(entry, cached: true) }
+                if runner == nil, ["正在检查新页面…", "等待阅读窗口…", "等待原阅读窗口…", "等待原阅读页面…"].contains(statusText), let entry = shownEntry { show(entry, cached: true) }
                 if autoButton.state == .on, runner == nil, tracker.needsSubmission, let page = tracker.current {
                     submit(page, force: false)
                 }
@@ -522,7 +578,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
             guard autoButton.state == .on, runner == nil, tracker.needsSubmission else { return }
             cancelTranslation(); submit(page, force: false)
-        } catch is CancellationError { overlay.hide() }
+        } catch is ReadingScopeError { suspendReading("等待原阅读页面…") }
+        catch is CancellationError { overlay.hide() }
         catch {
             if operationEpoch == epoch {
                 overlay.hide()
@@ -530,6 +587,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 setStatus(error.localizedDescription, error: true)
             }
         }
+    }
+    private func suspendReading(_ message: String) {
+        overlay.hide()
+        if let digest = requestDigest { tracker.release(digest); cancelTranslation() }
+        if autoButton.state == .on { setStatus(message) }
     }
     private func updateOverlay() {
         guard !tracker.isSettling, !probeTracker.isSettling, overlayButton.state == .on, let entry = shownEntry, entry.options == options,
@@ -539,12 +601,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func submit(_ page: CapturedPage, force: Bool, refreshOCR: Bool = false) {
-        guard let client, let cache, let ocr else { setStatus("翻译组件尚未就绪", error: true); return }
+        guard let cache, let ocr else { setStatus("翻译组件尚未就绪", error: true); return }
+        let client = client, google = google
         let selected = options
-        guard models.contains(where: { $0.slug == selected.model }) else {
+        guard translationAvailable else {
             stopWork(); setStatus("请先加载可用模型", error: true); return
         }
-        defaults.set(selected.model, forKey: "selectedModel"); defaults.set(selected.effort, forKey: "effort")
+        if selected.provider == .codex {
+            defaults.set(selected.model, forKey: "selectedModel"); defaults.set(selected.effort, forKey: "effort")
+        }
         pageFailure = nil
         tracker.markSubmitted(page.digest)
         let cached = force ? nil : cache.lookup(page: page, options: selected)
@@ -572,45 +637,38 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             defer { group.leave() }
-            let result = Result { () -> (PageTranslation, PageTimings) in
-                let ocrStart = Date()
-                let recognized = try ocr.recognize(page: page, runner: jobRunner, force: refreshOCR, progress: report)
-                let ocrTime = Date().timeIntervalSince(ocrStart)
-                try jobRunner.checkCancellation()
-                if recognized.blocks.isEmpty {
-                    return (PageTranslation(summary: "", dialogues: [], notes: "未识别到日文",
-                                            skippedCount: recognized.skippedCount, ocrSkippedCount: recognized.skippedCount),
-                            PageTimings(ocr: ocrTime, codex: 0, firstResult: nil))
-                }
-                let accepted = DispatchQueue.main.sync { () -> Bool in
-                    MainActor.assumeIsolated {
-                        guard let self, self.requestID == taskID else { return false }
-                        if (self.autoButton.state == .on && self.probeTracker.isSettling) || self.tracker.isSettling || self.latestPage?.digest != page.digest {
-                            self.tracker.release(page.digest); self.cancelTranslation(); self.shownEntry = nil; self.overlay.hide()
-                            self.setStatus("正在检查新页面…"); return false
+            let result = Result {
+                try TranslationPipeline.run(runner: jobRunner, began: began, recognize: { textReady in
+                    var ready = false
+                    return try ocr.recognize(page: page, runner: jobRunner, force: refreshOCR,
+                        progress: { if !ready { report($0) } }, onTextReady: { ready = true; textReady($0) })
+                }, translate: { recognized, preview in
+                    let accepted = DispatchQueue.main.sync { () -> Bool in
+                        MainActor.assumeIsolated {
+                            guard let self, self.requestID == taskID else { return false }
+                            return self.latestPage?.digest == page.digest
                         }
-                        return true
                     }
-                }
-                guard accepted else { throw CancellationError() }
-                let codexStart = Date()
-                var firstResult: Double?
-                let translation = try client.translate(ocr: recognized, options: selected, runner: jobRunner,
-                                                       force: force, seed: cached?.translation, progress: report, preview: { partial in
-                    if firstResult == nil { firstResult = Date().timeIntervalSince(began) }
+                    guard accepted else { throw CancellationError() }
+                    if selected.provider == .google, let google {
+                        return try google.translate(ocr: recognized, options: selected, runner: jobRunner,
+                            force: force, seed: cached?.translation, progress: report, preview: preview).0
+                    }
+                    guard let client else { throw AppError.configuration("请先安装并登录 Codex。") }
+                    return try client.translate(ocr: recognized, options: selected, runner: jobRunner,
+                        force: force, seed: cached?.translation, progress: report, preview: preview).0
+                }, preview: { partial, timings in
                     let elapsed = Date().timeIntervalSince(began)
-                    let timings = PageTimings(ocr: ocrTime, codex: Date().timeIntervalSince(codexStart), firstResult: firstResult)
                     DispatchQueue.main.async {
                         guard let self, self.requestID == taskID, self.options == selected,
                               self.latestPage?.digest == page.digest else { return }
                         self.shownEntry = CacheEntry(id: "preview-\(taskID)-\(partial.dialogues.count)", options: selected,
                             pageDigest: page.digest, translation: partial, createdAt: Date(), elapsed: elapsed, timings: timings)
                         self.updateOverlay()
-                        let rendered = self.overlay.renderedCount
-                        self.setStatus("已译 \(partial.translatedCount)/\(recognized.blocks.count) · 显示 \(rendered)")
+                        let total = partial.dialogues.count + partial.untranslatedCount
+                        self.setStatus("已译 \(partial.translatedCount)/\(total)")
                     }
-                }).0
-                return (translation, PageTimings(ocr: ocrTime, codex: Date().timeIntervalSince(codexStart), firstResult: firstResult))
+                })
             }
             DispatchQueue.main.async {
                 guard let self, self.requestID == taskID else { return }
@@ -626,13 +684,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                         } else { self.setStatus("等待翻译当前页…") }
                     } catch { self.setStatus("保存译文失败：\(error.localizedDescription)", error: true) }
                 case .failure(let error):
+                    if error is CancellationError {
+                        self.tracker.release(page.digest); self.pageFailure = nil
+                        self.overlay.hide()
+                        self.setStatus(self.autoButton.state == .on ? "正在检查新页面…" : "已停止")
+                        return
+                    }
                     if let partial = self.shownEntry, partial.pageDigest == page.digest,
                        !partial.translation.dialogues.isEmpty {
                         let previous = partial.translation
                         let kept = PageTranslation(summary: "", dialogues: previous.dialogues,
                             notes: error.localizedDescription, skippedCount: previous.skippedCount,
                             ocrSkippedCount: previous.ocrSkippedCount)
-                        if let saved = try? self.cache?.save(page: page, options: selected, translation: kept,
+                        // A full streaming preview is not a successful final
+                        // response. Persist only incomplete seeds after failure.
+                        if kept.untranslatedCount > 0, let saved = try? self.cache?.save(page: page, options: selected, translation: kept,
                             elapsed: Date().timeIntervalSince(began), timings: partial.timings) {
                             self.shownEntry = saved
                         }
@@ -651,6 +717,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
     private func show(_ entry: CacheEntry, cached: Bool) {
         shownEntry = entry; modelError = nil; updateOverlay()
+        if let failure = pageFailure, failure.digest == entry.pageDigest {
+            setStatus(failure.message, error: true); return
+        }
         if tracker.isSettling { setStatus("正在检查新页面…"); return }
         let translated = entry.translation.translatedCount
         let total = entry.translation.dialogues.count + entry.translation.skippedCount
@@ -686,6 +755,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func resetTracking() { tracker.reset(); probeTracker.reset(); lastProbeDigest = nil }
     private func stopWork() {
         operationEpoch += 1; autoButton?.state = .off
+        capture.endReading()
         resetTracking(); cancelTranslation()
         detailLabel?.stringValue = ""
     }
@@ -737,39 +807,10 @@ private enum MangaMenuIcon {
 }
 
 private enum PanelPalette {
-    static func color(_ light: (Double, Double, Double), _ dark: (Double, Double, Double)) -> NSColor {
-        NSColor(name: nil) { appearance in
-            let c = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
-            return NSColor(srgbRed: c.0, green: c.1, blue: c.2, alpha: 1)
-        }
-    }
     static let canvas = NSColor.windowBackgroundColor
-    static let surface = color((1, 1, 1), (0.18, 0.18, 0.19))
+    static let surface = NSColor.controlBackgroundColor
     static let accent = NSColor.controlAccentColor
-    static let selected = NSColor.labelColor.withAlphaComponent(0.045)
-    static let action = NSColor.controlAccentColor
-    static let actionText = NSColor.white
-    static let line = NSColor.labelColor.withAlphaComponent(0.08)
-}
-
-private enum PanelPaint {
-    static func text(_ text: String, in rect: NSRect, size: CGFloat, weight: NSFont.Weight = .regular,
-                     color: NSColor = .labelColor, alignment: NSTextAlignment = .left) {
-        let paragraph = NSMutableParagraphStyle(); paragraph.alignment = alignment; paragraph.lineBreakMode = .byTruncatingTail
-        (text as NSString).draw(in: rect, withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: weight),
-            .foregroundColor: color, .paragraphStyle: paragraph])
-    }
-    static func symbol(_ name: String, in rect: NSRect, color: NSColor, weight: NSFont.Weight = .medium) {
-        let configuration = NSImage.SymbolConfiguration(pointSize: rect.height, weight: weight)
-            .applying(.init(paletteColors: [color]))
-        NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(configuration)?
-            .draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
-    }
-    static func frame(_ rect: NSRect, radius: CGFloat, fill: NSColor?, stroke: NSColor? = nil) {
-        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
-        if let fill { fill.setFill(); path.fill() }
-        if let stroke { stroke.setStroke(); path.lineWidth = 1; path.stroke() }
-    }
+    static var line: NSColor { NSColor.labelColor.withAlphaComponent(0.10) }
 }
 
 private final class PanelCanvas: NSView {
@@ -782,28 +823,36 @@ private final class PanelCanvas: NSView {
 }
 
 private final class PanelGroup: NSView {
+    private weak var rows: NSStackView?
+    init(rows: NSStackView) { self.rows = rows; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
     override var isFlipped: Bool { true }
+    override func layout() { super.layout(); needsDisplay = true }
     override func draw(_ dirtyRect: NSRect) {
-        PanelPaint.frame(bounds, radius: 9, fill: PanelPalette.surface, stroke: PanelPalette.line)
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 9, yRadius: 9)
+        PanelPalette.surface.setFill(); path.fill()
+        PanelPalette.line.setStroke(); path.lineWidth = 0.5; path.stroke()
+        let visibleRows = rows?.arrangedSubviews.filter { !$0.isHidden } ?? []
         PanelPalette.line.setFill()
-        for y in [37.0, 71.0] { NSRect(x: 10, y: y, width: bounds.width-20, height: 0.5).fill() }
+        for row in visibleRows.dropLast() {
+            let rect = row.convert(row.bounds, to: self)
+            NSRect(x: 10, y: rect.maxY, width: bounds.width-20, height: 0.5).fill()
+        }
     }
 }
 
 private final class PanelPopUpButton: NSPopUpButton {
-    private let showsIcon: Bool
     var contextActions: NSMenu?
-    private var hovered = false
-    private var hoverArea: NSTrackingArea?
-    override var isFlipped: Bool { true }
     override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
     init(showsIcon: Bool = false) {
-        self.showsIcon = showsIcon
-        super.init(frame: .zero, pullsDown: true)
-        isBordered = false; focusRingType = .none; font = .systemFont(ofSize: 12)
-        (cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
+        super.init(frame: .zero, pullsDown: false)
+        isBordered = false; controlSize = .small; font = .systemFont(ofSize: 12)
+        imagePosition = showsIcon ? .imageLeading : .noImage
+        alignment = .left
+        setAccessibilityRole(.popUpButton)
         (cell as? NSPopUpButtonCell)?.preferredEdge = .maxY
-        (cell as? NSPopUpButtonCell)?.altersStateOfSelectedItem = true
+        cell?.lineBreakMode = .byTruncatingTail
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
     override func menu(for event: NSEvent) -> NSMenu? { contextActions }
@@ -817,70 +866,28 @@ private final class PanelPopUpButton: NSPopUpButton {
         super.layout()
         menu?.minimumWidth = bounds.width
     }
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let hoverArea { removeTrackingArea(hoverArea) }
-        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
-        addTrackingArea(area); hoverArea = area
-    }
-    override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
-    override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
-    override func becomeFirstResponder() -> Bool { let accepted = super.becomeFirstResponder(); needsDisplay = true; return accepted }
-    override func resignFirstResponder() -> Bool { let accepted = super.resignFirstResponder(); needsDisplay = true; return accepted }
-    override func draw(_ dirtyRect: NSRect) {
-        let focused = window?.firstResponder === self
-        let tint: NSColor? = hovered || isHighlighted ? PanelPalette.selected : nil
-        PanelPaint.frame(bounds, radius: 6, fill: tint,
-                         stroke: focused ? PanelPalette.accent.withAlphaComponent(0.65) : nil)
-        let foreground: NSColor = isEnabled ? .labelColor : .tertiaryLabelColor
-        if showsIcon {
-            let iconRect = NSRect(x: 9, y: (bounds.height-16)/2, width: 16, height: 16)
-            if let image = selectedItem?.image {
-                image.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
-            } else { PanelPaint.symbol("macwindow", in: iconRect.insetBy(dx: 3, dy: 3), color: .secondaryLabelColor) }
-        }
-        let textX: CGFloat = showsIcon ? 31 : 10
-        PanelPaint.text(titleOfSelectedItem ?? "", in: NSRect(x: textX, y: 6, width: bounds.width-textX-27, height: 18),
-                        size: 12, weight: .medium, color: foreground)
-        PanelPaint.symbol("chevron.down", in: NSRect(x: bounds.width-19, y: (bounds.height-6)/2, width: 8, height: 6),
-                          color: .secondaryLabelColor, weight: .semibold)
-    }
 }
 
-private class PanelHoverButton: NSButton {
-    private(set) var hovered = false
-    private var hoverArea: NSTrackingArea?
-    override var isFlipped: Bool { true }
+private final class PanelActionButton: NSButton {
+    static var accent: NSColor { PanelPalette.accent }
+    var active = false { didSet { updateAppearance() } }
+    override var title: String { didSet { updateAppearance() } }
     override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
     override init(frame: NSRect) {
         super.init(frame: frame)
-        isBordered = false; focusRingType = .none
+        bezelStyle = .rounded; controlSize = .large
+        font = .systemFont(ofSize: 12, weight: .medium)
+        imagePosition = .noImage
+        updateAppearance()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let hoverArea { removeTrackingArea(hoverArea) }
-        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
-        addTrackingArea(area); hoverArea = area
-    }
-    override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
-    override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
-    override func becomeFirstResponder() -> Bool { let accepted = super.becomeFirstResponder(); needsDisplay = true; return accepted }
-    override func resignFirstResponder() -> Bool { let accepted = super.resignFirstResponder(); needsDisplay = true; return accepted }
-    var keyboardFocused: Bool { window?.firstResponder === self }
-}
-
-private final class PanelActionButton: PanelHoverButton {
-    static var accent: NSColor { PanelPalette.accent }
-    var active = false { didSet { needsDisplay = true } }
-    override func draw(_ dirtyRect: NSRect) {
-        let fill = active ? PanelPalette.surface : PanelPalette.action
-        let foreground: NSColor = active ? .labelColor : PanelPalette.actionText
-        PanelPaint.frame(bounds, radius: 9, fill: fill.withAlphaComponent(isHighlighted ? 0.78 : hovered ? 0.90 : 1),
-                         stroke: active ? PanelPalette.line : NSColor.white.withAlphaComponent(0.09))
-        if keyboardFocused { PanelPaint.frame(bounds.insetBy(dx: 2, dy: 2), radius: 7, fill: nil, stroke: foreground.withAlphaComponent(0.45)) }
-        PanelPaint.text(title, in: NSRect(x: 12, y: 9, width: bounds.width-42, height: 18), size: 12, weight: .medium, color: foreground)
-        let symbol = active ? (title.contains("停止") ? "stop.fill" : "pause.fill") : "arrow.right"
-        PanelPaint.symbol(symbol, in: NSRect(x: bounds.width-24, y: 12, width: 11, height: 11), color: foreground)
+    private func updateAppearance() {
+        bezelColor = active ? nil : .controlAccentColor
+        let foreground: NSColor = active ? .labelColor : .white
+        contentTintColor = foreground
+        attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium), .foregroundColor: foreground
+        ])
+        needsDisplay = true
     }
 }

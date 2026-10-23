@@ -44,7 +44,7 @@ final class LocalOCR: @unchecked Sendable {
     private var input: FileHandle?
     private var runtime: URL?
     private var log: FileHandle?
-    private let engineVersion = "manga-ocr-15"
+    private let engineVersion = "manga-ocr-16"
 
     init(support: URL, resources: URL, engineRoot: URL? = nil) throws {
         root = engineRoot ?? support.appendingPathComponent("OCR")
@@ -80,6 +80,11 @@ final class LocalOCR: @unchecked Sendable {
         child.arguments = ["-u", script.path, root.path, directory.path]
         child.environment = CommandRunner.environment()
         child.standardInput = pipe; child.standardOutput = FileHandle.nullDevice; child.standardError = log
+        // A missing/broken worker must become a recoverable job error, never a
+        // SIGPIPE that terminates the menu-bar app on the next write.
+        guard fcntl(pipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            throw AppError.message("无法连接本地识字组件，请重试。")
+        }
         try child.run(); process = child; input = pipe.fileHandleForWriting
     }
 
@@ -104,13 +109,19 @@ final class LocalOCR: @unchecked Sendable {
         try start()
     }
 
-    func recognize(page: CapturedPage, runner: CommandRunner, force: Bool = false, progress: (String) -> Void) throws -> OCRPage {
+    // Called on the recognition queue. Start asynchronous text translation here;
+    // only the returned page has finished repair patches and is safe to render.
+    func recognize(page: CapturedPage, runner: CommandRunner, force: Bool = false, progress: (String) -> Void,
+                   onTextReady: ((OCRPage) -> Void)? = nil) throws -> OCRPage {
         serial.lock(); defer { serial.unlock() }
         try runner.checkCancellation()
         let key = page.digest + "-" + engineVersion + ".json"
         let cached = cache.appendingPathComponent(key)
         if !force, let data = try? Data(contentsOf: cached), let result = try? JSONDecoder().decode(OCRPage.self, from: data) {
             CacheFiles.touch(cached)
+            try runner.checkCancellation()
+            onTextReady?(result)
+            try runner.checkCancellation()
             return result
         }
         try start()
@@ -120,7 +131,12 @@ final class LocalOCR: @unchecked Sendable {
         try page.encoded(.png).write(to: job.appendingPathComponent("page.png"))
         progress("检查文字…")
         var request = try JSONSerialization.data(withJSONObject: ["directory": job.path, "hintsPending": true]); request.append(10)
-        try input!.write(contentsOf: request)
+        do { try input!.write(contentsOf: request) }
+        catch {
+            stopProcess(); cleanup()
+            try runner.checkCancellation()
+            throw AppError.message("本地识字连接已断开，请重试。")
+        }
         // Vision supplies independent Japanese evidence for unframed text and
         // small text missed by the comic detector. Images remain on this Mac.
         let hints = Self.textHints(in: page.image)
@@ -128,6 +144,7 @@ final class LocalOCR: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(90)
         var cancelStart: Date?
         var lastProgress = ""
+        var deliveredText = false
         struct State: Decodable {
             let phase: String
             var completed: Int?; var total: Int?; var page: OCRPage?; var message: String?
@@ -144,6 +161,12 @@ final class LocalOCR: @unchecked Sendable {
             }
             let state = (try? Data(contentsOf: job.appendingPathComponent("state.json")))
                 .flatMap { try? JSONDecoder().decode(State.self, from: $0) }
+            if !deliveredText, !runner.isCancelled,
+               let data = try? Data(contentsOf: job.appendingPathComponent("text.json")),
+               let text = try? JSONDecoder().decode(OCRPage.self, from: data) {
+                deliveredText = true
+                onTextReady?(text)
+            }
             if let state {
                 switch state.phase {
                 case "cancelled": throw CancellationError()
@@ -151,6 +174,8 @@ final class LocalOCR: @unchecked Sendable {
                 case "done":
                     try runner.checkCancellation()
                     guard let result = state.page else { throw AppError.message("识字结果不完整。") }
+                    if !deliveredText { onTextReady?(result) }
+                    try runner.checkCancellation()
                     try JSONEncoder().encode(result).write(to: cached, options: .atomic)
                     trimCache()
                     return result
@@ -159,6 +184,7 @@ final class LocalOCR: @unchecked Sendable {
             }
             let message = state?.phase == "detecting" ? "查找气泡…" : state?.phase == "recognizing"
                 ? "识字 \(state?.completed ?? 0)/\(state?.total ?? 0)"
+                : state?.phase == "repairing" ? "整理画面…"
                 : "加载识字模型…"
             if message != lastProgress { progress(message); lastProgress = message }
             Thread.sleep(forTimeInterval: 0.1)

@@ -3,9 +3,8 @@ import ScreenCaptureKit
 import ApplicationServices
 
 enum BrowserContent {
-    struct Region { let rect: CGRect; let toolbarEditing: Bool }
+    struct Region { let rect: CGRect; let toolbarEditing: Bool; let documentURL: URL? }
     private static let viewportLock = NSLock()
-    private static var cachedWeb: (pid: pid_t, window: CGRect, element: AXUIElement, checked: Date)?
     static func isBrowser(_ identity: String?) -> Bool {
         guard let identity else { return false }
         return ["com.google.Chrome", "com.apple.Safari", "com.microsoft.edgemac", "com.brave.Browser",
@@ -17,7 +16,8 @@ enum BrowserContent {
         _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
     }
 
-    // Read geometry only. Never walk the document's text or collect its URL.
+    // Read the viewport and document identity, never the document's text. The
+    // URL is used in memory to keep automatic reading on the selected document.
     static func isToolbarEditor(role: String?, frame: CGRect?, viewport: CGRect) -> Bool {
         guard ["AXTextField", "AXComboBox"].contains(role ?? ""), let frame else { return false }
         let overlap = frame.intersection(viewport)
@@ -41,6 +41,7 @@ enum BrowserContent {
             return CGRect(origin: position, size: size)
         }
         func region(_ element: AXUIElement) -> Region? {
+            if (attribute(element, "AXHidden") as? Bool) == true { return nil }
             guard let web = frame(element) else { return nil }
             let rect = web.intersection(windowFrame)
             guard !rect.isNull, rect.width >= windowFrame.width * 0.4, rect.height >= 100 else { return nil }
@@ -50,11 +51,10 @@ enum BrowserContent {
                 editing = isToolbarEditor(role: attribute(element, kAXRoleAttribute) as? String,
                                           frame: frame(element), viewport: rect)
             }
-            return Region(rect: rect.offsetBy(dx: -windowFrame.minX, dy: -windowFrame.minY), toolbarEditing: editing)
+            let rawURL = attribute(element, kAXURLAttribute)
+            let url = (rawURL as? URL) ?? (rawURL as? String).flatMap(URL.init(string:))
+            return Region(rect: rect.offsetBy(dx: -windowFrame.minX, dy: -windowFrame.minY), toolbarEditing: editing, documentURL: url)
         }
-        if let cached = cachedWeb, cached.pid == processID, cached.window == windowFrame,
-           Date().timeIntervalSince(cached.checked) < 2, let result = region(cached.element) { return result }
-        cachedWeb = nil
         guard let windows = attribute(app, kAXWindowsAttribute) as? [AXUIElement],
               let window = windows.first(where: {
                   guard let f = frame($0) else { return false }
@@ -67,7 +67,6 @@ enum BrowserContent {
             let role = attribute(element, kAXRoleAttribute) as? String
             if role == "AXWebArea" {
                 if let result = region(element) {
-                    cachedWeb = (processID, windowFrame, element, Date())
                     return result
                 }
                 continue
@@ -119,7 +118,7 @@ final class ReaderCapture {
     var source: CaptureSource? {
         didSet {
             if oldValue?.processID != source?.processID {
-                revision += 1; windows = []; selectedID = nil
+                revision += 1; windows = []; selectedID = nil; endReading()
             }
         }
     }
@@ -128,6 +127,11 @@ final class ReaderCapture {
     private(set) var topInset: CGFloat = 0
     private(set) var selectedID: CGWindowID?
     private(set) var contextKey = ""
+    private(set) var readingScope: ReadingScope?
+    private var reading = false
+
+    func beginReading() { reading = true; readingScope = nil; revision += 1 }
+    func endReading() { reading = false; readingScope = nil }
 
     func refresh() async throws -> [SCWindow] {
         guard let source, source.application?.isTerminated == false else {
@@ -154,6 +158,7 @@ final class ReaderCapture {
     func capture(maxDimension: CGFloat = 2600) async throws -> CapturedPage {
         let revision = revision
         let target = Self.visibleWindowID(processID: source?.processID ?? 0)
+        if let scope = readingScope, target != scope.windowID { throw ReadingScopeError.changed }
         if selectedID != target || !windows.contains(where: { $0.windowID == target }) {
             _ = try await refresh()
         }
@@ -162,6 +167,7 @@ final class ReaderCapture {
             throw AppError.message("请展开阅读软件的窗口。")
         }
         var viewport = CGRect(origin: .zero, size: frame.size)
+        var documentURL: URL?
         if BrowserContent.isBrowser(source?.identity) {
             guard BrowserContent.hasAccess else { throw AppError.configuration("请允许辅助功能后开始阅读。") }
             let processID = source!.processID
@@ -172,6 +178,11 @@ final class ReaderCapture {
             // current page while typing, then resume detection when focus returns.
             guard !web.toolbarEditing else { throw CancellationError() }
             viewport = web.rect
+            documentURL = web.documentURL
+            if reading, documentURL == nil { throw AppError.message("等待网页地址…") }
+        }
+        if let scope = readingScope, !scope.accepts(windowID: window.windowID, documentURL: documentURL) {
+            throw ReadingScopeError.changed
         }
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let configuration = SCStreamConfiguration()
@@ -185,7 +196,17 @@ final class ReaderCapture {
         guard revision == self.revision, selectedID == window.windowID,
               Self.visibleWindowID(processID: source?.processID ?? 0) == window.windowID,
               Self.frame(windowID: window.windowID)?.size == frame.size else { throw CancellationError() }
+        if BrowserContent.isBrowser(source?.identity), let source {
+            let after = await Task.detached(priority: .userInitiated) {
+                BrowserContent.viewport(processID: source.processID, windowFrame: frame)
+            }.value
+            guard revision == self.revision, let after, !after.toolbarEditing, after.rect == viewport else { throw CancellationError() }
+            guard documentURL.map(ReadingScope.documentKey) == after.documentURL.map(ReadingScope.documentKey) else {
+                throw ReadingScopeError.changed
+            }
+        }
         topInset = 0
+        if reading, readingScope == nil { readingScope = ReadingScope(windowID: window.windowID, documentURL: documentURL) }
         let info = (CGWindowListCopyWindowInfo([.optionIncludingWindow], window.windowID) as? [[String: Any]])?.first
         contextKey = (source?.identity ?? "") + "|" + (info?[kCGWindowName as String] as? String ?? window.title ?? "")
         // Hashing/encoding large screenshots must not occupy AppKit's main thread.

@@ -4,7 +4,7 @@ cd "${0:A:h}"
 APP="$PWD/build/Shiori.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 xcrun swiftc -swift-version 5 -O -target arm64-apple-macosx14.0 \
-  Sources/Core.swift Sources/CodexSession.swift Sources/OCR.swift Sources/Capture.swift Sources/Overlay.swift Sources/App.swift Sources/main.swift \
+  Sources/Core.swift Sources/CodexSession.swift Sources/GoogleTranslation.swift Sources/TranslationPipeline.swift Sources/OCR.swift Sources/ReadingScope.swift Sources/Capture.swift Sources/Overlay.swift Sources/App.swift Sources/main.swift \
   -framework AppKit -framework ScreenCaptureKit -framework CryptoKit \
   -o "$APP/Contents/MacOS/Shiori"
 cp Resources/translation.schema.json Resources/translator.txt Resources/ocr_worker.py Resources/MangaIcon.icns Resources/MangaIcon.png Resources/ThirdPartyNotices.txt "$APP/Contents/Resources/"
@@ -17,8 +17,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Shiori</string>
 <key>CFBundleExecutable</key><string>Shiori</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1.0</string>
-<key>CFBundleVersion</key><string>37</string>
+<key>CFBundleShortVersionString</key><string>1.2.0</string>
+<key>CFBundleVersion</key><string>38</string>
 <key>LSUIElement</key><true/>
 <key>CFBundleIconFile</key><string>MangaIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>

@@ -6,7 +6,7 @@ import time
 import traceback
 import base64
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -15,11 +15,15 @@ os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 
 
 def write_state(directory, **state):
+    write_json(directory, 'state', state)
+
+
+def write_json(directory, name, value):
     if not directory.exists():
         return
-    temporary = directory / 'state.tmp'
-    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding='utf-8')
-    temporary.replace(directory / 'state.json')
+    temporary = directory / (name + '.tmp')
+    temporary.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
+    temporary.replace(directory / (name + '.json'))
 
 
 def cancelled(directory):
@@ -400,6 +404,64 @@ def confirm_fragments(ocr, image, box, text, original, hints, directory, budget)
     return unknown
 
 
+def reconcile_fragments(ocr, image, box, text, hints, directory, budget):
+    """Confirm a single disputed glyph in otherwise matching dialogue.
+
+    Whole-line agreement is free. A strong system reading can nominate a local
+    disagreement, but only another crop decode may correct it. This also works
+    for closed balloons and vertical columns, without replacing their full text
+    with an incomplete system-OCR line. Shared page budget bounds extra decoding.
+    """
+    import unicodedata
+    def normalized(value):
+        return ''.join(c for c in unicodedata.normalize('NFKC', value) if c.isalnum())
+    uncertain = []
+    for hint in hints:
+        target = normalized(hint['text'])
+        if hint['confidence'] < .95 or not 4 <= len(target) <= 24 or budget[0] <= 0:
+            continue
+        x1, y1, x2, y2 = hint['box']
+        overlap = max(0, min(box[2], x2)-max(box[0], x1))*max(0, min(box[3], y2)-max(box[1], y1))
+        if overlap < .9*max(1, (x2-x1)*(y2-y1)):
+            continue
+        # Preserve source character offsets while ignoring only punctuation and
+        # spacing. Multi-codepoint normalizations are not safe edit candidates.
+        mapped = [(i, normalized(c)) for i, c in enumerate(text)]
+        if any(len(value) > 1 for _, value in mapped):
+            continue
+        mapped = [(i, value) for i, value in mapped if value]
+        source = ''.join(value for _, value in mapped)
+        if target in source:
+            continue
+        matches = []
+        for offset in range(len(source)-len(target)+1):
+            fragment = source[offset:offset+len(target)]
+            if sum(a != b for a, b in zip(fragment, target)) == 1:
+                matches.append((offset, fragment))
+        # Repeated or weakly matching text is not enough evidence for a repair.
+        if len(matches) != 1 or cancelled(directory):
+            continue
+        offset, original = matches[0]
+        height, width = image.shape[:2]
+        left, top = max(0, int(x1)), max(0, int(y1))
+        right, bottom = min(width, int(x2+.999)), min(height, int(y2+.999))
+        if right <= left or bottom <= top:
+            continue
+        budget[0] -= 1
+        retry = normalized(recognize_crops(ocr, [image[top:bottom, left:right]])[0])
+        if retry == target:
+            # Correct only the one glyph confirmed by both independent readings.
+            index = next(i for i, (a, b) in enumerate(zip(original, target)) if a != b)
+            position = mapped[offset+index][0]
+            text = text[:position] + target[index] + text[position+1:]
+        elif retry != original:
+            first, last = mapped[offset][0], mapped[offset+len(target)-1][0]+1
+            fragment = text[first:last]
+            if fragment not in uncertain:
+                uncertain.append(fragment)
+    return text, uncertain
+
+
 def restore_voicing(text, box, hints):
     """Recover dropped dakuten only where independent OCR reads the same phrase."""
     import unicodedata
@@ -621,6 +683,40 @@ def unique_blocks(blocks):
     return [b for b in blocks if b['id'] in ids]
 
 
+def finish_page(directory, blocks, skipped, patches, start):
+    """Publish stable OCR IDs before waiting for the final background repair.
+
+    text.json is a separate durable handoff: a fast repair cannot overwrite the
+    ready event before the parent polls. Drafts cannot erase source pixels.
+    """
+    if cancelled(directory):
+        write_state(directory, phase='cancelled')
+        return
+    result = unique_blocks(blocks)
+    draft = [dict(block, replacementPNG=None, replacementAllowed=False) for block in result]
+    write_json(directory, 'text', {'blocks': draft, 'skippedCount': skipped, 'elapsed': time.monotonic()-start})
+    write_state(directory, phase='repairing')
+    for block in result:
+        future = patches[block['id']]
+        while not cancelled(directory):
+            try:
+                patch = future.result(timeout=.05)
+                block['replacementPNG'] = patch
+                block['replacementAllowed'] = block['textStyle'] is None or patch is not None
+                break
+            except FutureTimeout:
+                # Python aliases FutureTimeout to built-in TimeoutError. Do not
+                # retry an actual timeout raised by a completed repair forever.
+                if future.done():
+                    raise
+                continue
+        if cancelled(directory):
+            write_state(directory, phase='cancelled')
+            return
+    write_state(directory, phase='done', page={'blocks': result, 'skippedCount': skipped,
+                'elapsed': time.monotonic()-start})
+
+
 def main():
     import cv2
     import numpy as np
@@ -709,7 +805,7 @@ def main():
                 patch_boxes[component] = target
                 patch_jobs[component] = repairs.submit(replacement_patch, image, text_mask, target,
                     ink_labels, extra_ink.get(component, []), component < 0, restorer)
-            result = []
+            result, accepted_patches = [], {}
             recognized = list(recognized_boxes(
                 ocr, image, boxes, languages, font_sizes, directory, 8 if device == 'mps' else 1, text_mask))
             uncertainty_budget = [4]
@@ -721,8 +817,8 @@ def main():
                 if hint and component < 0 and len(hint) >= 4:
                     text = hint
                 text = restore_voicing(text, box, hints)
-                uncertain = confirm_fragments(ocr, image, box, text, original, hints, directory, uncertainty_budget) \
-                    if hint and component < 0 and not directions[component] else []
+                text, uncertain = reconcile_fragments(ocr, image, box, text, hints, directory, uncertainty_budget)
+                uncertain += confirm_fragments(ocr, image, box, text, original, hints, directory, uncertainty_budget)
                 if not japanese_text(text, languages[component]):
                     # Keep "!!" and "…" in the original artwork; they are not failed OCR.
                     if not punctuation_only(text):
@@ -732,26 +828,22 @@ def main():
                 layouts = layout_boxes(labels, stats, component, box, font_sizes[component]) if closed else [list(box)]
                 layout = layouts[0]
                 x1, y1, x2, y2 = patch_boxes[component]
-                patch = patch_jobs[component].result()
                 # Open lettering uses only the detected glyph mask, never a solid
                 # white rectangle. An outline keeps Chinese readable over artwork.
                 style = None if closed else ('outlinedLight' if np.median(gray[y1:y2, x1:x2]) < 145 else 'outlinedDark')
                 result.append({'id': f'b{index+1}', 'text': text,
                     'uncertainFragments': uncertain or None,
-                    'replacementAllowed': closed or patch is not None,
+                    'replacementAllowed': False,
                     'vertical': directions[component], 'fontSize': font_sizes[component]/height*1000,
                     'layoutRegions': [{'x': b[0]/width*1000, 'y': b[1]/height*1000,
                                        'width': (b[2]-b[0])/width*1000, 'height': (b[3]-b[1])/height*1000} for b in layouts],
                     'layoutBounds': {'x': layout[0]/width*1000, 'y': layout[1]/height*1000,
                                      'width': (layout[2]-layout[0])/width*1000, 'height': (layout[3]-layout[1])/height*1000},
-                    'replacementPNG': patch, 'textStyle': style,
+                    'replacementPNG': None, 'textStyle': style,
                     'bounds': {'x': x1/width*1000, 'y': y1/height*1000,
                                'width': (x2-x1)/width*1000, 'height': (y2-y1)/height*1000}})
-            if cancelled(directory):
-                write_state(directory, phase='cancelled')
-            else:
-                write_state(directory, phase='done', page={'blocks': unique_blocks(result), 'skippedCount': skipped,
-                            'elapsed': time.monotonic()-start})
+                accepted_patches[f'b{index+1}'] = patch_jobs[component]
+            finish_page(directory, result, skipped, accepted_patches, start)
         except Exception:
             traceback.print_exc(file=sys.stderr)
             write_state(directory, phase='error', message='本地识字失败，请重试。')

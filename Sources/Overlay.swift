@@ -33,9 +33,6 @@ final class MangaOverlay {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.isReleasedWhenClosed = false
         panel.contentView = canvas
-        tracking = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.updatePosition() }
-        }
     }
 
     func show(_ entry: CacheEntry, page: CapturedPage, windowID: CGWindowID, processID: pid_t, topInset: CGFloat) {
@@ -53,13 +50,18 @@ final class MangaOverlay {
             layoutSeconds = Date().timeIntervalSince(began)
         }
         wantsVisible = true
+        if tracking == nil {
+            tracking = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.updatePosition() }
+            }
+        }
         updatePosition()
     }
 
     var renderedCount: Int { canvas.items.count }
     var omittedSummary: String { canvas.omittedSummary }
 
-    func hide() { wantsVisible = false; panel.orderOut(nil) }
+    func hide() { wantsVisible = false; panel.orderOut(nil); tracking?.invalidate(); tracking = nil }
 
     func stop() { hide(); tracking?.invalidate(); tracking = nil }
 

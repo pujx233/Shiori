@@ -2,15 +2,19 @@
 
 日语漫画翻译，常驻 macOS 菜单栏。
 
-选择正在使用的软件、模型和推理，点「开始阅读」。翻页后自动识字、翻译并回填原位置；取消「显示译文」可查看原图。
+选择正在使用的软件和翻译服务，点「开始阅读」。Google 直接翻译，Codex 可选模型和推理。翻页后自动识字、翻译并回填原位置；取消「显示译文」可查看原图。
 
 - 保留竖排，连体气泡分别排字，译文随返回逐步显示。
 - 局部疑点先比对并重识；仍有缺字时用小号灰色 `□`，可读部分继续翻译。整句无法辨认则保留原图，底部统一显示待确认数量。
 - 补识别气泡外的拟声词；复杂背景用本地 LaMa 修复，纯色区域直接回填。
 - 右键菜单栏图标可补齐译文、重新翻译、重新识字、复制译文和退出。
-- 识字在本地完成，Codex 只接收文字，使用已登录的 ChatGPT 账号，无需 API Key。
+- 识字和背景修复在本地完成，翻译服务只接收文字。Codex 使用已登录的 ChatGPT 账号；Google 无需 API Key。
+- 自动阅读绑定当前窗口和网页；切换软件或离开该页时暂停处理，返回后继续。支持同章翻页。
+- 文字就绪即可送译，背景修复同时进行；修复完成后再回填。
 - 同页复用缓存，翻页取消旧任务并保留连接；缺失条目补译一次。
-- 缓存合计上限 256 MiB。近期两页文字用于人名和语气衔接，关闭后清空。
+- 缓存合计上限 258 MiB。近期两页文字用于人名和语气衔接，关闭后清空。
+
+Google 通过网页翻译服务连接，速度受网络影响；上下文较强的对白可切换 Codex。
 
 首次使用需要录屏权限；浏览器还需要辅助功能权限。小字、手写字和复杂背景可能识别不全，可右键「重新识字」。
 
@@ -24,7 +28,7 @@
 
 ## 构建
 
-Apple Silicon、macOS 14+、Codex、Apple Command Line Tools 和 uv。
+Apple Silicon、macOS 14+、Apple Command Line Tools 和 uv。选择 Codex 时需要已安装并登录 Codex。
 
 ```sh
 ./SETUP_OCR.command
@@ -49,3 +53,9 @@ Apple Silicon、macOS 14+、Codex、Apple Command Line Tools 和 uv。
 疑点处理参考 [manga-image-translator 的识别质量过滤](https://github.com/zyddnys/manga-image-translator/blob/main/manga_translator/ocr/model_48px.py)，以及 [Mokuro Reader 的原图与文字层分离](https://github.com/Gnathonic/mokuro-reader/blob/main/src/lib/components/Reader/MangaPage.svelte)。两套本地识别结果一致时直接确认；仍有分歧时只重识对应的小区域，每页最多四次。不确定片段单独记录，字号适配、流式回填和缓存都保留这一状态。
 
 排版参考 [BallonsTranslator](https://github.com/dmMaze/BallonsTranslator) 与 [manga-image-translator](https://github.com/zyddnys/manga-image-translator) 的文字方向和区域适配；连接管理参考 [Easydict](https://github.com/tisfeng/Easydict)；界面参考 [Ice](https://github.com/jordanbaird/Ice) 与 [Settings](https://github.com/sindresorhus/Settings) 的对齐、分组和系统控件。
+
+### 1.2 性能与界面参考
+
+Google 接入参考 [Easydict GTX](https://github.com/tisfeng/Easydict/blob/dev/Easydict/Swift/Service/Google/GoogleService%2BTranslate.swift)。每个气泡独立对应请求和结果，最多六个并行请求；连接复用，重复文字复用本地缓存，服务限流时停止。该网页端点不提供 Cloud API 的服务保证。
+
+面板采用原生 AppKit 选择器和按钮，参考 [Apple 的选择器规范](https://developer.apple.com/design/human-interface-guidelines/pop-up-buttons) 与 [Ice 的分组设置](https://github.com/jordanbaird/Ice/blob/main/Ice/UI/IceUI/IceSection.swift)。Google 模式自动收起模型与推理，浅色、深色均跟随系统。

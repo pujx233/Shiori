@@ -354,7 +354,8 @@ let arguments = CommandLine.arguments
 if arguments.contains("--render-panel") || arguments.contains("--self-test") || arguments.contains("--make-fixture") || arguments.contains("--translate-file") || arguments.contains("--ocr-file") || arguments.contains("--make-vertical-fixture") || arguments.contains("--make-shaded-fixture") || arguments.contains("--render-result") {
     do {
         if let i = arguments.firstIndex(of: "--render-panel"), i + 1 < arguments.count {
-            try MainActor.assumeIsolated { try AppController().renderPanel(to: URL(fileURLWithPath: arguments[i + 1]), dark: arguments.contains("--dark")) }
+            let provider: TranslationProvider? = arguments.contains("--google") ? .google : arguments.contains("--codex") ? .codex : nil
+            try MainActor.assumeIsolated { try AppController().renderPanel(to: URL(fileURLWithPath: arguments[i + 1]), dark: arguments.contains("--dark"), provider: provider) }
         }
         if arguments.contains("--self-test") { try selfTest() }
         if let i = arguments.firstIndex(of: "--render-result"), i + 3 < arguments.count {
@@ -385,24 +386,33 @@ if arguments.contains("--render-panel") || arguments.contains("--self-test") || 
             let model = modelIndex.flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil } ?? "gpt-6.1-sol"
             let job = FileManager.default.temporaryDirectory.appendingPathComponent("shiori-smoke-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: job) }
-            let client = try CodexClient(resources: Bundle.main.resourceURL!, workspace: job)
-            defer { client.shutdown() }
             let support = try AppStorage.directory()
             let ocr = try LocalOCR(support: job, resources: Bundle.main.resourceURL!, engineRoot: support.appendingPathComponent("OCR"))
             defer { ocr.shutdown() }
             let began = Date(), page = try CapturedPage(image: image)
-            let recognized = try ocr.recognize(page: page, runner: CommandRunner(), progress: { fputs($0 + "\n", stderr) })
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
             if arguments.contains("--ocr-file") {
+                let recognized = try ocr.recognize(page: page, runner: CommandRunner(), progress: { fputs($0 + "\n", stderr) })
                 print(String(decoding: try encoder.encode(recognized), as: UTF8.self))
             } else {
-                guard !recognized.blocks.isEmpty else { throw AppError.message("No text recognized in fixture") }
-                let result = try client.translate(ocr: recognized, options: TranslationOptions(model: model, effort: "low"), runner: CommandRunner(),
-                    progress: { fputs($0 + "\n", stderr) }, preview: { partial in
-                        fputs(String(format: "PREVIEW=%d/%d AT=%.2fs\n", partial.dialogues.count, recognized.blocks.count, Date().timeIntervalSince(began)), stderr)
-                    })
+                let google = arguments.contains("--google") ? try GoogleTranslationClient(cacheDirectory: job.appendingPathComponent("Google"), concurrency: 6) : nil
+                let client = google == nil ? try CodexClient(resources: Bundle.main.resourceURL!, workspace: job) : nil
+                defer { client?.shutdown(); google?.shutdown() }
+                let options = TranslationOptions(model: google == nil ? model : GoogleTranslationClient.model,
+                    effort: google == nil ? "low" : "none", provider: google == nil ? .codex : .google)
+                let runner = CommandRunner()
+                let progress: (String) -> Void = { fputs($0 + "\n", stderr) }
+                let result = try TranslationPipeline.run(runner: runner, began: began, recognize: { ready in
+                    try ocr.recognize(page: page, runner: runner, progress: progress, onTextReady: ready)
+                }, translate: { recognized, preview in
+                    if let google { return try google.translate(ocr: recognized, options: options, runner: runner, progress: progress, preview: preview).0 }
+                    return try client!.translate(ocr: recognized, options: options, runner: runner, progress: progress, preview: preview).0
+                }, preview: { partial, _ in
+                    fputs(String(format: "PREVIEW=%d/%d AT=%.2fs\n", partial.dialogues.count,
+                        partial.dialogues.count + partial.untranslatedCount, Date().timeIntervalSince(began)), stderr)
+                })
                 print(String(decoding: try encoder.encode(result.0), as: UTF8.self))
-                fputs(String(format: "MODEL=%@ TRANSLATE=%.2fs TOTAL=%.2fs\n", model, result.1, Date().timeIntervalSince(began)), stderr)
+                fputs(String(format: "MODEL=%@ OCR=%.2fs TRANSLATE=%.2fs TOTAL=%.2fs\n", options.model, result.1.ocr, result.1.codex, Date().timeIntervalSince(began)), stderr)
             }
         }
     } catch { fputs(error.localizedDescription + "\n", stderr); exit(1) }

@@ -5,6 +5,8 @@ import unittest
 import tempfile
 import threading
 import time
+import json
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import cv2
@@ -48,6 +50,96 @@ class UncertainFragmentTests(unittest.TestCase):
         self.assertEqual(self.run_reading('文代祭')[0], ['文化祭'])
         result, calls, remaining = self.run_reading('文代祭', retry='文化祭', budget=0)
         self.assertEqual((result, calls, remaining), (['文化祭'], [], [0]))
+
+    def reconcile(self, text='揖川先生！？', retry='指川先生', confidence=.99, budget=4, shape=(100, 40)):
+        image = np.full((*shape, 3), 255, np.uint8)
+        hint = {'text': '指川先生', 'confidence': confidence, 'box': [5, 5, shape[1]-5, shape[0]-5]}
+        calls, previous = [], worker['recognize_crops']
+        worker['recognize_crops'] = lambda ocr, crops: calls.append(crops[0].shape) or [retry]
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                remaining = [budget]
+                result = worker['reconcile_fragments'](None, image, [0, 0, shape[1], shape[0]], text,
+                    [hint], Path(folder), remaining)
+                return result, calls, remaining
+        finally:
+            worker['recognize_crops'] = previous
+
+    def test_vertical_and_horizontal_local_agreement_correct_only_disputed_glyph(self):
+        for shape in [(100, 40), (40, 100)]:
+            result, calls, budget = self.reconcile(shape=shape)
+            self.assertEqual(result, ('指川先生！？', []))
+            self.assertEqual(calls, [(shape[0]-10, shape[1]-10, 3)])
+            self.assertEqual(budget, [3])
+
+    def test_strong_hint_does_not_override_confirmed_original_or_guess_a_third_reading(self):
+        self.assertEqual(self.reconcile(retry='揖川先生')[0], ('揖川先生！？', []))
+        self.assertEqual(self.reconcile(retry='梶川先生')[0], ('揖川先生！？', ['揖川先生']))
+
+    def test_matching_weak_ambiguous_and_over_budget_hints_do_not_redecode(self):
+        for arguments in [dict(text='指川先生！？'), dict(confidence=.9), dict(budget=0),
+                          dict(text='揖川先生と梶川先生'), dict(text='まったく違う話です')]:
+            self.assertEqual(self.reconcile(**arguments)[1], [])
+
+
+class TextHandoffTests(unittest.TestCase):
+    @staticmethod
+    def block(identifier='b1'):
+        return {'id': identifier, 'text': 'おはよう', 'textStyle': None,
+                'bounds': {'x': 0, 'y': 0, 'width': 100, 'height': 100}}
+
+    def test_text_is_available_before_repairs_and_final_retains_identical_ids(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory, pending = Path(folder), Future()
+            task = threading.Thread(target=worker['finish_page'], args=(directory,
+                [self.block()], 2, {'b1': pending}, time.monotonic()))
+            task.start()
+            deadline = time.monotonic()+1
+            while not (directory / 'text.json').exists() and time.monotonic() < deadline:
+                time.sleep(.005)
+            draft = json.loads((directory / 'text.json').read_text())
+            self.assertTrue(task.is_alive())
+            self.assertEqual(draft['skippedCount'], 2)
+            self.assertFalse(draft['blocks'][0]['replacementAllowed'])
+            self.assertIsNone(draft['blocks'][0]['replacementPNG'])
+            pending.set_result('verified-patch')
+            task.join(1)
+            final = json.loads((directory / 'state.json').read_text())
+            self.assertEqual(final['phase'], 'done')
+            self.assertEqual([b['id'] for b in final['page']['blocks']], [b['id'] for b in draft['blocks']])
+            self.assertEqual(final['page']['blocks'][0]['replacementPNG'], 'verified-patch')
+            self.assertEqual(json.loads((directory / 'text.json').read_text()), draft)
+
+    def test_cancel_during_repair_does_not_wait_for_future_or_publish_done(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory, pending = Path(folder), Future()
+            task = threading.Thread(target=worker['finish_page'], args=(directory,
+                [self.block()], 0, {'b1': pending}, time.monotonic()))
+            task.start()
+            deadline = time.monotonic()+1
+            while not (directory / 'text.json').exists() and time.monotonic() < deadline:
+                time.sleep(.005)
+            (directory / 'cancel').touch()
+            task.join(.5)
+            self.assertFalse(task.is_alive())
+            self.assertEqual(json.loads((directory / 'state.json').read_text())['phase'], 'cancelled')
+            self.assertFalse(pending.done())
+
+    def test_deduplication_is_identical_before_and_after_repair(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory, ready = Path(folder), Future()
+            ready.set_result(None)
+            worker['finish_page'](directory, [self.block(), self.block('b2')], 0, {'b1': ready}, time.monotonic())
+            draft = json.loads((directory / 'text.json').read_text())
+            final = json.loads((directory / 'state.json').read_text())['page']
+            self.assertEqual([b['id'] for b in draft['blocks']], ['b1'])
+            self.assertEqual([b['id'] for b in final['blocks']], ['b1'])
+
+    def test_repair_timeout_exception_is_not_confused_with_pending_future(self):
+        with tempfile.TemporaryDirectory() as folder:
+            failed = Future(); failed.set_exception(TimeoutError('repair failed'))
+            with self.assertRaises(TimeoutError):
+                worker['finish_page'](Path(folder), [self.block()], 0, {'b1': failed}, time.monotonic())
 
 
 class GlyphReplacementTests(unittest.TestCase):

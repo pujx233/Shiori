@@ -138,13 +138,34 @@ struct ModelInfo: Codable {
     let supported_reasoning_levels: [Effort]?
 }
 
+enum TranslationProvider: String, Codable {
+    case codex, google
+}
+
 struct TranslationOptions: Codable, Equatable {
     var model: String
     var effort: String
     // Increment when the prompt, OCR grouping or reading-order rules change.
     var promptVersion = 17
     var context = ""
-    var cacheNamespace: String { "\(model)|\(effort)|zh-Hans|\(promptVersion)" }
+    var provider: TranslationProvider = .codex
+    init(model: String, effort: String, promptVersion: Int = 17, context: String = "", provider: TranslationProvider = .codex) {
+        self.model = model; self.effort = effort; self.promptVersion = promptVersion
+        self.context = context; self.provider = provider
+    }
+    private enum CodingKeys: String, CodingKey { case model, effort, promptVersion, context, provider }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        model = try values.decode(String.self, forKey: .model)
+        effort = try values.decode(String.self, forKey: .effort)
+        promptVersion = try values.decode(Int.self, forKey: .promptVersion)
+        context = try values.decodeIfPresent(String.self, forKey: .context) ?? ""
+        provider = try values.decodeIfPresent(TranslationProvider.self, forKey: .provider) ?? .codex
+    }
+    var cacheNamespace: String {
+        let base = "\(model)|\(effort)|zh-Hans|\(promptVersion)"
+        return provider == .codex ? base : provider.rawValue + "|" + base
+    }
     var readingScope: String { cacheNamespace + "|" + context }
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.cacheNamespace == rhs.cacheNamespace }
 }

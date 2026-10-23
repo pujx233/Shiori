@@ -5,7 +5,7 @@ import Foundation
 @main
 struct CodexSessionTests {
     static func main() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("keda-rpc-tests-" + UUID().uuidString)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("shiori-rpc-tests-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let stub = root.appendingPathComponent("server.py")
