@@ -1,10 +1,9 @@
 import AppKit
 import CoreText
 
-// A single Japanese kana, with a compact menu-bar face and a rounded app face.
+// Keep the application and menu-bar icons on the same rounded kana outline.
 enum ShioriIcon {
-    private static let japanese = glyph(0x3042, fontName: "HiraginoSans-W6")
-    private static let applicationJapanese = glyph(0x3042, fontName: "HiraMaruProN-W4")
+    private static let japanese = glyph(0x3042, fontName: "HiraMaruProN-W4")
     private static let applicationFrame = CGRect(x: 232, y: 218, width: 560, height: 600)
 
     private static func glyph(_ character: UniChar, fontName: String) -> CGPath {
@@ -55,7 +54,7 @@ enum ShioriIcon {
             NSColor.white.withAlphaComponent(0.12).setStroke()
             tile.lineWidth = 1.5; tile.stroke()
             context.setFillColor(NSColor(srgbRed: 249 / 255.0, green: 251 / 255.0, blue: 250 / 255.0, alpha: 1).cgColor)
-            draw(applicationJapanese, in: applicationFrame, context: context)
+            draw(japanese, in: applicationFrame, context: context)
             return true
         }
     }
@@ -91,7 +90,7 @@ enum ShioriIcon {
           <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#jade)"/>
           <rect x="64" y="64" width="896" height="896" rx="200" fill="none" stroke="white" stroke-opacity="0.12" stroke-width="1.5"/>
           <g transform="translate(0 1024) scale(1 -1)">
-            \(svgGlyph(applicationJapanese, frame: applicationFrame))
+            \(svgGlyph(japanese, frame: applicationFrame))
           </g>
         </svg>
         """
