@@ -1,11 +1,11 @@
 import AppKit
 import CoreText
 
-// A single Japanese kana, with a small-size menu-bar face and an editorial app face.
+// A single Japanese kana, with a compact menu-bar face and a rounded app face.
 enum ShioriIcon {
     private static let japanese = glyph(0x3042, fontName: "HiraginoSans-W6")
-    private static let editorialJapanese = glyph(0x3042, fontName: "YuMin-Extrabold")
-    private static let applicationFrame = CGRect(x: 240, y: 220, width: 544, height: 600)
+    private static let applicationJapanese = glyph(0x3042, fontName: "HiraMaruProN-W4")
+    private static let applicationFrame = CGRect(x: 232, y: 218, width: 560, height: 600)
 
     private static func glyph(_ character: UniChar, fontName: String) -> CGPath {
         for name in [fontName, "HiraginoSans-W6"] {
@@ -49,13 +49,13 @@ enum ShioriIcon {
             context.saveGState(); defer { context.restoreGState() }
             let tile = NSBezierPath(roundedRect: NSRect(x: 64, y: 64, width: 896, height: 896),
                                     xRadius: 200, yRadius: 200)
-            NSGradient(starting: NSColor(srgbRed: 0.985, green: 0.981, blue: 0.958, alpha: 1),
-                       ending: NSColor(srgbRed: 0.882, green: 0.945, blue: 0.910, alpha: 1))!
-                .draw(in: tile, angle: -70)
-            NSColor.white.withAlphaComponent(0.45).setStroke()
+            NSGradient(starting: NSColor(srgbRed: 46 / 255.0, green: 115 / 255.0, blue: 105 / 255.0, alpha: 1),
+                       ending: NSColor(srgbRed: 17 / 255.0, green: 61 / 255.0, blue: 64 / 255.0, alpha: 1))!
+                .draw(in: tile, angle: -90)
+            NSColor.white.withAlphaComponent(0.12).setStroke()
             tile.lineWidth = 1.5; tile.stroke()
-            context.setFillColor(NSColor(srgbRed: 0.10, green: 0.31, blue: 0.28, alpha: 1).cgColor)
-            draw(editorialJapanese, in: applicationFrame, context: context)
+            context.setFillColor(NSColor(srgbRed: 249 / 255.0, green: 251 / 255.0, blue: 250 / 255.0, alpha: 1).cgColor)
+            draw(applicationJapanese, in: applicationFrame, context: context)
             return true
         }
     }
@@ -81,16 +81,17 @@ enum ShioriIcon {
 
     private static func svgGlyph(_ path: CGPath, frame: CGRect) -> String {
         let (x, y, scale) = fitting(path, in: frame)
-        return "<path d=\"\(svgPath(path))\" transform=\"translate(\(x) \(y)) scale(\(scale))\" fill=\"#1A4F47\"/>"
+        return "<path d=\"\(svgPath(path))\" transform=\"translate(\(x) \(y)) scale(\(scale))\" fill=\"#F9FBFA\"/>"
     }
 
     static var svg: String {
         """
         <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-          <defs><linearGradient id="jade" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FBFAF4"/><stop offset="1" stop-color="#E1F1E8"/></linearGradient></defs>
+          <defs><linearGradient id="jade" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#2E7369"/><stop offset="1" stop-color="#113D40"/></linearGradient></defs>
           <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#jade)"/>
+          <rect x="64" y="64" width="896" height="896" rx="200" fill="none" stroke="white" stroke-opacity="0.12" stroke-width="1.5"/>
           <g transform="translate(0 1024) scale(1 -1)">
-            \(svgGlyph(editorialJapanese, frame: applicationFrame))
+            \(svgGlyph(applicationJapanese, frame: applicationFrame))
           </g>
         </svg>
         """

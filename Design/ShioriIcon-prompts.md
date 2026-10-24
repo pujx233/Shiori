@@ -2,6 +2,8 @@
 
 使用内置 imagegen。生成图用于字形气质与配色探索；生产资源由 `Sources/ShioriIcon.swift` 的原生日文字形轮廓重绘，导出 SVG、PNG 与 ICNS，避免透明边缘杂点。
 
+最终版本采用墨绿底、白色 Hiragino Maru Gothic「あ」。在 Easydict、Pot 的文字比例与圆润笔画参考基础上，以原生矢量代码完成配色、字形与留白调整。下面保留早期探索提示词记录。
+
 ## 初稿提示词
 
 ```text
