@@ -1,12 +1,18 @@
 # 图标与界面
 
-图标：内置 image_gen 生成。[原始生成图](../Design/MangaIcon-master.png) / [1024px PNG](MangaIcon.png) / [macOS 图标](MangaIcon.icns)。
+图标只使用日文假名「あ」。应用图标采用暖白底、淡薄荷色调和墨绿色明朝体字标；菜单栏用更适合小尺寸的单色无衬线「あ」，跟随系统切换明暗。
 
-macOS 图标包含 16px 到 1024px 的十种标准尺寸，透明区域保留。菜单栏使用 AppKit 绘制的同款单色标记，随系统自动切换明暗。
+视觉方向通过内置 imagegen 探索，最终使用系统日文字形的矢量轮廓重绘，保持字符准确与透明边缘干净。[探索提示词](../Design/ShioriIcon-prompts.md)。
 
-最终提示：
+[SVG](../Design/ShioriIcon.svg) / [应用预览](../Design/ShioriIcon-preview.png) / [菜单栏明暗预览](../Design/ShioriIcon-menubar-preview.png) / [1024px PNG](ShioriKanaIcon.png) / [macOS 图标](ShioriKanaIcon.icns)。macOS 图标包含 16px 到 1024px 的十种标准尺寸，并保留外部透明区域。
 
-> Use case: logo-brand. Asset type: one final macOS app icon for a Japanese manga translation utility, square 1:1 canvas, 1024x1024, not a mockup. Design a fresh, restrained editorial identity: a single warm-white speech balloon whose interior is cut into a bold asymmetric manga-panel grid, with one small clean balloon tail. The panel cuts are broad and remain legible at 24px; this should read as one distinctive integrated symbol. Place this mark on a deep jade-green rounded-square tile matching a quiet jade-and-ink macOS interface. Use exceptionally balanced spacing, a crisp silhouette, softly rounded geometry and a very subtle matte tonal finish. The tile occupies about 87% of the canvas, with genuine transparent alpha outside it. The white symbol occupies about 62% of the tile. Front-facing, optically centered, fully contained. Keep the graphic simple and confidently drawn, with very little depth. No book, no overlapping bubbles, no letters or text, no flags, no translation arrows, no sparkle, no mascot, no glass/plastic gloss, no bevels, no outlines around the tile, no busy textures, no checkerboard baked into the image, no surrounding UI, no watermark. Produce only the single finished icon.
+矢量源在 `Sources/ShioriIcon.swift`，应用与菜单栏使用同一个假名，各自适配显示尺寸。用 `Scripts/GenerateIcons.swift` 生成 SVG、PNG、ICNS 与预览：
+
+```sh
+xcrun swiftc -swift-version 5 -O Sources/ShioriIcon.swift Scripts/GenerateIcons.swift -framework AppKit -o /tmp/shiori-generate-icons
+/tmp/shiori-generate-icons "$PWD"
+rm /tmp/shiori-generate-icons
+```
 
 界面参考：
 - [Bob](https://bobtranslate.com/)：菜单栏快速打开的轻量翻译面板。
@@ -24,4 +30,4 @@ Shiori 面板以软件、模型、推理三个同级选项开始，不重复显�
 
 顶栏右键通过 NSStatusItem.menu 显示，菜单外观跟随 NSApp.effectiveAppearance，使用系统背景、文字和选中颜色；菜单关闭后解除临时关联，保留左键打开面板的行为。
 
-后续图标方向：以 Shiori 的书签含义为主，用单一书签轮廓建立识别。菜单栏版本只保留单色剪影；应用图标使用相同轮廓与墨绿底色。此方向尚未替换当前的漫画气泡图标。
+品牌图标仅出现在系统菜单栏与应用图标中，面板内继续保留紧凑的原生控件布局。

@@ -1,5 +1,6 @@
 """Install a verified build without changing the app's privacy identity."""
 from pathlib import Path
+import os
 import plistlib
 import subprocess
 import tempfile
@@ -47,6 +48,8 @@ def main():
             if previous.exists():
                 previous.rename(destination)
             raise
+    # ditto preserves the directory timestamp; let Icon Services notice the update.
+    os.utime(destination, None)
     run('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', '-f', str(destination))
     print('Installed: ' + str(destination))
 

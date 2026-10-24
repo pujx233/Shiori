@@ -176,7 +176,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = ""
         statusItem.button?.toolTip = "Shiori"
-        statusItem.button?.image = MangaMenuIcon.make()
+        statusItem.button?.image = ShioriIcon.menuImage()
         statusItem.button?.setAccessibilityLabel("Shiori")
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self; statusItem.button?.action = #selector(statusItemClicked)
@@ -1045,27 +1045,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
     }
     @objc private func openCache() { if let cache { NSWorkspace.shared.open(cache.directory) } }
-}
-
-private enum MangaMenuIcon {
-    static func make() -> NSImage {
-        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
-            guard let context = NSGraphicsContext.current?.cgContext else { return false }
-            context.saveGState(); defer { context.restoreGState() }
-            context.setFillColor(NSColor.black.cgColor)
-            context.fillEllipse(in: CGRect(x: 1.5, y: 3.5, width: 15, height: 12.5))
-            context.move(to: CGPoint(x: 5.2, y: 6))
-            context.addLine(to: CGPoint(x: 3.6, y: 1.4))
-            context.addLine(to: CGPoint(x: 10, y: 4.8)); context.closePath(); context.fillPath()
-            context.setBlendMode(.clear)
-            context.fill(CGRect(x: 0, y: 9.1, width: 18, height: 1.1))
-            context.setLineWidth(1.15)
-            context.move(to: CGPoint(x: 8.9, y: 0)); context.addLine(to: CGPoint(x: 12.1, y: 18)); context.strokePath()
-            return true
-        }
-        image.isTemplate = true
-        return image
-    }
 }
 
 private enum PanelPalette {

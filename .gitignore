@@ -5,6 +5,10 @@ Review/
 __pycache__/
 *.py[cod]
 Design/*
-!Design/MangaIcon-master.png
+!Design/ShioriIcon.svg
+!Design/ShioriIcon-prompts.md
+!Design/ShioriIcon-preview.png
+!Design/ShioriIcon-menubar.png
+!Design/ShioriIcon-menubar-preview.png
 !Design/Shiori-panel-light.png
 !Design/Shiori-panel-dark.png
