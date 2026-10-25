@@ -88,6 +88,7 @@ struct Dialogue: Codable {
     var preserveOriginal: Bool? = nil
     var userRestoredOriginal: Bool? = nil
     var userEdited: Bool? = nil
+    var correctionEngine: String? = nil
 
     var needsReview: Bool { userRestoredOriginal != true && (preserveOriginal == true || !(uncertainRanges ?? []).isEmpty) }
 
@@ -150,12 +151,14 @@ struct TranslationOptions: Codable, Equatable {
     // Increment when the prompt, OCR grouping or reading-order rules change.
     var promptVersion = 17
     var context = ""
+    var guidance = ""
+    var terms: [WorkTerm] = []
     var provider: TranslationProvider = .codex
     init(model: String, effort: String, promptVersion: Int = 17, context: String = "", provider: TranslationProvider = .codex) {
         self.model = model; self.effort = effort; self.promptVersion = promptVersion
         self.context = context; self.provider = provider
     }
-    private enum CodingKeys: String, CodingKey { case model, effort, promptVersion, context, provider }
+    private enum CodingKeys: String, CodingKey { case model, effort, promptVersion, context, provider, guidance, terms }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         model = try values.decode(String.self, forKey: .model)
@@ -163,10 +166,17 @@ struct TranslationOptions: Codable, Equatable {
         promptVersion = try values.decode(Int.self, forKey: .promptVersion)
         context = try values.decodeIfPresent(String.self, forKey: .context) ?? ""
         provider = try values.decodeIfPresent(TranslationProvider.self, forKey: .provider) ?? .codex
+        guidance = try values.decodeIfPresent(String.self, forKey: .guidance) ?? ""
+        terms = try values.decodeIfPresent([WorkTerm].self, forKey: .terms) ?? []
     }
     var cacheNamespace: String {
         let base = "\(model)|\(effort)|zh-Hans|\(promptVersion)"
-        return provider == .codex ? base : provider.rawValue + "|" + base
+        var value = provider == .codex ? base : provider.rawValue + "|" + base
+        if context.hasPrefix("work:") || !guidance.isEmpty || !terms.isEmpty {
+            let data = Data((context + "|" + guidance + "|" + terms.map { $0.source + "=" + $0.translation }.joined(separator: "\n")).utf8)
+            value += "|" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        return value
     }
     var readingScope: String { cacheNamespace + "|" + context }
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.cacheNamespace == rhs.cacheNamespace }
@@ -340,11 +350,38 @@ struct PageTimings: Codable {
 
 final class TranslationCache {
     let directory: URL
+    private let manualDirectory: URL
+    private struct ManualEntry: Codable { let pageDigest: String; let context: String; let dialogues: [Dialogue] }
 
     init(directory: URL) throws {
         self.directory = directory
+        manualDirectory = directory.deletingLastPathComponent().appendingPathComponent("Corrections")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: manualDirectory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let marker = manualDirectory.appendingPathComponent(".migrated-v1")
+        if !FileManager.default.fileExists(atPath: marker.path) {
+            let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+            let entries = files.filter { $0.pathExtension == "json" }.compactMap { file -> CacheEntry? in
+                guard let data = try? Data(contentsOf: file) else { return nil }
+                return try? JSONDecoder().decode(CacheEntry.self, from: data)
+            }.sorted { $0.createdAt < $1.createdAt }
+            for entry in entries {
+                let manual = entry.translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true }.map { dialogue -> Dialogue in
+                    var value = dialogue; value.replacementPNG = nil; value.correctionEngine = "legacy"; return value
+                }
+                if !manual.isEmpty {
+                    let file = manualFile(entry.pageDigest, entry.options.context)
+                    let previous = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(ManualEntry.self, from: $0) }
+                    let latest = Set(manual.map(\.location))
+                    let merged = (previous?.dialogues ?? []).filter { !latest.contains($0.location) } + manual
+                    let record = ManualEntry(pageDigest: entry.pageDigest, context: entry.options.context, dialogues: merged)
+                    try JSONEncoder().encode(record).write(to: file, options: .atomic)
+                }
+            }
+            try Data().write(to: marker, options: .atomic)
+        }
         CacheFiles.trim(directory, maxBytes: 120 * 1024 * 1024)
     }
 
@@ -365,13 +402,40 @@ final class TranslationCache {
     }
 
     func save(page: CapturedPage, options: TranslationOptions, translation: PageTranslation, elapsed: Double,
-              timings: PageTimings? = nil) throws -> CacheEntry {
+              timings: PageTimings? = nil, persistManual: Bool = true) throws -> CacheEntry {
         let entry = CacheEntry(id: Self.key(page.digest, options), options: options,
                               pageDigest: page.digest, translation: translation, createdAt: Date(), elapsed: elapsed, timings: timings)
         let data = try JSONEncoder().encode(entry)
         try data.write(to: directory.appendingPathComponent(entry.id + ".json"), options: .atomic)
+        // Automatic recognition may omit a previously corrected bubble. Only
+        // explicit edits and undo replace the durable manual snapshot.
+        if persistManual {
+            let manual = translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true }.map { dialogue -> Dialogue in
+                var value = dialogue; value.replacementPNG = nil; value.correctionEngine = LocalOCR.engineVersion; return value
+            }
+            let manualURL = manualFile(page.digest, options.context)
+            if manual.isEmpty {
+                if FileManager.default.fileExists(atPath: manualURL.path) { try FileManager.default.removeItem(at: manualURL) }
+            } else {
+                let record = ManualEntry(pageDigest: page.digest, context: options.context, dialogues: manual)
+                try JSONEncoder().encode(record).write(to: manualURL, options: .atomic)
+            }
+        }
         CacheFiles.trim(directory, maxBytes: 120 * 1024 * 1024)
         return entry
+    }
+    private func manualFile(_ digest: String, _ context: String) -> URL {
+        let key = SHA256.hash(data: Data((digest + "|" + context).utf8)).map { String(format: "%02x", $0) }.joined()
+        return manualDirectory.appendingPathComponent(key + ".json")
+    }
+    func manualCorrections(page: CapturedPage, options: TranslationOptions, legacyContext: String? = nil) -> [Dialogue] {
+        func read(_ context: String) -> [Dialogue]? {
+            guard let data = try? Data(contentsOf: manualFile(page.digest, context)),
+              let entry = try? JSONDecoder().decode(ManualEntry.self, from: data),
+                  entry.pageDigest == page.digest, entry.context == context else { return nil }
+            return entry.dialogues
+        }
+        return read(options.context) ?? legacyContext.flatMap(read) ?? []
     }
 }
 
@@ -652,6 +716,12 @@ final class CodexClient: Sendable {
             }
             let input = String(decoding: try JSONEncoder().encode(blocks.map(inputBlock)), as: UTF8.self)
             var prompt = "逐条翻译为简体中文。一个 ID 对应一个气泡，译文只包含该 ID 的原文含义；不要把相邻气泡合并，也不要把有正文的气泡替换成省略号。\n"
+            if !options.guidance.isEmpty { prompt += "本作品的翻译习惯：\n" + options.guidance + "\n" }
+            let sourceText = (pageContext ?? ocr).blocks.map(\.text).joined(separator: "\n")
+            let matchedTerms = options.terms.filter { sourceText.contains($0.source) }
+            if !matchedTerms.isEmpty {
+                prompt += "本作品已确认的用词：\n" + matchedTerms.map { $0.source + " → " + $0.translation }.joined(separator: "\n") + "\n"
+            }
             if !history.isEmpty { prompt += "前页文字，仅用于人名和语气参考：\n" + history + "\n" }
             if let pageContext, pageContext.blocks.count > blocks.count {
                 let context = String(decoding: try JSONEncoder().encode(pageContext.blocks.map(inputBlock)), as: UTF8.self)

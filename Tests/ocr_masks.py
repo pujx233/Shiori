@@ -218,12 +218,13 @@ class ProgressivePageTests(unittest.TestCase):
                 mask = np.zeros(value.shape[:2], np.uint8)
                 return mask, mask, detected
         release, blocked = threading.Event(), threading.Event()
+        seen = []
         def recognized(ocr, image, boxes, languages, fonts, directory, batch, mask):
-            self.assertEqual(len(boxes), 9)
             time.sleep(.025)
             for index, (component, box) in enumerate(boxes):
-                if index == 8:
+                if len(seen) == 3:
                     blocked.set(); release.wait(2)
+                seen.append(component)
                 yield index, component, box, 'おはよう'
         replacements = {
             'recover_candidates': lambda *args: [], 'separate_caption_lines': lambda found: found,
@@ -247,15 +248,15 @@ class ProgressivePageTests(unittest.TestCase):
                 self.assertTrue(blocked.wait(2))
                 self.assertFalse(errors)
                 draft = json.loads((directory/'text.json').read_text())
-                self.assertEqual(len(draft['blocks']), 8)
+                self.assertEqual(len(draft['blocks']), 3)
                 self.assertTrue(all(block['replacementAllowed'] for block in draft['blocks']))
-                self.assertTrue(task.is_alive(), 'the first batch is available before the ninth crop')
+                self.assertTrue(task.is_alive(), 'the opening section is available before the fourth crop')
             finally:
                 release.set(); task.join(2)
             self.assertFalse(task.is_alive()); self.assertFalse(errors)
             final = json.loads((directory/'state.json').read_text())['page']
             self.assertEqual(len(final['blocks']), 9)
-            self.assertEqual([block['id'] for block in final['blocks'][:8]],
+            self.assertEqual([block['id'] for block in final['blocks'][:3]],
                              [block['id'] for block in draft['blocks']])
             self.assertTrue(all(block['text'] == 'おはよう' for block in final['blocks']))
 

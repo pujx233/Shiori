@@ -52,9 +52,8 @@ enum TranslationPipeline {
     // the current recognition snapshot no longer contains.
     static func applyingCorrections(_ ocr: OCRPage, corrections: [Dialogue]) -> OCRPage {
         guard !corrections.isEmpty else { return ocr }
-        let mapped = Dictionary(corrections.map { ($0.location, $0) }, uniquingKeysWith: { _, latest in latest })
         let blocks = ocr.blocks.map { block -> OCRBlock in
-            guard let value = mapped[block.id] else { return block }
+            guard let value = correction(for: block, in: corrections) else { return block }
             return OCRBlock(id: block.id, text: value.original, bounds: block.bounds,
                 replacementPNG: block.replacementPNG, replacementAllowed: block.replacementAllowed,
                 textStyle: block.textStyle, layoutBounds: block.layoutBounds, layoutRegions: block.layoutRegions,
@@ -63,12 +62,31 @@ enum TranslationPipeline {
         return OCRPage(blocks: blocks, skippedCount: ocr.skippedCount, elapsed: ocr.elapsed)
     }
 
+    static func correction(for block: OCRBlock, in corrections: [Dialogue]) -> Dialogue? {
+        func overlap(_ value: Dialogue) -> Double {
+            guard let a = block.bounds.rect(in: CGSize(width: 1000, height: 1000)),
+                  let b = value.bounds?.rect(in: CGSize(width: 1000, height: 1000)) else { return 0 }
+            let shared = a.intersection(b)
+            if shared.isNull { return 0 }
+            return shared.width*shared.height / (a.width*a.height + b.width*b.height-shared.width*shared.height)
+        }
+        if let exact = corrections.last(where: {
+            $0.location == block.id && ($0.correctionEngine == nil || $0.correctionEngine == LocalOCR.engineVersion || overlap($0) > 0.5)
+        }) { return exact }
+        let nearby = corrections.filter {
+            overlap($0) > 0.85 && ($0.original == block.text || ($0.correctionEngine != nil && $0.correctionEngine != LocalOCR.engineVersion))
+        }
+        if let textMatch = nearby.last(where: { $0.original == block.text }) { return textMatch }
+        return nearby.count == 1 ? nearby[0] : nil
+    }
+
     fileprivate static func bindCorrection(_ value: Dialogue, to block: OCRBlock) -> Dialogue {
         var rebound = Dialogue.recognized(block, text: value.translation)
         rebound.preserveOriginal = value.preserveOriginal
         rebound.uncertainRanges = value.uncertainRanges
         rebound.userEdited = value.userEdited
         rebound.userRestoredOriginal = value.userRestoredOriginal
+        rebound.correctionEngine = value.correctionEngine
         return rebound
     }
 
@@ -149,7 +167,7 @@ private final class PipelineState: @unchecked Sendable {
     private func page(allowEarlyOnly: Bool) -> PageTranslation? {
         guard let geometry else { return nil }
         let dialogues = geometry.blocks.compactMap { block -> Dialogue? in
-            let manual = corrections[block.id]
+            let manual = TranslationPipeline.correction(for: block, in: Array(corrections.values))
             let ready = !allowEarlyOnly || (earlyIDs?.contains(block.id) ?? true)
             if let manual {
                 var rebound = TranslationPipeline.bindCorrection(manual, to: block)
@@ -206,7 +224,9 @@ private final class PipelineState: @unchecked Sendable {
         condition.lock(); defer { condition.unlock() }
         while !runner.isCancelled, error == nil {
             if let geometry {
-                let blocks = geometry.blocks.filter { corrections[$0.id] == nil && !attempted.contains(SourceRevision($0)) }
+                let blocks = geometry.blocks.filter {
+                    TranslationPipeline.correction(for: $0, in: Array(corrections.values)) == nil && !attempted.contains(SourceRevision($0))
+                }
                 if !blocks.isEmpty {
                     attempted.formUnion(blocks.map(SourceRevision.init))
                     return OCRPage(blocks: blocks, skippedCount: 0, elapsed: geometry.elapsed)

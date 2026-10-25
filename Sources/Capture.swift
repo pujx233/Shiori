@@ -140,6 +140,7 @@ enum BrowserContent {
                   AXValueGetValue(s as! AXValue, .cgSize, &size) else { return nil }
             return CGRect(origin: position, size: size)
         }
+        var readingWindowHasFocus = false
         func region(_ element: AXUIElement) -> Region? {
             if (attribute(element, "AXHidden") as? Bool) == true { return nil }
             guard let web = frame(element) else { return nil }
@@ -148,7 +149,7 @@ enum BrowserContent {
             let rawURL = attribute(element, kAXURLAttribute)
             let url = (rawURL as? URL) ?? (rawURL as? String).flatMap(URL.init(string:))
             var editing = false
-            if let focused = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID() {
+            if readingWindowHasFocus, let focused = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID() {
                 let element = focused as! AXUIElement
                 editing = isToolbarEditor(role: attribute(element, kAXRoleAttribute) as? String,
                                           frame: frame(element), viewport: rect)
@@ -169,6 +170,7 @@ enum BrowserContent {
         let focused = focusedValue.flatMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil }
         guard let window = BrowserViewportSearch<AXUIElement, Region>.selectWindow(from: windows, focused: focused,
             same: { CFEqual($0, $1) }, matches: matches) else { return nil }
+        readingWindowHasFocus = focused.map { CFEqual($0, window) } ?? false
         let sameWindow = previous.map { CFEqual($0.window, window) } ?? false
         let search = BrowserViewportSearch<AXUIElement, Region>(
             role: { attribute($0, kAXRoleAttribute) as? String },
@@ -232,6 +234,7 @@ final class ReaderCapture {
     private(set) var topInset: CGFloat = 0
     private(set) var selectedID: CGWindowID?
     private(set) var contextKey = ""
+    private(set) var windowTitle = ""
     private(set) var readingScope: ReadingScope?
     private var reading = false
 
@@ -260,11 +263,11 @@ final class ReaderCapture {
         return windows
     }
 
-    func capture(maxDimension: CGFloat = 2600) async throws -> CapturedPage {
+    func capture(maxDimension: CGFloat = 2600, retainedWindow: CGWindowID? = nil) async throws -> CapturedPage {
         let revision = revision
-        let target = Self.visibleWindowID(processID: source?.processID ?? 0)
+        let target = retainedWindow ?? Self.visibleWindowID(processID: source?.processID ?? 0)
         if let scope = readingScope, target != scope.windowID { throw ReadingScopeError.changed }
-        if selectedID != target || !windows.contains(where: { $0.windowID == target }) {
+        if retainedWindow == nil, selectedID != target || !windows.contains(where: { $0.windowID == target }) {
             _ = try await refresh()
         }
         guard let window = windows.first(where: { $0.windowID == selectedID }),
@@ -299,7 +302,7 @@ final class ReaderCapture {
         configuration.ignoreShadowsSingleWindow = true
         let full = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
         guard revision == self.revision, selectedID == window.windowID,
-              Self.visibleWindowID(processID: source?.processID ?? 0) == window.windowID,
+              (retainedWindow != nil || Self.visibleWindowID(processID: source?.processID ?? 0) == window.windowID),
               Self.frame(windowID: window.windowID)?.size == frame.size else { throw CancellationError() }
         if BrowserContent.isBrowser(source?.identity), let source {
             let after = await Task.detached(priority: .userInitiated) {
@@ -313,7 +316,8 @@ final class ReaderCapture {
         topInset = 0
         if reading, readingScope == nil { readingScope = ReadingScope(windowID: window.windowID, documentURL: documentURL) }
         let info = (CGWindowListCopyWindowInfo([.optionIncludingWindow], window.windowID) as? [[String: Any]])?.first
-        contextKey = (source?.identity ?? "") + "|" + (info?[kCGWindowName as String] as? String ?? window.title ?? "")
+        windowTitle = info?[kCGWindowName as String] as? String ?? window.title ?? source?.title ?? "漫画"
+        contextKey = (source?.identity ?? "") + "|" + (documentURL.map(ReadingScope.documentKey) ?? windowTitle)
         // Hashing/encoding large screenshots must not occupy AppKit's main thread.
         let content = viewport
         return try await Task.detached(priority: .userInitiated) {
@@ -329,6 +333,10 @@ final class ReaderCapture {
 
     static func isForeground(windowID: CGWindowID, processID: pid_t) -> Bool {
         frontmostWindowID(processID: processID) == windowID
+    }
+    static func isOnScreen(windowID: CGWindowID) -> Bool {
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return windows.contains { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }
     }
 
     static func frontmostWindowID(processID: pid_t) -> CGWindowID? {

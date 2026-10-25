@@ -127,7 +127,7 @@ final class LocalOCR: @unchecked Sendable {
     private var input: FileHandle?
     private var runtime: URL?
     private var log: FileHandle?
-    static let engineVersion = "manga-ocr-19"
+    static let engineVersion = "manga-ocr-20"
 
     init(support: URL, resources: URL, engineRoot: URL? = nil,
          visionPreparation: OCRVisionPreparation? = nil,
@@ -166,7 +166,7 @@ final class LocalOCR: @unchecked Sendable {
         guard FileManager.default.isExecutableFile(atPath: python.path),
               FileManager.default.fileExists(atPath: root.appendingPathComponent("models/manga/pytorch_model.bin").path),
               FileManager.default.fileExists(atPath: root.appendingPathComponent("models/comictextdetector.pt").path) else {
-            throw AppError.configuration("本地识字组件未安装，请运行 SETUP_OCR.command。")
+            throw AppError.configuration("本地识字组件未安装，请在「应用设置…」中安装。")
         }
         cleanup()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("shiori-ocr-" + UUID().uuidString)

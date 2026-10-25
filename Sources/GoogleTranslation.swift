@@ -51,6 +51,7 @@ final class GoogleTranslationClient: @unchecked Sendable {
         let began = Date(), mailbox = GoogleMailbox()
         var accepted: [String: Dialogue] = [:]
         var jobs: [GoogleWork] = []
+        var plans: [String: GlossaryPlan] = [:]
         var jobIndex: [String: Int] = [:]
         var active: [Int: URLSessionDataTask] = [:]
         var next = 0, failures: [String] = []
@@ -86,6 +87,7 @@ final class GoogleTranslationClient: @unchecked Sendable {
             if let index = jobIndex[source] { jobs[index].blocks.append(block) }
             else {
                 jobIndex[source] = jobs.count
+                plans[source] = GlossaryPlan(source: source, terms: options.terms)
                 jobs.append(GoogleWork(source: source, namespace: namespace, blocks: [block]))
             }
         }
@@ -104,7 +106,7 @@ final class GoogleTranslationClient: @unchecked Sendable {
                 if let earliest = job.readyAt, Date() < earliest { break }
                 next += 1
                 let request: URLRequest
-                do { request = try Self.request(text: job.source) }
+                do { request = try Self.request(text: plans[job.source]?.text ?? job.source) }
                 catch { failures.append(error.localizedDescription); continue }
                 let task = session.dataTask(with: request) { data, response, error in
                     let result: Result<String, Error>
@@ -122,7 +124,10 @@ final class GoogleTranslationClient: @unchecked Sendable {
                 try runner.checkCancellation()
                 let job = jobs[index]
                 switch result {
-                case .success(let text):
+                case .success(let raw):
+                    let text: String
+                    do { text = try plans[job.source]?.restore(raw) ?? raw }
+                    catch { failures.append(error.localizedDescription); continue }
                     guard Self.usable(source: job.source, translation: text) else {
                         failures.append("部分原文未能翻译。"); continue
                     }

@@ -65,10 +65,11 @@ subjectKeyIdentifier = hash
     fingerprint = hashlib.sha1(certificate.read_bytes()).hexdigest().upper()
     run(['/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain)])
     try:
-        helper = app / 'Contents/Helpers/ShioriVision'
-        if helper.exists():
-            run(['/usr/bin/codesign', '--force', '--sign', fingerprint, '--keychain', str(keychain),
-                 '--timestamp=none', '--identifier', 'local.sai.Shiori.Vision', str(helper)])
+        for name, identifier in [('ShioriVision', 'local.sai.Shiori.Vision'), ('ShioriUV', 'local.sai.Shiori.UV')]:
+            helper = app / 'Contents/Helpers' / name
+            if helper.exists():
+                run(['/usr/bin/codesign', '--force', '--sign', fingerprint, '--keychain', str(keychain),
+                     '--timestamp=none', '--identifier', identifier, str(helper)])
         run(['/usr/bin/codesign', '--force', '--sign', fingerprint, '--keychain', str(keychain),
              '--timestamp=none', '--identifier', 'local.sai.Shiori', str(app)])
         run(['/usr/bin/codesign', '--verify', '--strict', str(app)])

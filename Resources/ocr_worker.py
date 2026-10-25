@@ -1016,7 +1016,7 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
     if pending and not (directory / 'hints.json').exists():
         boxes, fonts, languages, directions, extra, targets, skipped = page_groups(
             candidates, gray, labels, stats, exterior, ink_labels, ink_stats)
-        first = [(c, b) for c, b in boxes if c > 0 and 'ja' in languages[c] and fonts[c] >= 10][:8]
+        first = [(c, b) for c, b in boxes if c > 0 and 'ja' in languages[c] and fonts[c] >= 10][:(3 if device == 'mps' else 1)]
         for component, box in first:
             future = repairs.submit(replacement_patch, image, text_mask, targets[component],
                 ink_labels, extra.get(component, []), False, restorer, font_size=fonts[component],
@@ -1025,13 +1025,13 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
             early_patches[component] = (signature, future)
             patch_jobs[('early', component)] = future
         for index, component, box, text in recognized_boxes(
-                ocr, image, first, languages, fonts, directory, batch_size, text_mask):
+                ocr, image, first, languages, fonts, directory, min(batch_size, len(first) or 1), text_mask):
             early_text[(component, tuple(box), fonts[component])] = text
             if japanese_text(text, languages[component]):
                 early_result.append(page_block(component, box, text, [], targets[component], fonts[component],
                                                directions[component], gray, labels, stats))
             # Publish a complete decoder batch, retaining reading order later.
-            if len(early_text) % batch_size == 0 or len(early_text) == len(first):
+            if len(early_text) % min(batch_size, len(first) or 1) == 0 or len(early_text) == len(first):
                 order = {block_identifier(c, b): i for i, (c, b) in enumerate(first)}
                 early_result.sort(key=lambda block: order[block['id']])
                 publish_draft(directory, early_result, skipped,
@@ -1070,23 +1070,30 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
         patch_jobs[('final', component)] = future
         accepted_patches[block_identifier(component, box)] = future
     missing = [(c, b) for c, b in boxes if (c, tuple(b), fonts[c]) not in early_text]
-    for completed, (_, component, box, text) in enumerate(recognized_boxes(
-            ocr, image, missing, languages, fonts, directory, batch_size, text_mask), 1):
-        early_text[(component, tuple(box), fonts[component])] = text
-        if completed % batch_size == 0 or completed == len(missing):
-            # A fast Vision response must not turn the whole page back into a
-            # barrier. Publish completed decoder batches on this path too;
-            # independent verification below retains its original reading order
-            # and retry budget, and can still correct these provisional strings.
-            draft = []
-            for known, bounds in boxes:
-                value = early_text.get((known, tuple(bounds), fonts[known]))
-                if (known > 0 and fonts[known] >= 10 and 'ja' in languages[known]
-                        and value is not None and japanese_text(value, languages[known])):
-                    draft.append(page_block(known, bounds, value, [], targets[known], fonts[known],
-                                            directions[known], gray, labels, stats))
-            if draft:
-                publish_draft(directory, draft, skipped, accepted_patches, start)
+    # A short first section in reading order reaches translation before the
+    # remaining length-bucketed work. Keep the full independent review below.
+    priority = [] if early_text else [(c, b) for c, b in missing if c > 0 and fonts[c] >= 10 and 'ja' in languages[c]][:(3 if device == 'mps' else 1)]
+    priority_ids = {c for c, _ in priority}
+    phases = [(priority, min(batch_size, len(priority) or 1)),
+              ([(c, b) for c, b in missing if c not in priority_ids], batch_size)]
+    for phase, phase_batch in phases:
+        for completed, (_, component, box, text) in enumerate(recognized_boxes(
+                ocr, image, phase, languages, fonts, directory, phase_batch, text_mask), 1):
+            early_text[(component, tuple(box), fonts[component])] = text
+            if completed % phase_batch == 0 or completed == len(phase):
+                # A fast Vision response must not turn the whole page back into a
+                # barrier. Publish completed decoder batches on this path too;
+                # independent verification below retains its original reading order
+                # and retry budget, and can still correct these provisional strings.
+                draft = []
+                for known, bounds in boxes:
+                    value = early_text.get((known, tuple(bounds), fonts[known]))
+                    if (known > 0 and fonts[known] >= 10 and 'ja' in languages[known]
+                            and value is not None and japanese_text(value, languages[known])):
+                        draft.append(page_block(known, bounds, value, [], targets[known], fonts[known],
+                                                directions[known], gray, labels, stats))
+                if draft:
+                    publish_draft(directory, draft, skipped, accepted_patches, start)
     result, uncertainty_budget = [], [4]
     for component, box in boxes:
         if cancelled(directory):

@@ -13,7 +13,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var providerBox: NSPopUpButton!
     private var modelRow: NSView!
     private var effortRow: NSView!
-    private var autoButton: NSButton!
+    private var readingEnabled = false
+    private var modelDisclosureButton: NSButton!
+    private var modelOptionsExpanded = false
+    private var workProfiles: WorkProfileStore?
+    private var activeWorkID = ""
+    private var activeGuidance = ""
+    private var activeTerms: [WorkTerm] = []
+    private var workPanel: WorkSettingsPanel?
+    private var servicePanel: ServicesPanel?
+    private var hotkeys: ReaderHotkeys?
+    private var correctionHistory = CorrectionHistory()
+    private var lastReaderProbe: CapturedPage?
     private var overlayButton: NSButton!
     private var translateButton: NSButton!
     private var statusLabel: NSTextField!
@@ -93,11 +104,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 // Revalidate the underlying reader before showing any edited
                 // snapshot: the user may have scrolled while the editor was open.
                 self.overlay.hide()
-                if self.shownEntry != nil { self.setStatus("正在检查新页面…") }
+                if self.shownEntry != nil { self.setStatus("正在检查新页面…"); self.showReader() }
             }
         }
         do {
             let support = try AppStorage.directory()
+            workProfiles = try WorkProfileStore(directory: support)
             cache = try TranslationCache(directory: support.appendingPathComponent("Translations"))
             google = try GoogleTranslationClient(cacheDirectory: support.appendingPathComponent("GoogleTranslations"), concurrency: 6)
             ocr = try LocalOCR(support: support, resources: Bundle.main.resourceURL!)
@@ -121,7 +133,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         timer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.poll() }
         }
+        hotkeys = ReaderHotkeys()
+        hotkeys?.onAction = { [weak self] action in
+            switch action {
+            case .edit: self?.editBubble()
+            case .undo: self?.undoCorrection()
+            case .redo: self?.redoCorrection()
+            }
+        }
         updateProviderUI(); showSettings(); refreshSources()
+        if !OCRInstallation.isReady { setStatus("先安装本地识字组件"); showServices() }
     }
 
     func renderPanel(to destination: URL, dark: Bool = false, provider: TranslationProvider? = nil) throws {
@@ -142,7 +163,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationWillTerminate(_ notification: Notification) {
-        stopWork(); timer?.invalidate(); modelTimer?.invalidate(); overlay.stop()
+        stopWork(); timer?.invalidate(); modelTimer?.invalidate(); overlay.stop(); hotkeys = nil
+        servicePanel?.cancelServices()
         _ = translationGroup.wait(timeout: .now() + 4)
         client?.shutdown()
         google?.shutdown()
@@ -157,7 +179,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let menu = NSMenu()
         let appItem = NSMenuItem(); menu.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
-        appMenu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",").target = self
+        appMenu.addItem(withTitle: "阅读面板", action: #selector(showSettings), keyEquivalent: "").target = self
         appMenu.addItem(withTitle: "退出 Shiori", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let editItem = NSMenuItem(); editItem.title = "编辑"; menu.addItem(editItem)
         let edit = NSMenu(title: "编辑"); editItem.submenu = edit
@@ -169,6 +191,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         edit.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        edit.addItem(.separator())
+        let undoBubble = edit.addItem(withTitle: "撤销修正", action: #selector(undoCorrection), keyEquivalent: "z")
+        undoBubble.target = self; undoBubble.keyEquivalentModifierMask = [.control, .option]
+        let redoBubble = edit.addItem(withTitle: "重做修正", action: #selector(redoCorrection), keyEquivalent: "z")
+        redoBubble.target = self; redoBubble.keyEquivalentModifierMask = [.control, .option, .shift]
+        let readingItem = NSMenuItem(); readingItem.title = "阅读"; menu.addItem(readingItem)
+        let reading = NSMenu(title: "阅读"); readingItem.submenu = reading
+        reading.addItem(withTitle: "重新翻译", action: #selector(retranslate), keyEquivalent: "").target = self
+        reading.addItem(withTitle: "重新识字", action: #selector(rerecognize), keyEquivalent: "").target = self
+        let correct = reading.addItem(withTitle: "修正气泡…", action: #selector(editBubble), keyEquivalent: "e")
+        correct.target = self; correct.keyEquivalentModifierMask = [.control, .option]
+        reading.addItem(.separator())
+        reading.addItem(withTitle: "复制译文", action: #selector(copyTranslation), keyEquivalent: "").target = self
+        reading.addItem(withTitle: "返回阅读", action: #selector(showReader), keyEquivalent: "").target = self
         NSApp.mainMenu = menu
     }
 
@@ -189,23 +225,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         menu.removeAllItems()
         if (shownEntry?.translation.untranslatedCount ?? 0) > 0 {
             menu.addItem(withTitle: "补齐译文", action: #selector(translateCurrent), keyEquivalent: "").target = self
+        } else {
+            menu.addItem(withTitle: "重新翻译", action: #selector(retranslate), keyEquivalent: "").target = self
         }
-        menu.addItem(withTitle: "重新翻译", action: #selector(retranslate), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "重新识字", action: #selector(rerecognize), keyEquivalent: "").target = self
-        let correction = menu.addItem(withTitle: "修正气泡…", action: #selector(editBubble), keyEquivalent: "")
-        correction.target = self
-        correction.toolTip = "点选气泡后可修改原文和译文。阅读时按住 ⌥ 查看原图。"
-        menu.addItem(withTitle: "复制译文", action: #selector(copyTranslation), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "返回阅读窗口", action: #selector(showReader), keyEquivalent: "").target = self
-        let needsScreen = !CGPreflightScreenCaptureAccess()
-        let needsBrowser = BrowserContent.isBrowser(capture.source?.identity) && !BrowserContent.hasAccess
-        if needsScreen || needsBrowser {
-            menu.addItem(.separator())
-            if needsScreen { menu.addItem(withTitle: "授权屏幕录制…", action: #selector(openPermissions), keyEquivalent: "").target = self }
-            if needsBrowser { menu.addItem(withTitle: "授权辅助功能…", action: #selector(openAccessibility), keyEquivalent: "").target = self }
-        }
+        menu.addItem(withTitle: "修正气泡…", action: #selector(editBubble), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "作品用词…", action: #selector(showWorkSettings), keyEquivalent: "").target = self
         menu.addItem(.separator())
-        menu.addItem(withTitle: "退出 Shiori", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "设置…", action: #selector(showServices), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
     }
 
     private func label(_ text: String, color: NSColor = .secondaryLabelColor) -> NSTextField {
@@ -222,7 +249,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func buildWindow() {
         let controller = NSViewController()
-        let panelSize = NSSize(width: 240, height: 270)
+        let panelSize = NSSize(width: 260, height: 202)
         let background = PanelCanvas(frame: NSRect(origin: .zero, size: panelSize))
         controller.view = background
         let root = NSStackView(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 8
@@ -277,15 +304,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             fields.bottomAnchor.constraint(equalTo: fieldGroup.bottomAnchor, constant: -3)
         ])
         add(fieldGroup)
-        autoButton = NSButton(checkboxWithTitle: "自动翻译", target: self, action: #selector(toggleAuto))
         overlayButton = NSButton(checkboxWithTitle: "显示译文", target: self, action: #selector(toggleOverlay))
-        overlayButton.toolTip = "按住 ⌥ 临时查看原图；右键 Shiori 图标可修正气泡。"
-        for toggle in [autoButton!, overlayButton!] {
+        overlayButton.toolTip = "按住 ⌥ 查看原图；按住 ⌃⇧ 查看指向处译文；⌃⌥E 修正气泡，⌃⌥Z 撤销。"
+        for toggle in [overlayButton!] {
             toggle.font = .systemFont(ofSize: 11); toggle.controlSize = .small
             toggle.heightAnchor.constraint(equalToConstant: 24).isActive = true
         }
         overlayButton.state = defaults.object(forKey: "showOverlay") as? Bool == false ? .off : .on
-        let toggles = row([autoButton, overlayButton]); toggles.distribution = .fillEqually; toggles.spacing = 6
+        modelDisclosureButton = NSButton(title: "模型 ▸", target: self, action: #selector(toggleModelOptions))
+        modelDisclosureButton.isBordered = false; modelDisclosureButton.font = .systemFont(ofSize: 11)
+        modelDisclosureButton.toolTip = "模型与推理"
+        modelDisclosureButton.widthAnchor.constraint(equalToConstant: 54).isActive = true
+        modelDisclosureButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let toggles = row([overlayButton, spacer, modelDisclosureButton]); toggles.spacing = 6
         toggles.heightAnchor.constraint(equalToConstant: 24).isActive = true; add(toggles)
         let action = PanelActionButton(frame: .zero)
         action.title = "开始阅读"; action.target = self; action.action = #selector(startReading)
@@ -334,34 +366,39 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         popover.performClose(nil); reader.activate(options: [])
     }
     @objc private func startReading() {
-        if runner != nil || autoButton.state == .on { stopClicked(); return }
+        if runner != nil || readingEnabled { stopClicked(); return }
         guard capture.source != nil else { setStatus("请先选择软件", error: true); return }
         guard translationAvailable else { setStatus("请先加载可用模型", error: true); return }
-        autoButton.state = .on; toggleAuto()
+        readingEnabled = true; toggleAuto()
     }
     private var options: TranslationOptions {
         let provider = TranslationProvider(rawValue: providerBox?.selectedItem?.representedObject as? String ?? "codex") ?? .codex
-        return TranslationOptions(model: provider == .google ? "google-translate" : modelBox.titleOfSelectedItem ?? "",
+        var selected = TranslationOptions(model: provider == .google ? "google-translate" : modelBox.titleOfSelectedItem ?? "",
                                   effort: provider == .google ? "none" : effortBox.titleOfSelectedItem ?? "low",
-                                  context: capture.contextKey, provider: provider)
+                                  context: activeWorkID.isEmpty ? capture.contextKey : activeWorkID, provider: provider)
+        selected.guidance = activeGuidance; selected.terms = activeTerms
+        return selected
     }
     private var translationAvailable: Bool {
         options.provider == .google ? google != nil : client != nil && models.contains(where: { $0.slug == options.model })
     }
     private func updateProviderUI() {
         let codex = options.provider == .codex
-        modelRow.isHidden = !codex; effortRow.isHidden = !codex
-        popover.contentSize = NSSize(width: 240, height: codex ? 270 : 202)
+        modelRow.isHidden = !codex || !modelOptionsExpanded; effortRow.isHidden = !codex || !modelOptionsExpanded
+        modelDisclosureButton.title = modelOptionsExpanded ? "模型 ▾" : "模型 ▸"
+        modelDisclosureButton.isHidden = !codex
+        popover.contentSize = NSSize(width: 260, height: codex && modelOptionsExpanded ? 270 : 202)
         popover.contentViewController?.view.layoutSubtreeIfNeeded()
         updateStatus()
     }
+    @objc private func toggleModelOptions() { modelOptionsExpanded.toggle(); updateProviderUI() }
     @objc private func providerChanged() {
         defaults.set(options.provider.rawValue, forKey: "translationProvider")
         operationEpoch += 1; cancelTranslation(); resetTracking(); shownEntry = nil; overlay.hide()
         detailLabel.stringValue = ""
         updateProviderUI()
         if options.provider == .codex, models.isEmpty { refreshModels() }
-        setStatus(autoButton.state == .on ? "等待翻译…" : "就绪")
+        setStatus(readingEnabled ? "等待翻译…" : "就绪")
     }
     private func setStatus(_ text: String, error: Bool = false) {
         statusText = text; statusIsError = error; updateStatus()
@@ -376,7 +413,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         statusDot?.contentTintColor = error ? .systemOrange : runner != nil ? PanelActionButton.accent : .tertiaryLabelColor
         statusDot?.isHidden = runner != nil
         statusLabel.toolTip = text
-        let active = runner != nil || autoButton?.state == .on
+        let active = runner != nil || readingEnabled
         let title = runner != nil ? "停止翻译" : active ? "暂停翻译" : "开始阅读"
         translateButton.title = title
         (translateButton as? PanelActionButton)?.active = active
@@ -437,17 +474,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         cancelTranslation(); resetTracking(); overlay.hide()
         detailLabel.stringValue = ""
         shownEntry = nil
-        setStatus(autoButton.state == .on ? "等待翻译…" : "就绪")
+        setStatus(readingEnabled ? "等待翻译…" : "就绪")
     }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(undoCorrection) { return runner == nil && correctionRunner == nil && correctionHistory.canUndo && correctionHistory.page == latestPage?.digest }
+        if item.action == #selector(redoCorrection) { return runner == nil && correctionRunner == nil && correctionHistory.canRedo && correctionHistory.page == latestPage?.digest }
+        if item.action == #selector(showWorkSettings) { return workProfiles?.profiles.isEmpty == false }
         if item.action == #selector(editBubble) {
             return runner == nil && !captureBusy && correctionRunner == nil && shownEntry != nil && latestPage != nil
         }
         if item.action == #selector(translateCurrent) || item.action == #selector(retranslate) || item.action == #selector(rerecognize) {
             return runner == nil && !captureBusy && !isCorrectingBubble && capture.source != nil && translationAvailable
         }
-        if item.action == #selector(stopClicked) { return runner != nil || autoButton.state == .on }
+        if item.action == #selector(stopClicked) { return runner != nil || readingEnabled }
         if item.action == #selector(copyTranslation) { return shownEntry != nil }
         if item.action == #selector(showReader) { return capture.source != nil }
         return true
@@ -550,13 +590,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             do {
                 let page = try await self.capture.capture()
                 guard self.operationEpoch == epoch else { return }
-                self.tracker.adopt(page); self.latestPage = page; self.shownEntry = nil; self.updateOverlay()
+                self.prepareWork(for: page, force: force)
+                self.tracker.adopt(page); self.latestPage = page; self.updateOverlay()
                 self.submit(page, force: force, refreshOCR: refreshOCR); self.showReader()
             } catch { if self.operationEpoch == epoch { self.setStatus(error.localizedDescription, error: true) } }
         }
     }
     @objc private func toggleAuto() {
-        if autoButton.state == .on {
+        if readingEnabled {
             guard capture.source != nil, translationAvailable else {
                 stopWork(); setStatus(capture.source == nil ? "请先选择软件" : "请先加载可用模型", error: true); return
             }
@@ -573,7 +614,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func poll() async {
         defer {
             if defaults.bool(forKey: "diagnostics") {
-                let state: [String: Any] = ["auto": autoButton.state == .on, "busy": captureBusy,
+                let state: [String: Any] = ["auto": readingEnabled, "busy": captureBusy,
                     "running": runner != nil, "source": capture.source?.identity ?? "", "applications": applications.map(\.title), "status": statusLabel.stringValue, "target": capture.selectedID ?? 0,
                     "foreground": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "", "overlay": overlay.diagnosticState,
                     "page": latestPage?.digest ?? "", "request": requestDigest ?? "", "settling": tracker.isSettling,
@@ -587,17 +628,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         if isCorrectingBubble { await validateCorrectionPage(); return }
         guard correctionRunner == nil, !captureBusy,
-              autoButton.state == .on || runner != nil || shownEntry != nil else { return }
+              readingEnabled || runner != nil || shownEntry != nil else { return }
         guard let source = capture.source else { return }
         guard source.application?.isTerminated == false else { stopWork(); overlay.hide(); refreshApplications(); setStatus("阅读软件已关闭"); return }
         let foreground = NSWorkspace.shared.frontmostApplication?.processIdentifier
         guard foreground == source.processID else {
-            overlay.hide()
             // Opening our own panel must not interrupt a translation already
             // requested. Other applications suspend reading without taking screenshots.
             if foreground != ProcessInfo.processInfo.processIdentifier {
-                suspendReading("等待阅读窗口…")
+                if let digest = requestDigest { tracker.release(digest); cancelTranslation() }
+                if readingEnabled { setStatus("保留译文 · 等待继续阅读") }
             }
+            await validateRetainedPage()
             return
         }
         guard let visibleWindow = ReaderCapture.visibleWindowID(processID: source.processID) else {
@@ -605,7 +647,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             return
         }
         if let scope = capture.readingScope, scope.windowID != visibleWindow {
-            suspendReading("等待原阅读窗口…"); return
+            if let digest = requestDigest { tracker.release(digest); cancelTranslation() }
+            if readingEnabled { setStatus("保留译文 · 等待继续阅读") }
+            await validateRetainedPage(); return
         }
         if visibleWindow != capture.selectedID {
             cancelTranslation(); resetTracking(); latestPage = nil; shownEntry = nil; overlay.hide()
@@ -618,7 +662,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             guard operationEpoch == epoch else { return }
             guard let probe = probeTracker.observe(sample) else {
                 overlay.hide()
-                if runner == nil, autoButton.state == .on { setStatus("正在检查新页面…") }
+                if runner == nil, readingEnabled { setStatus("正在检查新页面…") }
                 // Confirm a page turn promptly, without increasing the idle
                 // screenshot rate or continuously chasing an animation.
                 if !didConfirmCandidate {
@@ -637,8 +681,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             settlingProbe?.cancel(); settlingProbe = nil; didConfirmCandidate = false
             if lastProbeDigest == probe.digest {
                 updateOverlay()
-                if runner == nil, ["正在检查新页面…", "等待阅读窗口…", "等待原阅读窗口…", "等待原阅读页面…"].contains(statusText), let entry = shownEntry { show(entry, cached: true) }
-                if autoButton.state == .on, runner == nil, tracker.needsSubmission, let page = tracker.current {
+                if runner == nil, ["正在检查新页面…", "等待阅读窗口…", "等待原阅读窗口…", "等待原阅读页面…", "保留译文 · 等待继续阅读"].contains(statusText), let entry = shownEntry { show(entry, cached: true) }
+                if readingEnabled, runner == nil, tracker.needsSubmission, let page = tracker.current {
                     submit(page, force: false)
                 }
                 return
@@ -655,15 +699,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             if runner != nil, requestDigest != page.digest { cancelTranslation() }
             if previous?.digest != page.digest {
                 shownEntry = nil; overlay.hide(); detailLabel.stringValue = ""
-                if autoButton.state == .on { setStatus("正在检查新页面…") }
+                if readingEnabled { setStatus("正在检查新页面…") }
             }
-            latestPage = page
+            prepareWork(for: page)
+            latestPage = page; lastReaderProbe = sample
             updateOverlay()
             if runner == nil, ["等待阅读窗口…", "正在检查新页面…"].contains(statusText), let entry = shownEntry { show(entry, cached: true) }
             if runner == nil, let failure = pageFailure, failure.digest == page.digest, !tracker.needsSubmission {
                 setStatus(failure.message, error: true)
             }
-            guard autoButton.state == .on, runner == nil, tracker.needsSubmission else { return }
+            guard readingEnabled, runner == nil, tracker.needsSubmission else { return }
             cancelTranslation(); submit(page, force: false)
         } catch is ReadingScopeError { suspendReading("等待原阅读页面…") }
         catch is CancellationError { overlay.hide() }
@@ -678,7 +723,83 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func suspendReading(_ message: String) {
         overlay.hide()
         if let digest = requestDigest { tracker.release(digest); cancelTranslation() }
-        if autoButton.state == .on { setStatus(message) }
+        if readingEnabled { setStatus(message) }
+    }
+    private func validateRetainedPage() async {
+        guard !captureBusy, overlay.isRetained, let target = capture.selectedID, ReaderCapture.isOnScreen(windowID: target),
+              let page = latestPage, shownEntry?.pageDigest == page.digest else { return }
+        captureBusy = true; let epoch = operationEpoch
+        defer { captureBusy = false }
+        do {
+            let regions = shownEntry?.translation.dialogues.compactMap(\.bounds) ?? []
+            if let reference = lastReaderProbe {
+                let current = try await capture.capture(maxDimension: 640, retainedWindow: capture.selectedID)
+                guard operationEpoch == epoch else { return }
+                let unchanged = regions.isEmpty ? current.hasSameContent(as: reference)
+                    : current.hasSameTextRegions(as: reference, regions: regions)
+                if !unchanged { overlay.hide() } else { updateOverlay() }
+            } else {
+                let current = try await capture.capture(retainedWindow: capture.selectedID)
+                guard operationEpoch == epoch else { return }
+                if !current.hasSameContent(as: page) { overlay.hide() } else { updateOverlay() }
+            }
+        } catch {
+            if operationEpoch == epoch { overlay.hide() }
+        }
+    }
+
+    private func prepareWork(for page: CapturedPage, force: Bool = false) {
+        correctionHistory.select(page.digest)
+        if force || latestPage?.digest != page.digest || activeWorkID.isEmpty {
+            do {
+                if let profile = try workProfiles?.resolve(context: capture.contextKey,
+                                                           title: capture.windowTitle.isEmpty ? "未命名作品" : capture.windowTitle) {
+                    if activeWorkID != profile.id { correctionHistory = CorrectionHistory(); correctionHistory.select(page.digest) }
+                    activeWorkID = profile.id; activeGuidance = profile.style; activeTerms = profile.terms
+                }
+            } catch { setStatus("作品用词暂未保存：" + error.localizedDescription, error: true) }
+        }
+    }
+
+    @objc private func showWorkSettings() {
+        guard let store = workProfiles,
+              let profile = store.profile(id: activeWorkID) ?? store.profiles.first else { return }
+        if let workPanel, workPanel.window?.isVisible == true {
+            popover.performClose(nil); workPanel.showWindow(nil); NSApp.activate(ignoringOtherApps: true); return
+        }
+        let context = activeWorkID.isEmpty ? nil : capture.contextKey
+        let controller = WorkSettingsPanel(profile: profile, profiles: store.profiles, showsStyle: options.provider == .codex)
+        controller.onSave = { [weak self] value in
+            try store.save(value, context: context)
+            self?.setStatus("作品设置已保存，后续翻译生效")
+        }
+        workPanel = controller; popover.performClose(nil)
+        controller.showWindow(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func showServices() {
+        if let servicePanel, servicePanel.window?.isVisible == true {
+            popover.performClose(nil); servicePanel.showWindow(nil); NSApp.activate(ignoringOtherApps: true); return
+        }
+        let controller = ServicesPanel(resources: Bundle.main.resourceURL!)
+        controller.onPauseReading = { [weak self] in self?.stopWork() }
+        controller.beforeOperation = { [group = translationGroup] in
+            guard group.wait(timeout: .now() + 5) == .success else {
+                throw AppError.message("正在收尾上一页，请稍后重试。")
+            }
+        }
+        controller.onPermissions = { [weak self] browser in
+            if browser { self?.openAccessibility() } else { self?.openPermissions() }
+        }
+        controller.onIdle = { [weak self] in
+            guard let self else { return }
+            self.ocr?.shutdown()
+            let support = try AppStorage.directory()
+            self.ocr = try LocalOCR(support: support, resources: Bundle.main.resourceURL!)
+            self.setStatus("本地组件已就绪")
+        }
+        servicePanel = controller; popover.performClose(nil)
+        controller.showWindow(nil); NSApp.activate(ignoringOtherApps: true)
     }
     private func updateOverlay() {
         guard !tracker.isSettling, !probeTracker.isSettling, overlayButton.state == .on, let entry = shownEntry, entry.options == options,
@@ -702,8 +823,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         pageFailure = nil
         tracker.markSubmitted(page.digest)
-        let cached = force ? nil : cache.lookup(page: page, options: selected)
-        let corrections = cached?.translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true } ?? []
+        let previous = shownEntry?.pageDigest == page.digest ? shownEntry : cache.lookup(page: page, options: selected)
+        let cached = force ? nil : previous
+        let corrections = cache.manualCorrections(page: page, options: selected,
+            legacyContext: (capture.source?.identity ?? "") + "|" + capture.windowTitle)
+            + (previous?.translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true } ?? [])
         if let entry = cached {
             if let recognized = ocr.cachedRecognition(for: page) { setCorrectionCandidates(recognized, digest: page.digest) }
             show(entry, cached: true)
@@ -784,7 +908,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                         }
                         guard let currentCache = self.cache else { return }
                         let entry = try currentCache.save(page: page, options: selected, translation: translation,
-                                                         elapsed: Date().timeIntervalSince(began), timings: timings)
+                                                         elapsed: Date().timeIntervalSince(began), timings: timings, persistManual: false)
                         if self.options == selected, self.latestPage?.digest == page.digest {
                             self.show(entry, cached: false)
                         } else { self.setStatus("等待翻译当前页…") }
@@ -793,7 +917,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                     if error is CancellationError {
                         self.tracker.release(page.digest); self.pageFailure = nil
                         self.overlay.hide()
-                        self.setStatus(self.autoButton.state == .on ? "正在检查新页面…" : "已停止")
+                        self.setStatus(self.readingEnabled ? "正在检查新页面…" : "已停止")
                         return
                     }
                     if let partial = self.shownEntry, partial.pageDigest == page.digest,
@@ -805,7 +929,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                         // A full streaming preview is not a successful final
                         // response. Persist only incomplete seeds after failure.
                         if kept.untranslatedCount > 0, let saved = try? self.cache?.save(page: page, options: selected, translation: kept,
-                            elapsed: Date().timeIntervalSince(began), timings: partial.timings) {
+                            elapsed: Date().timeIntervalSince(began), timings: partial.timings, persistManual: false) {
                             self.shownEntry = saved
                         }
                         self.updateOverlay()
@@ -814,7 +938,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                     if (error as? AppError)?.needsUserAction == true { self.stopWork() }
                     self.setStatus(error is CancellationError ? "已停止" : error.localizedDescription,
                                    error: !(error is CancellationError))
-                    if self.autoButton.state == .on {
+                    if self.readingEnabled {
                         self.statusLabel.toolTip = error.localizedDescription + "\n右键 Shiori 图标可重试此页。"
                     }
                 }
@@ -843,7 +967,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             details.append("\(entry.translation.unclearCount) 处待确认，其中 \(entry.translation.preservedCount) 处保留原图。")
         }
         if overlayButton.state == .on, rendered < translated {
-            details.append("\(translated-rendered) 处未显示：" + overlay.omittedSummary + "。右键可复制译文。")
+            details.append("\(translated-rendered) 处未显示：" + overlay.omittedSummary + "。可从「阅读」菜单复制译文。")
         }
         if !entry.translation.notes.isEmpty { details.append(entry.translation.notes) }
         if let timings = entry.timings {
@@ -913,9 +1037,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
               let cache else { throw AppError.message("页面已改变，请重新选择气泡。") }
         let order = correctionCandidates?.digest == page.digest
             ? correctionCandidates!.dialogues.map(\.location) : current.translation.dialogues.map(\.location)
+        let previousProfile = workProfiles?.profile(id: activeWorkID)
         let updated = BubbleCorrection.replacing(dialogue, in: current.translation, order: order)
         let entry = try cache.save(page: page, options: selected, translation: updated,
                                    elapsed: current.elapsed, timings: current.timings)
+        correctionHistory.record(CorrectionSnapshot(translation: current.translation, profile: previousProfile), page: page.digest)
+        if var profile = previousProfile { profile.learn(dialogue); try? workProfiles?.save(profile) }
         if updated.untranslatedCount == 0, pageFailure?.digest == page.digest { pageFailure = nil }
         show(entry, cached: true)
     }
@@ -1008,15 +1135,46 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         timerStatus?.invalidate(); timerStatus = nil; spinner.stopAnimation(nil); spinner.isHidden = true
         updateStatus()
     }
+    @objc private func undoCorrection() { restoreCorrection(redo: false) }
+    @objc private func redoCorrection() { restoreCorrection(redo: true) }
+    private func restoreCorrection(redo: Bool) {
+        guard runner == nil, correctionRunner == nil, !captureBusy, let page = latestPage,
+              let entry = shownEntry, entry.pageDigest == page.digest,
+              correctionHistory.page == page.digest,
+              redo ? correctionHistory.canRedo : correctionHistory.canUndo else { return }
+        overlay.endCorrection(); showReader()
+        captureBusy = true; let epoch = operationEpoch
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.captureBusy = false }
+            do {
+                let current = try await self.capture.capture()
+                guard self.operationEpoch == epoch, current.hasSameContent(as: page) else {
+                    throw AppError.message("页面已改变，请回到要修正的那一页。")
+                }
+                let snapshot = CorrectionSnapshot(translation: entry.translation,
+                    profile: self.workProfiles?.profile(id: self.activeWorkID))
+                var history = self.correctionHistory
+                guard let restored = redo ? history.redo(current: snapshot, page: page.digest)
+                    : history.undo(current: snapshot, page: page.digest) else { return }
+                guard let saved = try self.cache?.save(page: page, options: entry.options,
+                    translation: restored.translation, elapsed: entry.elapsed, timings: entry.timings) else { return }
+                if let profile = restored.profile { try self.workProfiles?.save(profile) }
+                self.correctionHistory = history; self.show(saved, cached: true)
+                self.setStatus(redo ? "已重做气泡修正" : "已撤销气泡修正")
+            } catch { self.setStatus(error.localizedDescription, error: true) }
+        }
+    }
     private func cancelTranslation() { runner?.cancel(); finishBusyState() }
     private func resetTracking() {
+        lastReaderProbe = nil
         settlingProbe?.cancel(); settlingProbe = nil; didConfirmCandidate = false
         tracker.reset(); probeTracker.reset(); lastProbeDigest = nil
     }
     private func stopWork() {
         overlay.endCorrection()
         correctionRunner?.cancel(); correctionRunner = nil; correctionID = nil
-        operationEpoch += 1; autoButton?.state = .off
+        operationEpoch += 1; readingEnabled = false
         capture.endReading()
         resetTracking(); cancelTranslation()
         detailLabel?.stringValue = ""

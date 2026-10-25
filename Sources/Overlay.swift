@@ -23,6 +23,9 @@ enum BubbleEditAction {
 final class MangaOverlay {
     private let panel: TranslationPanel
     private let canvas = TranslationCanvas()
+    private let peekPanel: TranslationPanel
+    private let peekLabel = NSTextField(wrappingLabelWithString: "")
+    private var peekID: String?
     private var windowID: CGWindowID?
     private var processID: pid_t = 0
     private var topInset: CGFloat = 32
@@ -31,6 +34,7 @@ final class MangaOverlay {
     private var sourceSize: CGSize?
     private var contentRect: CGRect = .zero
     private var wantsVisible = false
+    private var needsValidation = false
     private var layoutSeconds = 0.0
     private var pageDigest: String?
     private var selecting = false
@@ -43,19 +47,35 @@ final class MangaOverlay {
     init() {
         panel = TranslationPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
                                  backing: .buffered, defer: false)
+        peekPanel = TranslationPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                                     backing: .buffered, defer: false)
         panel.title = "漫画译文"
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.ignoresMouseEvents = true
         panel.hidesOnDeactivate = false
-        panel.level = .floating
+        // The translated pixels belong immediately above their reader window,
+        // including when another app has focus. They must not float over it.
+        panel.level = .normal
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.isReleasedWhenClosed = false
         panel.contentView = canvas
         panel.onCancel = { [weak self] in self?.endCorrection() }
         canvas.onSelect = { [weak self] id in self?.editBubble(id) }
         canvas.onCancel = { [weak self] in self?.endCorrection() }
+        peekPanel.title = "临时译文"
+        peekPanel.isOpaque = false; peekPanel.backgroundColor = .clear
+        peekPanel.hasShadow = true; peekPanel.ignoresMouseEvents = true
+        peekPanel.hidesOnDeactivate = false; peekPanel.level = .normal
+        peekPanel.collectionBehavior = panel.collectionBehavior
+        let background = NSVisualEffectView()
+        background.material = .popover; background.state = .active
+        background.wantsLayer = true; background.layer?.cornerRadius = 9
+        peekPanel.contentView = background
+        peekLabel.font = .systemFont(ofSize: 15)
+        peekLabel.setAccessibilityLabel("临时译文")
+        background.addSubview(peekLabel)
     }
 
     func show(_ entry: CacheEntry, page: CapturedPage, windowID: CGWindowID, processID: pid_t, topInset: CGFloat) {
@@ -76,6 +96,7 @@ final class MangaOverlay {
             layoutSeconds = Date().timeIntervalSince(began)
         }
         wantsVisible = true
+        needsValidation = false
         if tracking == nil {
             tracking = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.updatePosition() }
@@ -84,6 +105,8 @@ final class MangaOverlay {
         updatePosition()
     }
 
+    var isVisible: Bool { panel.isVisible }
+    var isRetained: Bool { wantsVisible }
     var renderedCount: Int { canvas.items.count }
     var selectedBubbleID: String? { selectedID }
     var omittedSummary: String { canvas.omittedSummary }
@@ -129,7 +152,7 @@ final class MangaOverlay {
         if case .restoreOriginal? = action { endCorrection() }
     }
 
-    func hide() { wantsVisible = false; endCorrection(); panel.orderOut(nil); tracking?.invalidate(); tracking = nil }
+    func hide() { wantsVisible = false; endCorrection(); panel.orderOut(nil); peekPanel.orderOut(nil); tracking?.invalidate(); tracking = nil }
 
     func stop() { hide(); tracking?.invalidate(); tracking = nil }
 
@@ -138,6 +161,8 @@ final class MangaOverlay {
          "target": windowID ?? 0, "targetPID": processID, "items": canvas.items.count,
          "layoutSeconds": layoutSeconds, "omissions": canvas.omittedSummary,
          "correcting": selecting, "selectedBubble": selectedID ?? "", "showingOriginal": canvas.showOriginal,
+         "peekVisible": peekPanel.isVisible, "windowNumber": panel.windowNumber,
+         "level": panel.level.rawValue,
          "targetForeground": windowID.map { ReaderCapture.isForeground(windowID: $0, processID: processID) } ?? false]
     }
 
@@ -165,12 +190,13 @@ final class MangaOverlay {
     private func updatePosition() {
         guard wantsVisible, let windowID,
               let windows = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]],
-              let info = windows.first,
+              let info = windows.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }),
+              (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == processID,
               let values = info[kCGWindowBounds as String] as? [String: Any],
               let cgFrame = CGRect(dictionaryRepresentation: values as CFDictionary),
               cgFrame.size == sourceSize,
               let primary = NSScreen.screens.first else {
-            panel.orderOut(nil); return
+            needsValidation = true; panel.orderOut(nil); peekPanel.orderOut(nil); return
         }
         // CGWindow coordinates start at the primary screen's top-left; AppKit starts at bottom-left.
         let frame = CGRect(x: cgFrame.minX + contentRect.minX,
@@ -184,13 +210,59 @@ final class MangaOverlay {
         if selecting && !readerForeground && !editingForeground {
             endCorrection(); return
         }
-        guard (info[kCGWindowIsOnscreen as String] as? Bool) == true,
-              readerForeground || editingForeground else {
-            panel.orderOut(nil); return
+        let stackInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let stack = stackInfo.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.intValue }
+        guard (info[kCGWindowIsOnscreen as String] as? Bool) == true, stack.contains(Int(windowID)) else {
+            needsValidation = true; panel.orderOut(nil); peekPanel.orderOut(nil); return
         }
+        guard !needsValidation else { panel.orderOut(nil); peekPanel.orderOut(nil); return }
         // Read current modifiers without installing a global keyboard monitor or requesting access.
         canvas.updateModifierFlags(NSEvent.modifierFlags)
-        if !panel.isVisible { panel.orderFrontRegardless() }
+        let readerIndex = stack.firstIndex(of: Int(windowID))
+        let adjacent = readerIndex.map { $0 > 0 && stack[$0-1] == panel.windowNumber } ?? false
+        if !panel.isVisible || !adjacent { panel.order(.above, relativeTo: Int(windowID)) }
+        updatePeek(windows: stackInfo)
+    }
+
+    private func updatePeek(windows: [[String: Any]]) {
+        let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let pointer = NSEvent.mouseLocation
+        let surfaces = windows.compactMap { window -> OverlaySurface? in
+            guard let id = (window[kCGWindowNumber as String] as? NSNumber)?.intValue,
+                  let value = window[kCGWindowBounds as String] as? [String: Any],
+                  let frame = CGRect(dictionaryRepresentation: value as CFDictionary) else { return nil }
+            return OverlaySurface(id: id, frame: frame, layer: (window[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0,
+                                  alpha: (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1)
+        }
+        let globalPoint = CGPoint(x: pointer.x, y: (NSScreen.screens.first?.frame.maxY ?? 0)-pointer.y)
+        guard !selecting, flags.contains([.control, .shift]), flags.intersection([.command, .option]).isEmpty,
+              let windowID, ReaderWindowVisibility.pointerHitsReader(globalPoint, target: Int(windowID),
+                  surfaces: surfaces, ignoring: [panel.windowNumber, peekPanel.windowNumber]),
+              panel.isVisible, panel.frame.contains(pointer),
+              let dialogue = canvas.dialogue(at: CGPoint(x: pointer.x-panel.frame.minX, y: panel.frame.maxY-pointer.y)),
+              !dialogue.translation.isEmpty else {
+            peekPanel.orderOut(nil); peekID = nil; return
+        }
+        // Pointer peeks are also tied to the reader's position in the window
+        // stack. A foreground app covers the card and still receives all input.
+        let identity = dialogue.location + dialogue.original + dialogue.translation
+        if peekID != identity {
+            let value = NSMutableAttributedString(string: String(dialogue.original.prefix(180)) + "\n\n",
+                attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+            value.append(NSAttributedString(string: String(dialogue.translation.prefix(700)),
+                attributes: [.font: NSFont.systemFont(ofSize: 15), .foregroundColor: NSColor.labelColor]))
+            peekLabel.attributedStringValue = value; peekID = identity
+        }
+        let width: CGFloat = min(300, max(180, panel.frame.width-24))
+        let height = min(320, ceil(peekLabel.attributedStringValue.boundingRect(
+            with: CGSize(width: width-24, height: 1000), options: [.usesLineFragmentOrigin, .usesFontLeading]).height)+24)
+        var rect = CGRect(x: pointer.x+14, y: pointer.y-height-12, width: width, height: height)
+        let available = panel.frame.intersection(panel.screen?.visibleFrame ?? panel.frame).insetBy(dx: 8, dy: 8)
+        rect.origin.x = max(available.minX, min(rect.minX, available.maxX-width))
+        rect.origin.y = max(available.minY, min(rect.minY, available.maxY-height))
+        peekPanel.setFrame(rect, display: true)
+        peekLabel.frame = CGRect(x: 12, y: 12, width: width-24, height: height-24)
+        peekPanel.order(.above, relativeTo: panel.windowNumber)
     }
 }
 
@@ -438,6 +510,7 @@ final class TranslationCanvas: NSView {
         bubbles.filter { $0.rect.insetBy(dx: -4, dy: -4).contains(point) }
             .min { $0.rect.width * $0.rect.height < $1.rect.width * $1.rect.height }
     }
+    func dialogue(at point: CGPoint) -> Dialogue? { bubble(at: point)?.dialogue }
     override func mouseMoved(with event: NSEvent) {
         if selecting { hoverID = bubble(at: convert(event.locationInWindow, from: nil))?.dialogue.location }
     }

@@ -19,3 +19,7 @@ Settings — https://github.com/sindresorhus/Settings
 Model weights and Python dependencies are stored in Application Support/Shiori/OCR.
 They are not embedded in this application bundle. Their original licenses and
 package metadata are retained with the installed dependencies.
+
+uv — https://github.com/astral-sh/uv
+Bundled installation helper, dual licensed under MIT and Apache-2.0.
+See UV-LICENSE-MIT.txt and UV-LICENSE-APACHE.txt.
