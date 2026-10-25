@@ -1,26 +1,21 @@
-# 单假名图标视觉探索
+# Shiori 图标设计记录
 
-使用内置 imagegen。生成图用于字形气质与配色探索；生产资源由 `Sources/ShioriIcon.swift` 的原生日文字形轮廓重绘，导出 SVG、PNG 与 ICNS，避免透明边缘杂点。
+主图标使用内置 image_gen，以 [Apple 翻译的实际图标](https://apps.apple.com/us/app/translate/id1514844618)为视觉参照。采用用户选定的第一版，保留墨绿底、白色「あ」气泡和浅灰「文」气泡。
 
-最终版本采用墨绿底、白色 Hiragino Maru Gothic「あ」。在 Easydict、Pot 的文字比例与圆润笔画参考基础上，以原生矢量代码完成配色、字形与留白调整。下面保留早期探索提示词记录。
+源稿：`Resources/ShioriArtwork.png`。菜单栏图标使用原生矢量路径单独绘制，源见 `Sources/ShioriIcon.swift`。
 
-## 初稿提示词
+## 已采用图稿的完整提示词
 
 ```text
 Use case: logo-brand.
-Asset type: a single finished macOS application icon, square 1:1, 1024x1024, not a mockup.
-Primary request: redesign the identity of Shiori, a Japanese manga translation app. The user wants ONLY a Japanese kana character, with much better taste and visual refinement.
-Text (verbatim): "あ". This must be the ONLY glyph. Render the correct, clearly recognizable Japanese hiragana あ.
-Design: a beautiful contemporary Japanese typographic logo. One generously sized deep ink-jade あ, custom drawn with confident smooth strokes, elegant open counters, and carefully balanced Japanese letterform proportions. Quiet, refined and memorable. Moderately heavy strokes, subtle natural stroke modulation and beautifully resolved terminals; the mark should feel designed, not a generic font sample. Keep the actual anatomy of あ accurate.
-Composition: one warm porcelain/ivory rounded-square macOS tile with very faint cool mint ambient shading. The single dark jade kana is optically centered and takes about 60 percent of the tile, with generous balanced breathing room. Tile fills about 87 percent of the canvas; actual transparent alpha outside the tile. Front-facing, completely contained, no perspective. Crisp edges and restrained matte finish. A faint, tasteful edge highlight is sufficient; keep the face clean and calm. The mark must stay identifiable when the icon is reduced to 32px.
-Constraints: one tile and one kana only. No Roman or Latin letters, no English title, no extra Japanese text, no overlapping cards, no second panel, no book, no bookmark, no fold, no speech bubble, no fish, no arrow, no flag, no sparkle, no mascot, no border around the glyph, no glass blob, no plastic gloss, no inflated bevels, no busy texture, no frame or icon grid, no surrounding interface, no watermark, no baked checkerboard. Output only the one completed icon with real outside transparency.
-```
-
-## 第二稿提示词
-
-```text
-Refine this Japanese macOS icon into a clean production asset. Keep its correct, elegant single hiragana あ, ink-jade color and warm ivory / very pale mint tile. Keep the character's existing anatomy and expressive stroke shapes.
-Make the あ about 15 percent smaller, then optically center it with more balanced breathing room. Keep the front face almost flat and matte, with a smooth clean surface and only a very subtle edge highlight.
-CRITICAL CLEANUP: Rebuild the outside silhouette as one mathematically smooth rounded square. Remove ALL the ragged white flecks, distressed edges, detached pixels, halo, paper texture and grain around the tile. The exterior is perfectly empty genuine transparent alpha; the tile interior is fully opaque. No fuzz or scattered fragments on any side. Produce a sharp, clean, anti-aliased icon edge. Maintain a clear transparent margin on all four sides.
-The single character あ is the only content. No Latin letter, card, bookmark, book, fold, secondary shapes, extra text, border, grid, surrounding UI or watermark. Output only the finished single square app icon.
+The attached image is the actual Apple Translate app icon. Use THIS image as the sole design reference. Create a Shiori icon that closely follows Apple's compact two-dialogue-bubble composition, shape quality, corner radii, breathing room, and gentle front/back overlap.
+Keep the upper-left speech bubble and lower-right speech bubble as in the reference. The lower-right bubble is in front. Both are wide rounded dialogue shapes with short natural tails, not square tiles. Preserve the clean, regular, balanced silhouettes of the reference. Keep a small clear overlap without obscuring either character.
+Change ONLY the following identity and finish:
+- The base tile is rich DARK JADE GREEN #1B554A, replacing Apple's cyan. It is a native Mac rounded-square enclosure.
+- The upper-left dialogue bubble is pearl WHITE #FAFCFB, containing the single exact Japanese hiragana “あ” in very dark jade #153D35, replacing the Latin A.
+- The lower-right dialogue bubble is COOL LIGHT GRAY #D4DDDA, containing the exact Chinese “文” in very dark jade #153D35. It is not green, black, blue, or transparent.
+- Letterforms are clean authentic modern Japanese/Chinese sans-serif, natural rounded terminals, confident medium weight, balanced optical size. Keep the 文 accurate with four proper strokes. Avoid handwriting, calligraphy, serif terminals or playful malformed glyphs.
+- Use a refined satin/matte finish. Keep only a restrained soft contact shadow between the two bubbles and very shallow edge depth. No shiny glass, bright rim highlights, reflections, inflated pillows, embossed type, metallic sheen or thick bevels. The shapes should feel crisp and deliberately designed.
+Important invariants: exactly two speech bubbles, exactly the visible characters あ and 文, upper-left/lower-right layout, pale foreground shapes clearly separate from the dark jade background. No extra green speech bubble. No arrows, paper folds, Microsoft-style symbols, badges, sparkles, outline frames, title, extra letters or captions.
+Presentation: one finished app icon centered on a neutral very light gray background, straight-on view, square image, comfortable exterior margins. This is a visual design preview.
 ```

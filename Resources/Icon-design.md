@@ -1,20 +1,20 @@
 # 图标与界面
 
-图标只使用日文假名「あ」。应用图标采用墨绿底、白色现代圆体字标，底色由 `#2E7369` 过渡到 `#113D40`；菜单栏沿用同一圆体轮廓，以单色显示并跟随系统切换明暗。
+应用图标采用墨绿底与错位双气泡，左上「あ」、右下「文」，构图参考 [Apple 翻译](https://apps.apple.com/us/app/translate/id1514844618)。已确认的第一稿保存在 [ShioriArtwork.png](ShioriArtwork.png)，打包时生成带透明外缘的 macOS 图标。
 
-构图参考 [Easydict](https://github.com/tisfeng/Easydict) 的圆润笔画与清楚字腔，以及 [Pot](https://pot-app.com/) 以文字建立翻译工具辨识度的处理。最终保留一个假名、均匀留白和轻微底色层次，字形使用 Hiragino Maru Gothic 的矢量轮廓。
+菜单栏单独绘制为 22 × 18 pt 的「双气泡＋あ」：前方气泡内保留一个假名，后方用空心轮廓。模板图像使用黑色与透明色，由系统处理浅色、深色和选中状态。
 
-视觉方向通过内置 imagegen 探索，最终使用系统日文字形的矢量轮廓重绘，保持字符准确与透明边缘干净。[探索提示词](../Design/ShioriIcon-prompts.md)。
+[应用预览](../Design/ShioriIcon-preview.png) / [菜单栏明暗预览](../Design/ShioriIcon-menubar-preview.png) / [顶栏矢量](../Design/ShioriIcon-menubar.svg) / [1024px PNG](ShioriAppIcon.png) / [macOS 图标](ShioriAppIcon.icns)。
 
-[SVG](../Design/ShioriIcon.svg) / [应用预览](../Design/ShioriIcon-preview.png) / [菜单栏明暗预览](../Design/ShioriIcon-menubar-preview.png) / [1024px PNG](ShioriKanaIcon.png) / [macOS 图标](ShioriKanaIcon.icns)。macOS 图标包含 16px 到 1024px 的十种标准尺寸，并保留外部透明区域。
-
-矢量源在 `Sources/ShioriIcon.swift`，应用与菜单栏使用同一个假名，各自适配显示尺寸。用 `Scripts/GenerateIcons.swift` 生成 SVG、PNG、ICNS 与预览：
+主图标采用确认的位图稿，布局 SVG 内嵌同一 PNG；菜单栏 SVG 使用字体轮廓与图形路径。绘制与打包源位于 `Sources/ShioriIcon.swift`，通过以下命令生成资源：
 
 ```sh
-xcrun swiftc -swift-version 5 -O Sources/ShioriIcon.swift Scripts/GenerateIcons.swift -framework AppKit -o /tmp/shiori-generate-icons
+xcrun swiftc -swift-version 5 -O Sources/ShioriIcon.swift Scripts/GenerateIcons.swift -framework AppKit -framework CoreText -o /tmp/shiori-generate-icons
 /tmp/shiori-generate-icons "$PWD"
 rm /tmp/shiori-generate-icons
 ```
+
+[图像生成记录](../Design/ShioriIcon-prompts.md)。
 
 界面参考：
 - [Bob](https://bobtranslate.com/)：菜单栏快速打开的轻量翻译面板。

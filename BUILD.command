@@ -12,8 +12,8 @@ xcrun swiftc -swift-version 5 -O -target arm64-apple-macosx14.0 \
   Sources/Core.swift Sources/CodexSession.swift Sources/GoogleTranslation.swift Sources/TranslationPipeline.swift Sources/VisionRecognition.swift Sources/OCR.swift Sources/ReadingScope.swift Sources/Capture.swift Sources/BubbleCorrection.swift Sources/Overlay.swift Sources/ShioriIcon.swift Sources/App.swift Sources/main.swift \
   -framework AppKit -framework ScreenCaptureKit -framework CryptoKit \
   -o "$APP/Contents/MacOS/Shiori"
-cp Resources/translation.schema.json Resources/translator.txt Resources/ocr_worker.py Resources/ShioriKanaIcon.icns Resources/ShioriKanaIcon.png Resources/ThirdPartyNotices.txt "$APP/Contents/Resources/"
-rm -f "$APP/Contents/Resources/MangaIcon.icns" "$APP/Contents/Resources/MangaIcon.png" "$APP/Contents/Resources/ShioriIcon.icns" "$APP/Contents/Resources/ShioriIcon.png"
+cp Resources/translation.schema.json Resources/translator.txt Resources/ocr_worker.py Resources/ShioriAppIcon.icns Resources/ShioriAppIcon.png Resources/ThirdPartyNotices.txt "$APP/Contents/Resources/"
+rm -f "$APP/Contents/Resources/MangaIcon.icns" "$APP/Contents/Resources/MangaIcon.png" "$APP/Contents/Resources/ShioriIcon.icns" "$APP/Contents/Resources/ShioriIcon.png" "$APP/Contents/Resources/ShioriKanaIcon.icns" "$APP/Contents/Resources/ShioriKanaIcon.png"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -23,10 +23,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Shiori</string>
 <key>CFBundleExecutable</key><string>Shiori</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.3.4</string>
-<key>CFBundleVersion</key><string>48</string>
+<key>CFBundleShortVersionString</key><string>1.3.5</string>
+<key>CFBundleVersion</key><string>49</string>
 <key>LSUIElement</key><true/>
-<key>CFBundleIconFile</key><string>ShioriKanaIcon</string>
+<key>CFBundleIconFile</key><string>ShioriAppIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSScreenCaptureUsageDescription</key><string>截取所选窗口中的漫画页面用于翻译。</string>
