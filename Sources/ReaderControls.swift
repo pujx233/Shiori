@@ -124,7 +124,7 @@ final class WorkSettingsPanel: NSWindowController, NSTableViewDataSource, NSTabl
     private func display(_ profile: WorkProfile) {
         selected = profile; name.stringValue = profile.title; style.string = profile.style
         words = profile.terms; name.isHidden = true; status.isHidden = true
-        table.reloadData(); remove.isEnabled = false
+        table.deselectAll(nil); table.reloadData(); remove.isEnabled = false
     }
     @objc private func changed() {
         if let id = chooser.selectedItem?.representedObject as? String,
@@ -178,7 +178,7 @@ final class WorkSettingsPanel: NSWindowController, NSTableViewDataSource, NSTabl
     @objc private func removeWords() {
         finishWordEditing()
         for index in table.selectedRowIndexes.reversed() where words.indices.contains(index) { words.remove(at: index) }
-        table.reloadData(); remove.isEnabled = false
+        table.deselectAll(nil); table.reloadData(); remove.isEnabled = false
     }
     @objc private func saveProfile() {
         finishWordEditing()
