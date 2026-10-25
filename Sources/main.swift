@@ -345,7 +345,7 @@ func selfTest() throws {
         let openEntry = CacheEntry(id: "open-result", options: first, pageDigest: page.digest,
                                   translation: openTranslation, createdAt: Date(), elapsed: 1)
         overlay.show(openEntry, page: page, windowID: 0, processID: ProcessInfo.processInfo.processIdentifier, topInset: 0)
-        try check(overlay.renderedCount == 0 && overlay.omittedSummary.contains("开放文字区域 1 处"),
+        try check(overlay.renderedCount == 0 && overlay.omittedSummary.contains("保留原图 1 处"),
                   "open text is available to copy while its artwork stays unchanged")
     }
     let active = CommandRunner(), cancelStart = Date()

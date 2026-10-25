@@ -10,6 +10,8 @@ SHA-256: 7ba7aa7ac37a4d41fdbbeba3a2af7ead18058552997e3a3cd1a3b2210c9e6b4c
 Design and implementation references:
 BallonsTranslator — https://github.com/dmMaze/BallonsTranslator
 manga-image-translator — https://github.com/zyddnys/manga-image-translator
+Koharu — https://github.com/koharu-rs/koharu
+manga-translator-ui — https://github.com/hgmzhn/manga-translator-ui
 Easydict — https://github.com/tisfeng/Easydict
 Ice — https://github.com/jordanbaird/Ice
 Settings — https://github.com/sindresorhus/Settings

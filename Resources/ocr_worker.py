@@ -230,6 +230,32 @@ def separate_caption_lines(candidates):
     return merged
 
 
+def reader_content_bounds(gray):
+    """Recognize a light manga page between two substantial dark reader gutters."""
+    import numpy as np
+    height, width = gray.shape
+    def substantial_runs(indices, minimum):
+        runs = np.split(indices, np.flatnonzero(np.diff(indices) > 1)+1)
+        return np.concatenate([run for run in runs if len(run) >= minimum]) if any(len(run) >= minimum for run in runs) else np.array([], dtype=int)
+    columns = substantial_runs(np.flatnonzero((gray > 180).mean(axis=0) > .12), width*.02)
+    if len(columns) and columns[0] > width*.05 and columns[-1] < width*.95:
+        left, right = int(columns[0]), int(columns[-1])+1
+        if np.mean(gray[:, :left] < 85) < .95 or np.mean(gray[:, right:] < 85) < .95:
+            return None
+        rows = substantial_runs(np.flatnonzero((gray[:, left:right] > 180).mean(axis=1) > .18), height*.02)
+        if len(rows) and rows[-1]-rows[0] >= height*.5:
+            return [left, int(rows[0]), right, int(rows[-1])+1]
+    return None
+
+
+def within_reader_content(box, content):
+    if content is None:
+        return True
+    x1, y1, x2, y2 = box
+    overlap = max(0, min(x2, content[2])-max(x1, content[0])) * max(0, min(y2, content[3])-max(y1, content[1]))
+    return overlap >= .8 * max(1, (x2-x1)*(y2-y1))
+
+
 def recover_candidates(image, raw_mask, candidates):
     """Recover lettering present in CTD's segmentation but absent from its boxes."""
     import cv2
@@ -237,19 +263,11 @@ def recover_candidates(image, raw_mask, candidates):
     from comic_text_detector.utils.textblock import TextBlock
     height, width = raw_mask.shape
     binary = (raw_mask > 140).astype(np.uint8)
-    # A dark reader gutter is not page content. Restrict only the recovery pass;
-    # ordinary detector boxes and independently verified Vision text stay intact.
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    def substantial_runs(indices, minimum):
-        runs = np.split(indices, np.flatnonzero(np.diff(indices) > 1)+1)
-        return np.concatenate([run for run in runs if len(run) >= minimum]) if any(len(run) >= minimum for run in runs) else np.array([], dtype=int)
-    columns = substantial_runs(np.flatnonzero((gray > 180).mean(axis=0) > .12), width*.02)
-    if len(columns) and columns[0] > width*.05 and columns[-1] < width*.95:
-        left, right = int(columns[0]), int(columns[-1])+1
-        rows = substantial_runs(np.flatnonzero((gray[:, left:right] > 180).mean(axis=1) > .18), height*.02)
+    content = reader_content_bounds(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+    if content is not None:
+        left, top, right, bottom = content
         binary[:, :left] = 0; binary[:, right:] = 0
-        if len(rows):
-            binary[:rows[0]] = 0; binary[rows[-1]+1:] = 0
+        binary[:top] = 0; binary[bottom:] = 0
     joined = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     _, _, stats, _ = cv2.connectedComponentsWithStats(joined)
     boxes = []
@@ -514,7 +532,9 @@ class BackgroundRestorer:
         if self.model is None:
             return cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
         height, width = mask.shape
-        scale = min(1., 384 / max(height, width))
+        # These are local lettering crops, not whole pages. Keep enough detail
+        # for screentones and thin outlines before returning to screen pixels.
+        scale = min(1., 512 / max(height, width))
         size = (max(8, round(width*scale)), max(8, round(height*scale)))
         small = cv2.resize(image, size, interpolation=cv2.INTER_AREA) if scale < 1 else image
         holes = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST) if scale < 1 else mask
@@ -548,16 +568,71 @@ def surrounding_flat_color(image, box, mask):
     return color
 
 
+def bubble_fill_region(labels, stats, component):
+    """An inset balloon interior; its outline is never an erasure target."""
+    import cv2
+    import numpy as np
+    x, y, w, h, _ = [int(v) for v in stats[component]]
+    interior = (labels[y:y+h, x:x+w] == component).astype(np.uint8)
+    contours, _ = cv2.findContours(interior, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(interior, contours, -1, 1, cv2.FILLED)
+    interior = cv2.erode(interior, np.ones((3, 3), np.uint8))
+    return (x, y, w, h), interior
+
+
+def complete_glyphs(gray, mask, font_size, light=False, background=None, protect_edges=False):
+    """Recover antialiased strokes and nearby punctuation without following art lines."""
+    import cv2
+    import numpy as np
+    threshold = max(35, float(background)+18) if light else min(225, float(background)-18)
+    foreground = gray > threshold if light else gray < threshold
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(foreground.astype(np.uint8), connectivity=8)
+    near = cv2.dilate(mask, np.ones((max(3, round(font_size*.45)) | 1,)*2, np.uint8)) > 0
+    recovered = mask.copy()
+    for component in range(1, count):
+        x, y, w, h, area = [int(v) for v in stats[component]]
+        # A panel border or a strand continuing outside the text box is not a
+        # missing glyph. Both seeded components and recovered dots obey this.
+        if max(w, h) > font_size*2.2 or area > font_size**2*2:
+            continue
+        if protect_edges and (x == 0 or y == 0 or x+w == gray.shape[1] or y+h == gray.shape[0]):
+            continue
+        region = labels[y:y+h, x:x+w] == component
+        if np.any(mask[y:y+h, x:x+w][region]) or (area >= 2 and np.any(near[y:y+h, x:x+w][region])):
+            pixels = region if area <= max(9, font_size**2*.08) else region & near[y:y+h, x:x+w]
+            recovered[y:y+h, x:x+w][pixels] = 255
+    return recovered
+
+
+def protect_art_lines(gray, original_mask, repair_mask, font_size):
+    """Keep visible thin lines that continue beyond an open lettering crop."""
+    import cv2
+    import numpy as np
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((gray < 135).astype(np.uint8), connectivity=8)
+    protected = np.zeros(gray.shape, np.uint8)
+    for component in range(1, count):
+        x, y, w, h, area = [int(v) for v in stats[component]]
+        edge = x == 0 or y == 0 or x+w == gray.shape[1] or y+h == gray.shape[0]
+        if not edge or max(w, h) < font_size*.8 or area/(w*h) > .65:
+            continue
+        region = labels[y:y+h, x:x+w] == component
+        if np.mean(original_mask[y:y+h, x:x+w][region] > 0) > .05:
+            continue
+        protected[y:y+h, x:x+w][region & (original_mask[y:y+h, x:x+w] == 0)] = 255
+    protected = cv2.dilate(protected, np.ones((3, 3), np.uint8))
+    return cv2.bitwise_and(repair_mask, cv2.bitwise_not(protected))
+
+
 def replacement_patch(image, text_mask, box, ink_labels=None, ink_ids=(), open_text=False, restorer=None,
-                      font_size=None):
-    """Use surrounding pixels for repair; composite only the original glyph mask."""
+                      font_size=None, bubble_region=None):
+    """Separate background sampling, glyph coverage, and the protected balloon boundary."""
     import cv2
     import numpy as np
     x1, y1, x2, y2 = box
     crop = image[y1:y2, x1:x2]
     mask = (text_mask[y1:y2, x1:x2] > 0).astype(np.uint8) * 255
-    if open_text:
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    if open_text and font_size is None:
         # The neural mask may include gaps between letters. Erase the ink and
         # its antialiasing fringe, leaving artwork visible through those gaps.
         foreground = (gray < 190) if np.median(gray) >= 145 else (gray > 165)
@@ -568,31 +643,78 @@ def replacement_patch(image, text_mask, box, ink_labels=None, ink_ids=(), open_t
         extra = cv2.dilate(extra, np.ones((3, 3), np.uint8), iterations=1)
         mask = cv2.bitwise_or(mask, extra)
     flat_color = None
-    if open_text:
+    safe = None
+    if bubble_region is not None:
+        (bx, by, bw, bh), interior = bubble_region
+        safe = np.zeros(mask.shape, np.uint8)
+        ix1, iy1, ix2, iy2 = max(x1, bx), max(y1, by), min(x2, bx+bw), min(y2, by+bh)
+        if ix2 > ix1 and iy2 > iy1:
+            safe[iy1-y1:iy2-y1, ix1-x1:ix2-x1] = interior[iy1-by:iy2-by, ix1-bx:ix2-bx]
+        # Sample the full balloon, excluding every detected word and its gray
+        # fringe, instead of a small ring that can contain a neighboring glyph.
+        text = text_mask[by:by+bh, bx:bx+bw]
+        excluded = cv2.dilate((text > 0).astype(np.uint8), np.ones((5, 5), np.uint8))
+        pixels = image[by:by+bh, bx:bx+bw][(interior > 0) & (excluded == 0)]
+        if len(pixels) >= 32:
+            color = np.median(pixels, axis=0)
+            if np.mean(np.max(np.abs(pixels.astype(float)-color), axis=1) <= 10) >= .97:
+                flat_color = color
+    if open_text and font_size is not None:
+        flat_color = surrounding_flat_color(image, box, mask)
+        # A dark caption may touch a white panel border. Recover its light
+        # glyphs from the dominant dark interior, not that exterior border.
+        pixels = crop[mask == 0]
+        if flat_color is None and len(pixels) >= 32:
+            color = np.median(pixels, axis=0)
+            close = np.max(np.abs(pixels.astype(float)-color), axis=1) <= 12
+            if np.max(color) < 48 and np.mean(close) >= .72 and np.max(np.std(pixels[close], axis=0)) < 6:
+                flat_color = color
+    if open_text and flat_color is None and font_size is not None and font_size >= max(32, image.shape[0]*.036):
+        # Large decorative lettering hides too much line art to validate a
+        # reconstructed background. Keep the source; its translation remains
+        # available in the existing bubble editor. The relative-size check
+        # keeps this decision consistent between 1x and Retina captures.
+        return None
+    if font_size is not None and np.any(mask):
+        background = float(np.mean(flat_color)) if flat_color is not None else float(np.median(gray))
+        mask = complete_glyphs(gray, mask, font_size, light=background < 100, background=background,
+                               protect_edges=open_text and flat_color is None)
+        if open_text:
+            radius = max(2, min(6, int(np.ceil(font_size*.09))))
+            mask = cv2.dilate(mask, np.ones((radius*2+1,)*2, np.uint8))
+            if flat_color is None:
+                mask = protect_art_lines(gray, text_mask[y1:y2, x1:x2], mask, font_size)
+        elif flat_color is not None:
+            mask = cv2.dilate(mask, np.ones((3, 3), np.uint8))
+    if safe is not None:
+        mask = cv2.bitwise_and(mask, safe*255)
+    if open_text and font_size is None:
         # Include white outlines around black letters, not just their dark cores.
-        original = mask
-        mask = cv2.dilate(original, np.ones((7, 7), np.uint8))
-        if np.mean(mask > 0) > .95 and font_size is not None and 6 <= font_size <= 18:
-            # Fixed dilation can consume a tiny caption's entire crop. Only
-            # reduce it when the remaining pixels and three outside edges agree
-            # on a flat background; textured lettering keeps the original rule.
-            size = max(3, min(5, int(font_size * .3) // 2 * 2 + 1))
-            smaller = cv2.dilate(original, np.ones((size, size), np.uint8))
-            if np.any(smaller) and np.mean(smaller > 0) <= .95:
-                flat_color = surrounding_flat_color(image, box, smaller)
-                if flat_color is not None:
-                    mask = smaller
+        mask = cv2.dilate(mask, np.ones((7, 7), np.uint8))
+    if open_text and np.mean(mask > 0) > .95 and font_size is not None and 6 <= font_size <= 18:
+        # Tiny flat captions still need a sparse, bounded erasure layer.
+        smaller = cv2.dilate((text_mask[y1:y2, x1:x2] > 0).astype(np.uint8)
+                            & (gray < 190 if np.median(gray) >= 145 else gray > 165),
+                            np.ones((3, 3), np.uint8))*255
+        color = surrounding_flat_color(image, box, smaller)
+        if color is not None and np.mean(smaller > 0) <= .95:
+            mask, flat_color = smaller, color
     if not np.any(mask) or np.mean(mask > 0) > .95:
         return None
-    pad = max(32, min(72, min(x2-x1,y2-y1)))
+    pad = max(32, min(128, max(min(x2-x1,y2-y1), round((font_size or 0)*2))))
     left, top = max(0,x1-pad), max(0,y1-pad)
     right, bottom = min(image.shape[1],x2+pad), min(image.shape[0],y2+pad)
     context = image[top:bottom,left:right]
     context_mask = np.zeros(context.shape[:2], np.uint8)
+    if open_text and font_size is not None:
+        # Neighboring lettering must not become texture for this repair. It is
+        # hidden from the model but only this block's alpha is pasted back.
+        context_mask = cv2.dilate((text_mask[top:bottom,left:right] > 0).astype(np.uint8),
+                                  np.ones((3, 3), np.uint8))*255
     context_mask[y1-top:y2-top,x1-left:x2-left] = mask
     ring = cv2.dilate(mask, np.ones((11, 11), np.uint8)) > 0
     background = crop[ring & (mask == 0)]
-    flat = len(background) >= 12 and np.max(np.std(background, axis=0)) < 10
+    flat = font_size is None and len(background) >= 12 and np.max(np.std(background, axis=0)) < 10
     if flat_color is not None:
         restored = np.empty_like(crop); restored[:] = flat_color
     elif flat:
@@ -756,6 +878,26 @@ def publish_draft(directory, blocks, skipped, patches, start):
     write_json(directory, 'text', {'blocks': draft, 'skippedCount': skipped, 'elapsed': time.monotonic()-start})
 
 
+def preserve_overlapping_lettering(blocks):
+    """An effect split into overlapping boxes must not be erased only halfway."""
+    opened = [block for block in blocks if block.get('textStyle') is not None]
+    changed = True
+    while changed:
+        changed = False
+        retained = [b['bounds'] for b in opened if not b.get('replacementAllowed')]
+        for block in opened:
+            if not block.get('replacementAllowed'):
+                continue
+            a = block['bounds']
+            for b in retained:
+                overlap = max(0, min(a['x']+a['width'], b['x']+b['width'])-max(a['x'], b['x'])) \
+                    * max(0, min(a['y']+a['height'], b['y']+b['height'])-max(a['y'], b['y']))
+                if overlap > .1*min(a['width']*a['height'], b['width']*b['height']):
+                    block.update(replacementPNG=None, replacementAllowed=False)
+                    changed = True
+                    break
+
+
 def finish_page(directory, blocks, skipped, patches, start):
     """Finish background work after the last durable text snapshot is published."""
     if cancelled(directory):
@@ -770,7 +912,7 @@ def finish_page(directory, blocks, skipped, patches, start):
             try:
                 patch = future.result(timeout=.05)
                 block['replacementPNG'] = patch
-                block['replacementAllowed'] = block['textStyle'] is None or patch is not None
+                block['replacementAllowed'] = patch is not None
                 break
             except FutureTimeout:
                 # Python aliases FutureTimeout to built-in TimeoutError. Do not
@@ -781,6 +923,7 @@ def finish_page(directory, blocks, skipped, patches, start):
         if cancelled(directory):
             write_state(directory, phase='cancelled')
             return
+    preserve_overlapping_lettering(result)
     write_state(directory, phase='done', page={'blocks': result, 'skippedCount': skipped,
                 'elapsed': time.monotonic()-start})
 
@@ -842,6 +985,7 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
     import numpy as np
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    content = reader_content_bounds(gray)
     labels, stats, exterior = bubble_regions(gray)
     _, ink_labels, ink_stats, _ = cv2.connectedComponentsWithStats((gray < 215).astype(np.uint8), connectivity=8)
     hints = read_hints(directory)
@@ -852,6 +996,7 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
         write_state(directory, phase='detecting')
         detector.input_size = (resolution, resolution)
         raw, mask, found = detector(image)
+        found = [b for b in found if within_reader_content(b.xyxy, content)]
         recovered = recover_candidates(image, raw, found)
         found = separate_caption_lines(found)
         if recovered:
@@ -874,7 +1019,8 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
         first = [(c, b) for c, b in boxes if c > 0 and 'ja' in languages[c] and fonts[c] >= 10][:8]
         for component, box in first:
             future = repairs.submit(replacement_patch, image, text_mask, targets[component],
-                ink_labels, extra.get(component, []), False, restorer, font_size=fonts[component])
+                ink_labels, extra.get(component, []), False, restorer, font_size=fonts[component],
+                bubble_region=bubble_fill_region(labels, stats, component))
             signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
             early_patches[component] = (signature, future)
             patch_jobs[('early', component)] = future
@@ -910,7 +1056,7 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
     if resolution_for(hints) > resolution:
         resolution = resolution_for(hints)
         text_mask, candidates = detect(resolution)
-    candidates = supplement_candidates(candidates, hints)
+    candidates = supplement_candidates(candidates, [hint for hint in hints if within_reader_content(hint['box'], content)])
     boxes, fonts, languages, directions, extra, targets, skipped = page_groups(
         candidates, gray, labels, stats, exterior, ink_labels, ink_stats)
     accepted_patches = {}
@@ -919,7 +1065,8 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
         earlier = early_patches.get(component)
         future = earlier[1] if earlier and earlier[0] == signature else repairs.submit(
             replacement_patch, image, text_mask, targets[component], ink_labels, extra.get(component, []),
-            component < 0, restorer, font_size=fonts[component])
+            component < 0, restorer, font_size=fonts[component],
+            bubble_region=bubble_fill_region(labels, stats, component) if component > 0 else None)
         patch_jobs[('final', component)] = future
         accepted_patches[block_identifier(component, box)] = future
     missing = [(c, b) for c, b in boxes if (c, tuple(b), fonts[c]) not in early_text]

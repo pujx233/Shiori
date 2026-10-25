@@ -340,7 +340,7 @@ final class TranslationCanvas: NSView {
         case bounds = "位置不完整"
         case length = "气泡空间不足"
         case background = "未能擦除原文"
-        case open = "开放文字区域"
+        case open = "保留原图"
     }
     struct Item {
         let rect: CGRect

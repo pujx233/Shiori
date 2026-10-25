@@ -5,13 +5,15 @@
 选择正在使用的软件和翻译服务，点「开始阅读」。Google 直接翻译，Codex 可选模型和推理。翻页后自动识字、翻译并回填原位置；按住 ⌥ 可临时查看原图。
 
 - 保留竖排，连体气泡分别排字，译文随返回逐步显示。
-- 局部疑点先比对并重识；仍有缺字时用小号灰色 `□`，可读部分继续翻译。整句无法辨认则保留原图，底部统一显示待确认数量。
-- 补识别气泡外的拟声词；复杂背景用本地 LaMa 修复，纯色区域直接回填。
+- 局部疑点先比对并重识；仍有缺字时用小号灰色 `□`，可读部分继续翻译。整句无法辨认则保留原图，菜单栏面板底部统一显示待确认数量。
+- 气泡按真实内部区域采样底色，纯色白、灰、黑底直接回填；按字号补齐灰边、描边和漏掉的标点，擦除受气泡轮廓约束。
+- 复杂背景用本地 LaMa 局部修复，遮住上下文里的邻字，并保护延伸到文字框外的画线。复杂大号拟声词保留原画，译文仍可在「修正气泡…」中查看。浏览器的明显深色边栏和页底控制区不参与识字。
 - 右键菜单栏图标 →「修正气泡…」，点选气泡后可重新识字、修改原文与译文、重新翻译或恢复原图。按 Esc 退出选择。
 - 手动修正保存在当前页，后续补译会保留；整页重新翻译或重新识字时重新生成。
 - 识字和背景修复在本地完成，翻译服务只接收文字。Codex 使用已登录的 ChatGPT 账号；Google 无需 API Key。
 - 自动阅读绑定当前窗口和网页；切换软件或离开该页时暂停处理，返回后继续。支持同章翻页。
 - 可靠气泡先识字、翻译和显示，Vision 在后台补漏与复核；复杂背景修复同时进行，完成后补齐。
+- 保留原图等处理状态仅在菜单栏面板显示；漫画页不增加提示标记或弹窗。
 - 同页复用缓存，翻页取消旧任务并保留连接；缺失条目补译一次。
 - 缓存合计上限 258 MiB。近期两页文字用于人名和语气衔接，关闭后清空。
 
@@ -52,7 +54,7 @@ Vision 编译为独立的 `Contents/Helpers/ShioriVision`，使用固定签名�
 
 Manga OCR 初始化时跳过上游构造器的示例图片推理，首次推理直接处理真实漫画；两条识字路径都按批次交付可靠气泡，最终复核仍会补充或纠正结果。
 
-背景修复使用 [LaMa](https://github.com/advimman/lama)，权重来自 [simple-lama-inpainting 的官方发布](https://github.com/enesmsahin/simple-lama-inpainting/releases/tag/v0.1.0)，安装时校验 SHA-256。OCR 按文字长度分批、局部修复与识字并行；未检测为文字框的笔画从已有分割图中补检。
+背景修复使用 [LaMa](https://github.com/advimman/lama)，权重来自 [simple-lama-inpainting 的官方发布](https://github.com/enesmsahin/simple-lama-inpainting/releases/tag/v0.1.0)，安装时校验 SHA-256。局部修复保留至 512 像素长边，蒙版外像素保留原图；识字按批次交付，与修复并行。气泡底色采样、纯色分流和局部上下文处理参考 [BallonsTranslator](https://github.com/dmMaze/BallonsTranslator)、[Koharu](https://github.com/koharu-rs/koharu) 和 [manga-translator-ui](https://github.com/hgmzhn/manga-translator-ui)。复杂画面仍可能修复不准，可通过「修正气泡…」恢复原图。
 
 疑点处理参考 [manga-image-translator 的识别质量过滤](https://github.com/zyddnys/manga-image-translator/blob/main/manga_translator/ocr/model_48px.py)，以及 [Mokuro Reader 的原图与文字层分离](https://github.com/Gnathonic/mokuro-reader/blob/main/src/lib/components/Reader/MangaPage.svelte)。两套本地识别结果一致时直接确认；仍有分歧时只重识对应的小区域，每页最多四次。不确定片段单独记录，字号适配、流式回填和缓存都保留这一状态。
 

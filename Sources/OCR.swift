@@ -127,7 +127,7 @@ final class LocalOCR: @unchecked Sendable {
     private var input: FileHandle?
     private var runtime: URL?
     private var log: FileHandle?
-    static let engineVersion = "manga-ocr-18"
+    static let engineVersion = "manga-ocr-19"
 
     init(support: URL, resources: URL, engineRoot: URL? = nil,
          visionPreparation: OCRVisionPreparation? = nil,

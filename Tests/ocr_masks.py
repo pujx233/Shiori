@@ -85,10 +85,40 @@ class UncertainFragmentTests(unittest.TestCase):
 
 
 class TextHandoffTests(unittest.TestCase):
+    def test_split_effect_is_preserved_as_a_whole_without_suppressing_adjacent_dialogue(self):
+        bounds = {'x': 10, 'y': 10, 'width': 50, 'height': 80}
+        blocks = [dict(self.block('effect-a'), text='ドン', textStyle='outlinedDark', bounds=bounds),
+                  dict(self.block('effect-b'), text='ザッ', textStyle='outlinedDark',
+                       bounds=dict(bounds, y=60)),
+                  dict(self.block('other'), text='ほっ', textStyle='outlinedDark',
+                       bounds=dict(bounds, x=200)),
+                  dict(self.block('dialogue'), text='こんにちは', bounds=bounds)]
+        patches = {}
+        for block in blocks:
+            future = Future(); future.set_result(None if block['id'] == 'effect-a' else 'verified-patch')
+            patches[block['id']] = future
+        with tempfile.TemporaryDirectory() as folder:
+            worker['finish_page'](Path(folder), blocks, 0, patches, time.monotonic())
+            page = json.loads((Path(folder)/'state.json').read_text())['page']
+            result = {block['id']: block for block in page['blocks']}
+            self.assertFalse(result['effect-a']['replacementAllowed'])
+            self.assertFalse(result['effect-b']['replacementAllowed'])
+            self.assertIsNone(result['effect-b']['replacementPNG'])
+            self.assertTrue(result['other']['replacementAllowed'])
+            self.assertTrue(result['dialogue']['replacementAllowed'])
+
     @staticmethod
     def block(identifier='b1'):
         return {'id': identifier, 'text': 'おはよう', 'textStyle': None,
                 'bounds': {'x': 0, 'y': 0, 'width': 100, 'height': 100}}
+
+    def test_failed_closed_repair_cannot_enable_legacy_erasure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repair = Future(); repair.set_result(None)
+            worker['finish_page'](Path(folder), [self.block()], 0, {'b1': repair}, time.monotonic())
+            page = json.loads((Path(folder)/'state.json').read_text())['page']
+            self.assertFalse(page['blocks'][0]['replacementAllowed'])
+            self.assertIsNone(page['blocks'][0]['replacementPNG'])
 
     def test_text_is_available_before_repairs_and_final_retains_identical_ids(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -333,6 +363,90 @@ class SelectedBubbleTests(unittest.TestCase):
 
 
 class GlyphReplacementTests(unittest.TestCase):
+    def test_large_decorative_text_on_artwork_is_preserved_at_both_capture_scales(self):
+        yy, xx = np.indices((600, 800))
+        base = np.where((xx+yy)%12 < 6, 90, 220).astype(np.uint8)
+        image = np.repeat(base[:, :, None], 3, axis=2)
+        mask = np.zeros(base.shape, np.uint8); mask[250:310, 350:380] = 255
+        for scale in (1, 2):
+            full = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+            holes = cv2.resize(mask, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+            def unexpected_repair(*args):
+                self.fail('unverifiable decorative lettering must keep the original artwork')
+            self.assertIsNone(replacement_patch(full, holes, [v*scale for v in [330, 230, 400, 330]],
+                                               open_text=True, font_size=40*scale, restorer=unexpected_repair))
+
+    def test_open_text_repair_preserves_unmasked_line_running_through_its_margin(self):
+        yy, xx = np.indices((120, 160))
+        values = np.where((xx+yy)%4 < 2, 190, 230).astype(np.uint8)
+        image = np.repeat(values[:, :, None], 3, axis=2)
+        image[15:100, 53:56] = 0
+        image[40:61, 60:67] = 0
+        mask = np.zeros(values.shape, np.uint8); mask[39:62, 59:68] = 255
+        patch = decode(replacement_patch(image, mask, [45, 30, 76, 75], open_text=True,
+                                        font_size=24, restorer=lambda crop, holes: np.full_like(crop, 225)))
+        result = image.copy(); alpha = patch[:, :, 3] > 0
+        result[30:75, 45:76][alpha] = patch[:, :, :3][alpha]
+        self.assertTrue(np.array_equal(result[:, 53:56], image[:, 53:56]))
+        self.assertTrue(np.all(result[42:59, 61:66] == 225))
+
+    def test_dark_caption_recovers_gray_strokes_and_missing_dot_without_erasing_panel_border(self):
+        image = np.full((128, 100, 3), 14, np.uint8)
+        mask = np.zeros((128, 100), np.uint8)
+        for y in (24, 45, 66):
+            cv2.rectangle(image, (43, y), (53, y+12), (105, 105, 105), -1)
+            cv2.rectangle(mask, (42, y-1), (54, y+13), 255, -1)
+        cv2.circle(image, (49, 84), 2, (220, 220, 220), -1)
+        image[10:110, 70:72] = 255
+        def unexpected_repair(*args):
+            self.fail('uniform dark lettering must use its actual background color')
+        patch = decode(replacement_patch(image, mask, [20, 10, 72, 110], open_text=True,
+                                        font_size=20, restorer=unexpected_repair))
+        result = image.copy()
+        alpha = patch[:, :, 3] > 0
+        result[10:110, 20:72][alpha] = patch[:, :, :3][alpha]
+        self.assertTrue(np.all(result[21:89, 40:57] == 14))
+        self.assertTrue(np.array_equal(result[:, 70:], image[:, 70:]))
+
+    def test_balloon_fill_clips_to_its_inset_boundary(self):
+        image = np.full((120, 160, 3), 120, np.uint8)
+        cv2.ellipse(image, (80, 60), (64, 48), 0, 0, 360, (0, 0, 0), -1)
+        cv2.ellipse(image, (80, 60), (61, 45), 0, 0, 360, (248, 248, 248), -1)
+        for y in (40, 58):
+            cv2.rectangle(image, (72, y), (79, y+9), (0, 0, 0), -1)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        labels, stats, _ = worker['bubble_regions'](gray)
+        region = worker['bubble_fill_region'](labels, stats, int(labels[75, 80]))
+        mask = np.zeros(gray.shape, np.uint8)
+        mask[36:72, 69:83] = 255
+        mask[50:57, 14:24] = 255  # A bad detector edge touches the outline.
+        patch = decode(replacement_patch(image, mask, [10, 10, 150, 110], font_size=16,
+                                        bubble_region=region))
+        result = image.copy()
+        alpha = patch[:, :, 3] > 0
+        result[10:110, 10:150][alpha] = patch[:, :, :3][alpha]
+        self.assertTrue(np.all(result[40:68, 72:80] == 248))
+        (x, y, w, h), safe = region
+        allowed = np.zeros(gray.shape, bool); allowed[y:y+h, x:x+w] = safe > 0
+        self.assertTrue(np.array_equal(result[~allowed], image[~allowed]))
+
+    def test_textured_repair_masks_neighboring_words_without_pasting_over_them(self):
+        values = np.tile(np.arange(160, dtype=np.uint8)+60, (120, 1))
+        image = np.repeat(values[:, :, None], 3, axis=2)
+        mask = np.zeros(values.shape, np.uint8)
+        image[40:65, 50:60] = 0; mask[39:66, 49:61] = 255
+        image[40:65, 90:100] = 0; mask[39:66, 89:101] = 255
+        calls = []
+        def restore(crop, holes):
+            calls.append(holes.copy())
+            # Context starts at x=8, y=0 for this box and 36px padding.
+            self.assertTrue(np.all(holes[40:65, 82:92] > 0))
+            return crop
+        patch = decode(replacement_patch(image, mask, [44, 30, 68, 75], open_text=True,
+                                        font_size=18, restorer=restore))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(patch.shape[:2], (45, 24))
+
     def test_shaded_background_and_artwork_outside_glyphs_are_preserved(self):
         image = np.full((100, 140, 3), 210, np.uint8)
         cv2.rectangle(image, (2, 2), (137, 97), (0, 0, 0), 2)
@@ -406,6 +520,15 @@ class GlyphReplacementTests(unittest.TestCase):
 
 
 class RecognitionTests(unittest.TestCase):
+    def test_reader_gutters_exclude_controls_but_do_not_clip_ordinary_dark_images(self):
+        gray = np.full((400, 600), 37, np.uint8)
+        gray[:370, 100:500] = 255
+        content = worker['reader_content_bounds'](gray)
+        self.assertEqual(content, [100, 0, 500, 370])
+        self.assertTrue(worker['within_reader_content']([200, 200, 240, 260], content))
+        self.assertFalse(worker['within_reader_content']([105, 380, 180, 395], content))
+        self.assertIsNone(worker['reader_content_bounds'](np.full((100, 100), 20, np.uint8)))
+
     def test_model_loading_skips_only_the_constructor_example_decode(self):
         calls = []
         class UpstreamOCR:
