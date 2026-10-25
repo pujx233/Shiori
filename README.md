@@ -26,7 +26,7 @@ Google 通过网页翻译服务连接，速度受网络影响；上下文较强�
 
 ## 安装
 
-从 [Releases](https://github.com/pujx233/Shiori/releases) 下载 Apple Silicon 版，将 `Shiori.app` 放入「应用程序」并打开。首次启动会显示组件安装窗口，点击安装即可准备 Python、识字依赖与模型，可查看进度并取消；已有模型会校验后复用。录屏与辅助功能授权入口也在此窗口。
+从 [Releases](https://github.com/pujx233/Shiori/releases) 下载 Apple Silicon 的 `.dmg`，打开后将 `Shiori.app` 拖到 `Applications` 并打开。首次启动会显示组件安装窗口，点击安装即可准备 Python、识字依赖与模型，可查看进度并取消；已有模型会校验后复用。录屏与辅助功能授权入口也在此窗口。
 
 更新检查由用户手动发起；发现新版后点击「安装更新并重启」。应用会校验 SHA-256、版本和现有签名身份，安装失败时保留原版本。签名不同的自行构建版本需要从发布页手动更新。解压目录中的 `SETUP_OCR.command` 继续可用于终端安装。
 
@@ -44,6 +44,8 @@ Apple Silicon、macOS 14+、Apple Command Line Tools 和 uv。选择 Codex 时�
 ./build/Shiori.app/Contents/MacOS/Shiori --self-test
 ./INSTALL.command
 ```
+
+运行 `python3 Scripts/create_dmg.py build/Shiori.app` 可生成 DMG 安装包。
 
 应用位于 `build/Shiori.app`。本地识字组件保存在 `~/Library/Application Support/Shiori/OCR`。
 Vision 编译为独立的 `Contents/Helpers/ShioriVision`，使用固定签名，避免无关的主程序更新改变其可执行文件身份。首次运行仍需由系统初始化识字模型；后续启动可复用系统缓存。
