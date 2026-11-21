@@ -142,6 +142,84 @@ struct PipelineTests {
         try check(incremental.0.skippedCount == 2 && incremental.0.untranslatedCount == 0, "batch accounting preserves only final OCR omissions")
         try check(incrementalPreviews.first?.dialogues.map(\.location) == ["first"], "first reliable bubble appears before OCR supplements it")
 
+        let verifiedRequest = DispatchSemaphore(value: 0)
+        var verifiedBatches: [[String]] = []
+        var verified = page([added, initial])
+        verified.verifiedText = true
+        let verifiedResult = try TranslationPipeline.run(runner: CommandRunner(), scheduling: .verified, renderPatches: false,
+            recognize: { ready in
+                ready(page([initial, removed]))
+                guard verifiedRequest.wait(timeout: .now() + 0.15) == .timedOut else {
+                    throw AppError.message("FAIL: a provisional OCR snapshot triggered a Codex request")
+                }
+                ready(verified)
+                try wait(verifiedRequest, "verified text starts translation before patches complete")
+                return verified
+            }, translate: { input, preview in
+                verifiedBatches.append(input.blocks.map(\.id))
+                let result = translated(input)
+                preview(result)
+                verifiedRequest.signal()
+                return result
+            }, preview: { _, _ in })
+        try check(verifiedBatches == [["added", "first"]], "verified mode sends one ordered translation batch")
+        try check(verifiedResult.1.firstResult != nil, "text-only previews do not wait for drawable patches")
+
+        let previewStarted = DispatchSemaphore(value: 0), releasePreview = DispatchSemaphore(value: 0)
+        let remainderStarted = DispatchSemaphore(value: 0)
+        var offered = page([initial])
+        offered.previewBatch = true
+        let overlapping = try TranslationPipeline.run(runner: CommandRunner(), scheduling: .verifiedWithPreview,
+            renderPatches: false, recognize: { ready in
+                ready(offered)
+                try wait(previewStarted, "preview Codex request begins on the offered text")
+                ready(page([initial, removed]))
+                ready(verified)
+                try wait(remainderStarted, "verified request starts while the preview is still running")
+                releasePreview.signal()
+                return verified
+            }, translate: { input, preview in
+                let output = translated(input)
+                preview(output)
+                if input.previewBatch == true {
+                    guard input.blocks.map(\.id) == ["first"] else { throw AppError.message("Invalid preview subset") }
+                    previewStarted.signal()
+                    try wait(releasePreview, "preview finishes after the second request starts")
+                } else {
+                    guard input.blocks.map(\.id) == ["added"] else { throw AppError.message("Invalid verified subset") }
+                    remainderStarted.signal()
+                }
+                return output
+            }, preview: { _, _ in })
+        try check(overlapping.0.dialogues.map(\.location) == ["added", "first"]
+                  && overlapping.1.translationBatches == 2, "overlapping replies preserve all results in final reading order")
+
+        let withoutPreview = try TranslationPipeline.run(runner: CommandRunner(), scheduling: .verifiedWithPreview,
+            recognize: { ready in ready(page([initial])); return verified },
+            translate: { input, _ in
+                guard input.previewBatch != true, input.blocks.map(\.id) == ["added", "first"] else {
+                    throw AppError.message("Unverified text entered a full-page request")
+                }
+                return translated(input)
+            }, preview: { _, _ in })
+        try check(withoutPreview.1.translationBatches == 1, "the parallel scheduler uses one request without an eligible preview")
+
+        let previewFailed = DispatchSemaphore(value: 0)
+        let recoveredPreview = try TranslationPipeline.run(runner: CommandRunner(), scheduling: .verifiedWithPreview,
+            recognize: { ready in
+                ready(offered)
+                try wait(previewFailed, "failed optional preview returns before verified text")
+                return verified
+            }, translate: { input, _ in
+                if input.previewBatch == true {
+                    previewFailed.signal()
+                    throw AppError.message("Temporary request failure")
+                }
+                return translated(input)
+            }, preview: { _, _ in })
+        try check(recoveredPreview.0.dialogues.map(\.location) == ["added", "first"],
+                  "a failed optional preview leaves all verified dialogue translatable")
+
         let correctionStarted = DispatchSemaphore(value: 0), releaseCorrection = DispatchSemaphore(value: 0)
         let corrected = block("first", "訂正"), newest = block("first", "最終訂正")
         var correctionBatches: [[String]] = [], correctionPreviews: [PageTranslation] = []

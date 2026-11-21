@@ -272,6 +272,11 @@ private final class CodexRPC: @unchecked Sendable {
 // and split Unicode characters cannot turn an incomplete sentence into an item.
 enum TranslationStream {
     static func preview(_ text: String, ocr: OCRPage) -> PageTranslation? {
+        guard let value = reply(text) else { return nil }
+        return try? value.resolve(ocr: ocr, allowIncomplete: true)
+    }
+
+    static func reply(_ text: String) -> TranslationReply? {
         let bytes = Array(text.utf8)
         guard bytes.count <= 1024 * 1024 else { return nil }
         var closings: [UInt8] = [], quoted = false, escaped = false
@@ -291,8 +296,13 @@ enum TranslationStream {
                 if byte == 125 && (closings == [125, 93] || closings.isEmpty) { checkpoint = (index + 1, Array(closings.reversed())) }
             }
         }
+        struct PartialReply: Decodable {
+            var status: String?
+            var message: String?
+            let translations: [TranslationReply.Item]
+        }
         guard let (end, suffix) = checkpoint,
-              let reply = try? JSONDecoder().decode(TranslationReply.self, from: Data(bytes[..<end] + suffix)) else { return nil }
-        return try? reply.resolve(ocr: ocr, allowIncomplete: true)
+              let value = try? JSONDecoder().decode(PartialReply.self, from: Data(bytes[..<end] + suffix)) else { return nil }
+        return TranslationReply(status: value.status ?? "partial", message: value.message ?? "", translations: value.translations)
     }
 }

@@ -38,12 +38,26 @@ struct LocalOCRTests {
             temporary = path.with_suffix('.tmp')
             temporary.write_text(json.dumps(value))
             temporary.replace(path)
+        deferred = None
         for line in sys.stdin:
             request = json.loads(line)
             directory = Path(request['directory'])
+            if request.get('kind') == 'warmup':
+                with (root/'warmups').open('a') as log: log.write('warmup\n')
+                continue
             with (root/'jobs').open('a') as log: log.write('job\n')
             (root/'last-job').write_text(str(directory))
             mode = (root/'mode').read_text()
+            if request.get('kind') == 'patches':
+                assert deferred is not None and not (directory/'page.png').exists()
+                assert not request['hintsPending']
+                deferred['textOnly'] = False
+                deferred['blocks'][0]['replacementAllowed'] = True
+                deferred['blocks'][0]['replacementPNG'] = base64.b64encode(b'patch').decode()
+                write(directory/'state.json', {'phase':'done','page':deferred})
+                with (root/'repairs').open('a') as log: log.write('patches\n')
+                deferred = None
+                continue
             if request.get('kind') == 'bubble':
                 if mode == 'bubble-cancel':
                     while not (directory/'cancel').exists(): time.sleep(.01)
@@ -73,9 +87,13 @@ struct LocalOCRTests {
                 if directory.exists(): write(directory/'state.json', {'phase':'cancelled'})
                 continue
             if mode == 'normal': time.sleep(.5)
-            block['replacementAllowed'] = True
-            block['replacementPNG'] = base64.b64encode(b'patch').decode()
-            write(directory/'state.json', {'phase':'done','page':{'blocks':draft['blocks'],'skippedCount':0,'elapsed':.6}})
+            text_only = not request.get('makePatches', True)
+            if not text_only:
+                block['replacementAllowed'] = True
+                block['replacementPNG'] = base64.b64encode(b'patch').decode()
+            page = {'blocks':draft['blocks'], 'skippedCount':0,'elapsed':.6,'textOnly':text_only}
+            deferred = page if text_only else None
+            write(directory/'state.json', {'phase':'done','retainsPatches':text_only,'page':page})
         """#
         try script.write(to: root.appendingPathComponent("ocr_worker.py"), atomically: true, encoding: .utf8)
         let image = NSImage(size: NSSize(width: 80, height: 80), flipped: false) { rect in
@@ -182,6 +200,8 @@ struct LocalOCRTests {
         })
         try check(cancelledBeforeRecognition && preparationFinished.wait(timeout: .now()) == .timedOut,
                   "uncached page cancels preparation before Vision without waiting for its completion")
+        try check(String(contentsOf: root.appendingPathComponent("warmups"), encoding: .utf8) == "warmup\n",
+                  "only one detector warmup is queued for a worker")
         preparationRelease.signal(); preparationQueue.sync {}
         try preparedOCR.prepare(); preparationQueue.sync {}
         try check(preparationEntered.wait(timeout: .now()) == .timedOut, "prepare after real recognition cannot schedule a replacement warmup")
@@ -225,6 +245,22 @@ struct LocalOCRTests {
                   "cached correction candidates can be read without starting or waiting for OCR")
         progressiveOCR.shutdown()
 
+        try mode("fast")
+        let textOnly = try ocr.recognize(page: page, runner: CommandRunner(), force: true,
+                                        makePatches: false, progress: { _ in })
+        var repeatedRecognition = false
+        let reused = try ocr.recognize(page: page, runner: CommandRunner(), makePatches: false,
+                                      progress: { _ in repeatedRecognition = true })
+        let upgraded = try ocr.recognize(page: page, runner: CommandRunner(), progress: { _ in })
+        try check(!repeatedRecognition && textOnly.textOnly == true && reused.textOnly == true && textOnly.verifiedText == true
+                    && textOnly.blocks.allSatisfy { $0.replacementPNG == nil },
+                  "text-only recognition stays reusable without falsely claiming erasure patches")
+        try check(upgraded.textOnly != true && upgraded.blocks.first?.replacementPNG == Data("patch".utf8),
+                  "enabling erasure bypasses the text-only cache")
+        try check(FileManager.default.fileExists(atPath: root.appendingPathComponent("repairs").path),
+                  "the latest text-only page is repaired without screenshot encoding or new Vision OCR")
+
+        try mode("progressive")
         let lateRelease = DispatchSemaphore(value: 0), lateEntered = DispatchSemaphore(value: 0)
         let lateFinished = DispatchSemaphore(value: 0), lateCancelled = DispatchSemaphore(value: 0)
         let lateOCR = try LocalOCR(support: root, resources: root, visionFileHints: { _, imageFile, runner in

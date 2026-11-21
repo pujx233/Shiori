@@ -108,10 +108,21 @@ struct OCRBlock: Codable {
         return hints[key]
     }
 }
+struct OCRStageTimings: Codable {
+    let detection: Double
+    let recognition: Double
+    let verification: Double
+    let visionWait: Double
+}
+
 struct OCRPage: Codable {
     let blocks: [OCRBlock]
     let skippedCount: Int
     let elapsed: Double
+    var verifiedText: Bool? = nil
+    var textOnly: Bool? = nil
+    var previewBatch: Bool? = nil
+    var stages: OCRStageTimings? = nil
 }
 
 // The serial worker keeps its local models warm between pages. Cancellation and
@@ -127,6 +138,7 @@ final class LocalOCR: @unchecked Sendable {
     private var input: FileHandle?
     private var runtime: URL?
     private var log: FileHandle?
+    private var deferredPatchesDigest: String?
     static let engineVersion = "manga-ocr-20"
 
     init(support: URL, resources: URL, engineRoot: URL? = nil,
@@ -201,14 +213,25 @@ final class LocalOCR: @unchecked Sendable {
         try? input?.close(); input = nil
         try? log?.close(); log = nil
         if let runtime { try? FileManager.default.removeItem(at: runtime) }
-        runtime = nil; process = nil
+        runtime = nil; process = nil; deferredPatchesDigest = nil
     }
 
-    func prepare() throws {
-        serial.lock()
-        do { try start(); serial.unlock() }
-        catch { serial.unlock(); throw error }
+    func prepare(makePatches: Bool = true) throws {
+        try serial.withLock {
+            let starting = process?.isRunning != true
+            try start()
+            if starting {
+                do { try send(["kind": "warmup", "directory": runtime!.path, "makePatches": makePatches]) }
+                catch { stopProcess(); cleanup(); throw error }
+            }
+        }
         visionPreparation.schedule()
+    }
+
+    private func send(_ message: [String: Any]) throws {
+        var request = try JSONSerialization.data(withJSONObject: message)
+        request.append(10)
+        try input!.write(contentsOf: request)
     }
 
     // Atomic cache files can be inspected by the UI without joining the active
@@ -230,9 +253,7 @@ final class LocalOCR: @unchecked Sendable {
         try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: job) }
         try page.encoded(.png).write(to: job.appendingPathComponent("page.png"))
-        var request = try JSONSerialization.data(withJSONObject: ["directory": job.path, "kind": "bubble"])
-        request.append(10)
-        do { try input!.write(contentsOf: request) }
+        do { try send(["directory": job.path, "kind": "bubble"]) }
         catch {
             stopProcess(); cleanup()
             try runner.checkCancellation()
@@ -280,14 +301,17 @@ final class LocalOCR: @unchecked Sendable {
     // reliable balloons finish and Vision supplements/rechecks the page. IDs are
     // stable; text can change after verification. Only completed closed-balloon
     // patches can render before the final page.
-    func recognize(page: CapturedPage, runner: CommandRunner, force: Bool = false, progress: (String) -> Void,
+    func recognize(page: CapturedPage, runner: CommandRunner, force: Bool = false,
+                   streamDrafts: Bool = true, earlyTranslation: Bool = false,
+                   makePatches: Bool = true, progress: (String) -> Void,
                    onTextReady: ((OCRPage) -> Void)? = nil) throws -> OCRPage {
         serial.lock(); defer { serial.unlock() }
         try runner.checkCancellation()
         let key = page.digest + "-" + Self.engineVersion + ".json"
         let cached = cache.appendingPathComponent(key)
-        if !force, let data = try? Data(contentsOf: cached), let result = try? JSONDecoder().decode(OCRPage.self, from: data) {
+        if !force, var result = cachedRecognition(for: page), !makePatches || result.textOnly != true {
             CacheFiles.touch(cached)
+            result.verifiedText = true
             try runner.checkCancellation()
             onTextReady?(result)
             try runner.checkCancellation()
@@ -295,13 +319,18 @@ final class LocalOCR: @unchecked Sendable {
         }
         visionPreparation.cancel()
         try start()
+        let patchOnly = !force && makePatches && deferredPatchesDigest == page.digest
+        deferredPatchesDigest = nil
         let job = runtime!.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: job, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: job) }
-        try page.encoded(.png).write(to: job.appendingPathComponent("page.png"))
-        progress("检查文字…")
-        var request = try JSONSerialization.data(withJSONObject: ["directory": job.path, "hintsPending": true]); request.append(10)
-        do { try input!.write(contentsOf: request) }
+        if !patchOnly { try page.encoded(.png).write(to: job.appendingPathComponent("page.png")) }
+        progress(patchOnly ? "整理画面…" : "检查文字…")
+        do {
+            try send(["directory": job.path, "kind": patchOnly ? "patches" : "page", "pageDigest": page.digest,
+                      "hintsPending": !patchOnly, "streamDrafts": streamDrafts,
+                      "earlyTranslation": earlyTranslation, "makePatches": makePatches])
+        }
         catch {
             stopProcess(); cleanup()
             try runner.checkCancellation()
@@ -317,7 +346,7 @@ final class LocalOCR: @unchecked Sendable {
         // framework's cold initialization. The final pass still uses its evidence.
         let vision = OCRVisionMailbox(directory: job, parent: runner)
         defer { vision.close() }
-        vision.start(image: page.image, imageFile: job.appendingPathComponent("page.png"), recognize: visionHints)
+        if !patchOnly { vision.start(image: page.image, imageFile: job.appendingPathComponent("page.png"), recognize: visionHints) }
         let deadline = Date().addingTimeInterval(90)
         var cancelStart: Date?
         var lastProgress = ""
@@ -325,6 +354,7 @@ final class LocalOCR: @unchecked Sendable {
         struct State: Decodable {
             let phase: String
             var completed: Int?; var total: Int?; var page: OCRPage?; var message: String?
+            var retainsPatches: Bool?
         }
         while Date() < deadline {
             if runner.isCancelled, cancelStart == nil {
@@ -353,7 +383,8 @@ final class LocalOCR: @unchecked Sendable {
                     throw AppError.message(state.message ?? "本地识字失败。")
                 case "done":
                     try runner.checkCancellation()
-                    guard let result = state.page else { throw AppError.message("识字结果不完整。") }
+                    guard var result = state.page else { throw AppError.message("识字结果不完整。") }
+                    result.verifiedText = true
                     if deliveredText == nil { onTextReady?(result) }
                     try runner.checkCancellation()
                     try JSONEncoder().encode(result).write(to: cached, options: .atomic)
@@ -362,6 +393,7 @@ final class LocalOCR: @unchecked Sendable {
                         try? FileManager.default.removeItem(at: cached)
                         throw CancellationError()
                     }
+                    if result.textOnly == true, state.retainsPatches == true { deferredPatchesDigest = page.digest }
                     return result
                 default: break
                 }

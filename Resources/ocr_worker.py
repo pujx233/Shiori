@@ -522,13 +522,21 @@ def restore_voicing(text, box, hints):
 class BackgroundRestorer:
     """One local CPU LaMa model, reused for textured lettering regions."""
     def __init__(self, path):
-        import torch
-        self.model = torch.jit.load(str(path), map_location='cpu').eval() if path.exists() else None
+        self.path = path
+        self.model = None
+
+    def prepare(self):
+        if self.path is not None:
+            import torch
+            if self.path.exists():
+                self.model = torch.jit.load(str(self.path), map_location='cpu').eval()
+            self.path = None
 
     def __call__(self, image, mask):
         import cv2
         import numpy as np
         import torch
+        self.prepare()
         if self.model is None:
             return cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
         height, width = mask.shape
@@ -861,7 +869,7 @@ def unique_blocks(blocks):
     return ordered
 
 
-def publish_draft(directory, blocks, skipped, patches, start):
+def publish_draft(directory, blocks, skipped, patches, start, verified=False, preview_batch=False):
     """Cumulative snapshots retain IDs; only real closed-balloon patches can show."""
     if cancelled(directory):
         return
@@ -869,13 +877,14 @@ def publish_draft(directory, blocks, skipped, patches, start):
     draft = []
     for block in result:
         candidate = dict(block, replacementPNG=None, replacementAllowed=False)
-        future = patches[block['id']]
-        if block['textStyle'] is None and future.done() and not future.cancelled():
+        future = patches.get(block['id'])
+        if block['textStyle'] is None and future is not None and future.done() and not future.cancelled():
             patch = future.result()
             if patch is not None:
                 candidate.update(replacementPNG=patch, replacementAllowed=True)
         draft.append(candidate)
-    write_json(directory, 'text', {'blocks': draft, 'skippedCount': skipped, 'elapsed': time.monotonic()-start})
+    write_json(directory, 'text', {'blocks': draft, 'skippedCount': skipped,
+               'elapsed': time.monotonic()-start, 'verifiedText': verified, 'previewBatch': preview_batch})
 
 
 def preserve_overlapping_lettering(blocks):
@@ -898,34 +907,35 @@ def preserve_overlapping_lettering(blocks):
                     break
 
 
-def finish_page(directory, blocks, skipped, patches, start):
+def finish_page(directory, blocks, skipped, patches, start, make_patches=True, retains_patches=False, timings=None):
     """Finish background work after the last durable text snapshot is published."""
     if cancelled(directory):
         write_state(directory, phase='cancelled')
         return
     result = unique_blocks(blocks)
-    publish_draft(directory, result, skipped, patches, start)
-    write_state(directory, phase='repairing')
-    for block in result:
-        future = patches[block['id']]
-        while not cancelled(directory):
-            try:
-                patch = future.result(timeout=.05)
-                block['replacementPNG'] = patch
-                block['replacementAllowed'] = patch is not None
-                break
-            except FutureTimeout:
-                # Python aliases FutureTimeout to built-in TimeoutError. Do not
-                # retry an actual timeout raised by a completed repair forever.
-                if future.done():
-                    raise
-                continue
-        if cancelled(directory):
-            write_state(directory, phase='cancelled')
-            return
-    preserve_overlapping_lettering(result)
-    write_state(directory, phase='done', page={'blocks': result, 'skippedCount': skipped,
-                'elapsed': time.monotonic()-start})
+    if make_patches:
+        publish_draft(directory, result, skipped, patches, start, verified=True)
+        write_state(directory, phase='repairing')
+        for block in result:
+            future = patches[block['id']]
+            while not cancelled(directory):
+                try:
+                    patch = future.result(timeout=.05)
+                    block['replacementPNG'] = patch
+                    block['replacementAllowed'] = patch is not None
+                    break
+                except FutureTimeout:
+                    # Python aliases FutureTimeout to built-in TimeoutError. Do not
+                    # retry an actual timeout raised by a completed repair forever.
+                    if future.done():
+                        raise
+                    continue
+            if cancelled(directory):
+                write_state(directory, phase='cancelled')
+                return
+        preserve_overlapping_lettering(result)
+    write_state(directory, phase='done', retainsPatches=retains_patches, page={'blocks': result, 'skippedCount': skipped,
+                'elapsed': time.monotonic()-start, 'verifiedText': True, 'textOnly': not make_patches, 'stages': timings})
 
 
 def page_groups(candidates, gray, labels, stats, exterior, ink_labels, ink_stats):
@@ -980,9 +990,11 @@ def page_block(component, box, text, uncertain, target, font, direction, gray, l
             'replacementPNG': None, 'textStyle': style, 'bounds': bounds(target)}
 
 
-def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_mask, device, pending, start, patch_jobs):
+def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_mask, device, pending, start, patch_jobs,
+                   stream_drafts=True, make_patches=True, early_translation=False):
     import cv2
     import numpy as np
+    detecting = time.monotonic()
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     content = reader_content_bounds(gray)
@@ -1005,38 +1017,50 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
         return mask, found
     resolution = resolution_for(hints)
     text_mask, candidates = detect(resolution)
+    detection_seconds = time.monotonic() - detecting
+    recognition_seconds = 0.0
     if cancelled(directory):
         write_state(directory, phase='cancelled'); return
-    early_text, early_patches, early_result = {}, {}, []
+    early_text, early_patches, early_result, draft_patches = {}, {}, [], {}
+    early_preview = False
     early_revision = None
     batch_size = 8 if device == 'mps' else 1
 
     # Fast path only uses detector-confirmed Japanese inside a real closed
     # balloon. Unknown/open/small text keeps the full independent Vision review.
     if pending and not (directory / 'hints.json').exists():
+        detecting = time.monotonic()
         boxes, fonts, languages, directions, extra, targets, skipped = page_groups(
             candidates, gray, labels, stats, exterior, ink_labels, ink_stats)
+        detection_seconds += time.monotonic() - detecting
+        early_preview = early_translation and len(boxes) > 8
         first = [(c, b) for c, b in boxes if c > 0 and 'ja' in languages[c] and fonts[c] >= 10][:(3 if device == 'mps' else 1)]
-        for component, box in first:
-            future = repairs.submit(replacement_patch, image, text_mask, targets[component],
-                ink_labels, extra.get(component, []), False, restorer, font_size=fonts[component],
-                bubble_region=bubble_fill_region(labels, stats, component))
-            signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
-            early_patches[component] = (signature, future)
-            patch_jobs[('early', component)] = future
-        for index, component, box, text in recognized_boxes(
-                ocr, image, first, languages, fonts, directory, min(batch_size, len(first) or 1), text_mask):
+        if make_patches:
+            for component, box in first:
+                future = repairs.submit(replacement_patch, image, text_mask, targets[component],
+                    ink_labels, extra.get(component, []), False, restorer, font_size=fonts[component],
+                    bubble_region=bubble_fill_region(labels, stats, component))
+                signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
+                early_patches[component] = (signature, future)
+                patch_jobs[('early', component)] = future
+        draft_patches = {block_identifier(c, b): early_patches[c][1] for c, b in first if c in early_patches}
+        early_batch_size = min(batch_size, len(first) or 1)
+        recognizing = time.monotonic()
+        for _, component, box, text in recognized_boxes(
+                ocr, image, first, languages, fonts, directory, early_batch_size, text_mask):
             early_text[(component, tuple(box), fonts[component])] = text
+            if not stream_drafts and not early_preview:
+                continue
             if japanese_text(text, languages[component]):
                 early_result.append(page_block(component, box, text, [], targets[component], fonts[component],
                                                directions[component], gray, labels, stats))
             # Publish a complete decoder batch, retaining reading order later.
-            if len(early_text) % min(batch_size, len(first) or 1) == 0 or len(early_text) == len(first):
+            if len(early_text) % early_batch_size == 0 or len(early_text) == len(first):
                 order = {block_identifier(c, b): i for i, (c, b) in enumerate(first)}
                 early_result.sort(key=lambda block: order[block['id']])
-                publish_draft(directory, early_result, skipped,
-                    {block_identifier(c, b): early_patches[c][1] for c, b in first}, start)
+                publish_draft(directory, early_result, skipped, draft_patches, start, preview_batch=early_preview)
                 early_revision = tuple(future.done() for _, future in early_patches.values())
+        recognition_seconds += time.monotonic() - recognizing
         if cancelled(directory):
             write_state(directory, phase='cancelled'); return
         write_state(directory, phase='verifying')
@@ -1046,41 +1070,52 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
         revision = tuple(future.done() for _, future in early_patches.values())
         if early_result and revision != early_revision:
             early_revision = revision
-            publish_draft(directory, early_result, skipped,
-                {block_identifier(c, b): early_patches[c][1] for c, b in first}, start)
+            publish_draft(directory, early_result, skipped, draft_patches, start, preview_batch=early_preview)
     # A repair can complete after decoding. Publish it while Vision is pending
     # instead of leaving the already translated balloon hidden until final OCR.
+    awaiting_hints = time.monotonic()
     hints = read_hints(directory, pending, on_wait=publish_completed_patches)
+    hint_wait = time.monotonic() - awaiting_hints
     if cancelled(directory):
         write_state(directory, phase='cancelled'); return
+    detecting = time.monotonic()
     if resolution_for(hints) > resolution:
         resolution = resolution_for(hints)
         text_mask, candidates = detect(resolution)
     candidates = supplement_candidates(candidates, [hint for hint in hints if within_reader_content(hint['box'], content)])
     boxes, fonts, languages, directions, extra, targets, skipped = page_groups(
         candidates, gray, labels, stats, exterior, ink_labels, ink_stats)
-    accepted_patches = {}
-    for component, box in sorted(boxes, key=lambda pair: pair[0] < 0):
-        signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
-        earlier = early_patches.get(component)
-        future = earlier[1] if earlier and earlier[0] == signature else repairs.submit(
-            replacement_patch, image, text_mask, targets[component], ink_labels, extra.get(component, []),
-            component < 0, restorer, font_size=fonts[component],
-            bubble_region=bubble_fill_region(labels, stats, component) if component > 0 else None)
-        patch_jobs[('final', component)] = future
-        accepted_patches[block_identifier(component, box)] = future
+    detection_seconds += time.monotonic() - detecting
+    def schedule_patches(jobs):
+        accepted_patches = {}
+        for component, box in sorted(boxes, key=lambda pair: pair[0] < 0):
+            signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
+            earlier = early_patches.get(component)
+            future = earlier[1] if earlier and earlier[0] == signature else repairs.submit(
+                replacement_patch, image, text_mask, targets[component], ink_labels, extra.get(component, []),
+                component < 0, restorer, font_size=fonts[component],
+                bubble_region=bubble_fill_region(labels, stats, component) if component > 0 else None)
+            jobs[('final', component)] = future
+            accepted_patches[block_identifier(component, box)] = future
+        return accepted_patches
+    accepted_patches = schedule_patches(patch_jobs) if make_patches else {}
     missing = [(c, b) for c, b in boxes if (c, tuple(b), fonts[c]) not in early_text]
     # A short first section in reading order reaches translation before the
     # remaining length-bucketed work. Keep the full independent review below.
-    priority = [] if early_text else [(c, b) for c, b in missing if c > 0 and fonts[c] >= 10 and 'ja' in languages[c]][:(3 if device == 'mps' else 1)]
+    priority = []
+    preview_priority = early_translation and len(boxes) > 8
+    if (stream_drafts or preview_priority) and not early_text:
+        priority = [(c, b) for c, b in missing if c > 0 and fonts[c] >= 10 and 'ja' in languages[c]][:(3 if device == 'mps' else 1)]
     priority_ids = {c for c, _ in priority}
     phases = [(priority, min(batch_size, len(priority) or 1)),
               ([(c, b) for c, b in missing if c not in priority_ids], batch_size)]
+    recognizing = time.monotonic()
     for phase, phase_batch in phases:
         for completed, (_, component, box, text) in enumerate(recognized_boxes(
                 ocr, image, phase, languages, fonts, directory, phase_batch, text_mask), 1):
             early_text[(component, tuple(box), fonts[component])] = text
-            if completed % phase_batch == 0 or completed == len(phase):
+            preview_batch = preview_priority and phase is priority
+            if (stream_drafts or preview_batch) and (completed % phase_batch == 0 or completed == len(phase)):
                 # A fast Vision response must not turn the whole page back into a
                 # barrier. Publish completed decoder batches on this path too;
                 # independent verification below retains its original reading order
@@ -1093,7 +1128,10 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
                         draft.append(page_block(known, bounds, value, [], targets[known], fonts[known],
                                                 directions[known], gray, labels, stats))
                 if draft:
-                    publish_draft(directory, draft, skipped, accepted_patches, start)
+                    publish_draft(directory, draft, skipped, accepted_patches, start, preview_batch=preview_batch)
+    recognition_seconds += time.monotonic() - recognizing
+    write_state(directory, phase='verifying')
+    verifying = time.monotonic()
     result, uncertainty_budget = [], [4]
     for component, box in boxes:
         if cancelled(directory):
@@ -1112,7 +1150,15 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
             continue
         result.append(page_block(component, box, text, uncertain, targets[component], fonts[component],
                                  directions[component], gray, labels, stats))
-    finish_page(directory, result, skipped, accepted_patches, start)
+    timings = {'detection': detection_seconds, 'recognition': recognition_seconds,
+               'verification': time.monotonic() - verifying, 'visionWait': hint_wait}
+    finish_page(directory, result, skipped, accepted_patches, start, make_patches=make_patches,
+                retains_patches=not make_patches, timings=timings)
+    if not make_patches and not cancelled(directory):
+        def restore(next_directory, next_start, jobs):
+            patches = schedule_patches(jobs)
+            finish_page(next_directory, result, skipped, patches, next_start)
+        return restore
 
 
 def load_manga_ocr(model_type, path):
@@ -1138,6 +1184,25 @@ def load_manga_ocr(model_type, path):
     return FirstRealCropMangaOcr(str(path))
 
 
+def keep_encoder_beam_order(model):
+    from transformers import DynamicCache, EncoderDecoderCache
+
+    class FixedImageFeatures(EncoderDecoderCache):
+        def reorder_cache(self, beam_idx):
+            # In Manga OCR's beam search, every beam for a crop has the same
+            # encoder features. Beam indices only select within that crop.
+            self.self_attention_cache.reorder_cache(beam_idx)
+
+    generate = model.generate
+    config = model.config.get_text_config(decoder=True)
+
+    def generate_for_crop(*args, **kwargs):
+        features = FixedImageFeatures(DynamicCache(config=config), DynamicCache(config=config))
+        return generate(*args, **kwargs, past_key_values=features)
+
+    model.generate = generate_for_crop
+
+
 def main():
     import cv2
     import numpy as np
@@ -1155,9 +1220,13 @@ def main():
     detector = TextDetector(root / 'models/comictextdetector.pt', device=device, input_size=1024, act='leaky')
     ocr = load_manga_ocr(MangaOcr, root / 'models/manga')
     ocr.model.generation_config.num_beams = 2
+    if (device == 'mps' and ocr.model.config.decoder.model_type == 'bert'
+            and ocr.model.generation_config.use_cache and ocr.model.generation_config.cache_implementation is None):
+        keep_encoder_beam_order(ocr.model)
     restorer = BackgroundRestorer(root / 'models/big-lama.pt')
     repairs = ThreadPoolExecutor(max_workers=1, thread_name_prefix='background-repair')
     write_state(runtime, phase='ready')
+    deferred_patches = None
     for line in sys.stdin:
         request = json.loads(line)
         directory = Path(request['directory'])
@@ -1166,6 +1235,19 @@ def main():
         try:
             if cancelled(directory):
                 write_state(directory, phase='cancelled')
+                continue
+            if request.get('kind') == 'warmup':
+                if request.get('makePatches', True):
+                    repairs.submit(restorer.prepare)
+                if device == 'mps':
+                    detector.input_size = (1536, 1536)
+                    detector(np.full((768, 1536, 3), 255, dtype=np.uint8))
+                continue
+            if request.get('kind') == 'patches':
+                plan, deferred_patches = deferred_patches, None
+                if plan is None or request.get('pageDigest') != plan[0]:
+                    raise ValueError('Deferred page does not match')
+                plan[1](directory, start, patch_jobs)
                 continue
             write_state(directory, phase='detecting')
             image = cv2.imread(str(directory / 'page.png'))
@@ -1181,8 +1263,13 @@ def main():
                 else:
                     write_state(directory, phase='error', message='没能读出文字，可以直接修改原文。')
                 continue
-            recognize_page(directory, image, detector, ocr, restorer, repairs, refine_mask,
-                           device, request.get('hintsPending', False), start, patch_jobs)
+            deferred_patches = None
+            restore = recognize_page(directory, image, detector, ocr, restorer, repairs, refine_mask,
+                                     device, request.get('hintsPending', False), start, patch_jobs,
+                                     stream_drafts=request.get('streamDrafts', True), make_patches=request.get('makePatches', True),
+                                     early_translation=request.get('earlyTranslation', False))
+            if restore is not None:
+                deferred_patches = (request.get('pageDigest'), restore)
         except Exception:
             traceback.print_exc(file=sys.stderr)
             write_state(directory, phase='error', message='本地识字失败，请重试。')

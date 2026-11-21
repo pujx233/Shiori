@@ -147,9 +147,15 @@ final class MangaOverlay {
         pendingAction = nil
         if let error { editor.finish(error: error); return }
         if let dialogue { editor.update(dialogue) }
-        editor.finish(error: nil)
+        if case .recognize? = action, dialogue == nil { editor.finish(error: nil, message: "识字完成") }
+        else { editor.finish(error: nil) }
         if case .save? = action { endCorrection() }
         if case .restoreOriginal? = action { endCorrection() }
+    }
+
+    func showRecognizedSource(id: String, text: String, translating: Bool) {
+        guard selecting, selectedID == id, case .recognize? = pendingAction else { return }
+        editor?.showRecognizedSource(text, translating: translating)
     }
 
     func hide() { wantsVisible = false; endCorrection(); panel.orderOut(nil); peekPanel.orderOut(nil); tracking?.invalidate(); tracking = nil }
@@ -390,10 +396,16 @@ private final class BubbleEditor: NSWindowController, NSWindowDelegate {
         status.textColor = .secondaryLabelColor
     }
 
-    func finish(error: String?) {
+    func showRecognizedSource(_ text: String, translating: Bool) {
+        source.string = text
+        source.undoManager?.removeAllActions()
+        if translating { status.stringValue = "翻译中…" }
+    }
+
+    func finish(error: String?, message: String? = nil) {
         buttons.forEach { $0.isEnabled = true }
         source.isEditable = true; translation.isEditable = true
-        status.stringValue = error ?? ""
+        status.stringValue = error ?? message ?? ""
         status.toolTip = error
         status.textColor = error == nil ? .secondaryLabelColor : .systemRed
     }

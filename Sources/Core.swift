@@ -237,8 +237,15 @@ struct CapturedPage {
     }
 
     func matchesProbe(_ other: CapturedPage) -> Bool {
-        guard displaySize == other.displaySize,
-              abs(contentRect.width/contentRect.height - other.contentRect.width/other.contentRect.height) < 0.02 else { return false }
+        guard displaySize == other.displaySize else { return false }
+        // Cropping rounds inward at each screenshot resolution. The same
+        // viewport can therefore move by nearly one low-resolution pixel.
+        let pixelWidth = max(contentRect.width / CGFloat(image.width), other.contentRect.width / CGFloat(other.image.width))
+        let pixelHeight = max(contentRect.height / CGFloat(image.height), other.contentRect.height / CGFloat(other.image.height))
+        guard abs(contentRect.minX - other.contentRect.minX) <= pixelWidth,
+              abs(contentRect.maxX - other.contentRect.maxX) <= pixelWidth,
+              abs(contentRect.minY - other.contentRect.minY) <= pixelHeight,
+              abs(contentRect.maxY - other.contentRect.maxY) <= pixelHeight else { return false }
         let difference = zip(appearance, other.appearance).reduce(0) { $0 + abs(Int($1.0)-Int($1.1)) }
         return Double(difference)/Double(appearance.count) < 5
     }
@@ -335,15 +342,23 @@ struct CacheEntry: Codable {
     let createdAt: Date
     let elapsed: Double
     var timings: PageTimings? = nil
+    var textOnly: Bool? = nil
 }
 
 struct PageTimings: Codable {
     let ocr: Double
     let codex: Double
     let firstResult: Double?
+    var translationBatches: Int? = nil
+    var ocrStages: OCRStageTimings? = nil
     var diagnosticState: [String: Any] {
         var values: [String: Any] = ["ocr": ocr, "codex": codex]
         if let firstResult { values["firstResult"] = firstResult }
+        if let translationBatches { values["translationBatches"] = translationBatches }
+        if let stages = ocrStages {
+            values["ocrStages"] = ["detection": stages.detection, "recognition": stages.recognition,
+                                    "verification": stages.verification, "visionWait": stages.visionWait]
+        }
         return values
     }
 }
@@ -402,9 +417,10 @@ final class TranslationCache {
     }
 
     func save(page: CapturedPage, options: TranslationOptions, translation: PageTranslation, elapsed: Double,
-              timings: PageTimings? = nil, persistManual: Bool = true) throws -> CacheEntry {
+              timings: PageTimings? = nil, textOnly: Bool? = nil, persistManual: Bool = true) throws -> CacheEntry {
         let entry = CacheEntry(id: Self.key(page.digest, options), options: options,
-                              pageDigest: page.digest, translation: translation, createdAt: Date(), elapsed: elapsed, timings: timings)
+                              pageDigest: page.digest, translation: translation, createdAt: Date(), elapsed: elapsed,
+                              timings: timings, textOnly: textOnly)
         let data = try JSONEncoder().encode(entry)
         try data.write(to: directory.appendingPathComponent(entry.id + ".json"), options: .atomic)
         // Automatic recognition may omit a previously corrected bubble. Only
@@ -638,10 +654,12 @@ final class CodexClient: Sendable {
     let resources: URL
     let textCache: TextTranslationCache
     private let session: CodexSession
-    private let memory = ReadingMemory()
+    private let memory: ReadingMemory
 
-    init(resources: URL, workspace: URL, textCacheDirectory: URL? = nil) throws {
+    init(resources: URL, workspace: URL, textCacheDirectory: URL? = nil,
+         shareReadingContextWith: CodexClient? = nil) throws {
         self.resources = resources; self.workspace = workspace
+        memory = shareReadingContextWith?.memory ?? ReadingMemory()
         textCache = try TextTranslationCache(directory: textCacheDirectory ?? workspace.appendingPathComponent("TextTranslations"))
         let choices = [
             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
@@ -708,13 +726,23 @@ final class CodexClient: Sendable {
         }
         let history = memory.context(scope: options.readingScope, excluding: ocr.blocks.map(\.text))
         func request(_ blocks: [OCRBlock], repair: Bool) throws -> TranslationReply {
-            struct Input: Encodable { let id: String; let text: String; let kind: String?; let readingHint: String?; let uncertainFragments: [String]? }
-            func inputBlock(_ block: OCRBlock) -> Input {
-                return Input(id: block.id, text: block.text, kind: block.translationKind,
+            struct Input: Encodable { let id: String?; let text: String; let kind: String?; let readingHint: String?; let uncertainFragments: [String]? }
+            let wireIDs = blocks.indices.map { String($0 + 1) }
+            let stableIDs = Dictionary(uniqueKeysWithValues: zip(wireIDs, blocks.map(\.id)))
+            func inputBlock(_ block: OCRBlock, id: String? = nil) -> Input {
+                return Input(id: id, text: block.text, kind: block.translationKind,
                              readingHint: block.readingHint,
                              uncertainFragments: block.uncertainFragments)
             }
-            let input = String(decoding: try JSONEncoder().encode(blocks.map(inputBlock)), as: UTF8.self)
+            func bindIDs(_ wireReply: TranslationReply) throws -> TranslationReply {
+                let items = try wireReply.translations.map { item -> TranslationReply.Item in
+                    guard let stableID = stableIDs[item.id] else { throw AppError.message("译文与气泡未能对应，请重试。") }
+                    return TranslationReply.Item(id: stableID, text: item.text)
+                }
+                return TranslationReply(status: wireReply.status, message: wireReply.message, translations: items)
+            }
+            let input = String(decoding: try JSONEncoder().encode(zip(blocks, wireIDs).map { block, id in inputBlock(block, id: id) }),
+                               as: UTF8.self)
             var prompt = "逐条翻译为简体中文。一个 ID 对应一个气泡，译文只包含该 ID 的原文含义；不要把相邻气泡合并，也不要把有正文的气泡替换成省略号。\n"
             if !options.guidance.isEmpty { prompt += "本作品的翻译习惯：\n" + options.guidance + "\n" }
             let sourceText = (pageContext ?? ocr).blocks.map(\.text).joined(separator: "\n")
@@ -723,32 +751,33 @@ final class CodexClient: Sendable {
                 prompt += "本作品已确认的用词：\n" + matchedTerms.map { $0.source + " → " + $0.translation }.joined(separator: "\n") + "\n"
             }
             if !history.isEmpty { prompt += "前页文字，仅用于人名和语气参考：\n" + history + "\n" }
-            if let pageContext, pageContext.blocks.count > blocks.count {
-                let context = String(decoding: try JSONEncoder().encode(pageContext.blocks.map(inputBlock)), as: UTF8.self)
-                prompt += "本页其他文字仅供理解，不要返回其他 ID：" + context + "\n"
+            let requested = Set(stableIDs.values)
+            let reference = (pageContext ?? ocr).blocks.filter { !requested.contains($0.id) }
+            if !reference.isEmpty {
+                let context = String(decoding: try JSONEncoder().encode(reference.map { inputBlock($0) }), as: UTF8.self)
+                prompt += "本页其他文字仅供理解，不要翻译这些文字：" + context + "\n"
             }
-            if repair {
-                let context = String(decoding: try JSONEncoder().encode(ocr.blocks.map(inputBlock)), as: UTF8.self)
-                prompt += "本页上下文（仅供理解）：" + context + "\n以下条目需要补译或重新拆分，其他 ID 不要返回。\n"
-            }
+            if repair { prompt += "请补译或重新拆分以下条目。\n" }
             prompt += input
             var schema = baseSchema
             var properties = schema["properties"] as! [String: Any]
             var array = properties["translations"] as! [String: Any]
             var item = array["items"] as! [String: Any]
             var fields = item["properties"] as! [String: Any]
-            fields["id"] = ["type": "string", "enum": blocks.map(\.id)]
+            fields["id"] = ["type": "string", "enum": wireIDs]
             item["properties"] = fields; array["items"] = item; properties["translations"] = array; schema["properties"] = properties
             let subset = OCRPage(blocks: blocks, skippedCount: 0, elapsed: 0)
             var lastPreview = ""
-            return try session.translate(prompt: prompt, instructions: instructions, schema: schema,
+            let reply = try session.translate(prompt: prompt, instructions: instructions, schema: schema,
                                          options: options, runner: runner) { text in
                 try runner.checkCancellation()
-                guard let partial = TranslationStream.preview(text, ocr: subset) else { return }
+                guard let wireReply = TranslationStream.reply(text),
+                      let partial = try? bindIDs(wireReply).resolve(ocr: subset, allowIncomplete: true) else { return }
                 for dialogue in partial.dialogues { accepted[dialogue.location] = dialogue }
                 let fingerprint = ocr.blocks.compactMap { accepted[$0.id]?.translation }.joined(separator: "\u{0}")
                 if fingerprint != lastPreview { lastPreview = fingerprint; preview?(page()) }
             }
+            return try bindIDs(reply)
         }
         var wanted = ocr.blocks.filter { accepted[$0.id] == nil }
         if !wanted.isEmpty {

@@ -31,6 +31,11 @@ enum BubbleCorrection {
         return try CapturedPage(image: image)
     }
 
+    static func canReuseTranslation(_ dialogue: Dialogue, recognizedSource: String) -> Bool {
+        recognizedSource == dialogue.original && dialogue.userRestoredOriginal != true && !dialogue.needsReview
+            && TranslationReply.usable(source: recognizedSource, translated: dialogue.translation)
+    }
+
     static func edited(_ dialogue: Dialogue, source: String, translation: String) throws -> Dialogue {
         let value = translation.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { throw AppError.message("请填写译文，或选择恢复原图。") }

@@ -6,28 +6,29 @@ import ImageIO
 // source revisions, then bind every preview to the latest local geometry.
 enum TranslationPipeline {
     typealias Translate = (OCRPage, @escaping (PageTranslation) -> Void) throws -> PageTranslation
+    enum Scheduling { case progressive, verified, verifiedWithPreview }
 
     static func run(runner: CommandRunner, began: Date = Date(), corrections: [Dialogue] = [],
+                    scheduling: Scheduling = .progressive, renderPatches: Bool = true,
                     recognize: (@escaping (OCRPage) -> Void) throws -> OCRPage,
                     translate: @escaping Translate,
                     preview: @escaping (PageTranslation, PageTimings) -> Void) throws -> (PageTranslation, PageTimings) {
-        let state = PipelineState(began: began, runner: runner, corrections: corrections, preview: preview)
-        let finished = DispatchSemaphore(value: 0)
-        // One translation call at a time keeps both providers' serial sessions
-        // and model context ordered. OCR can continue replacing the pending page
-        // while a request is in flight, so obsolete queued revisions are skipped.
-        DispatchQueue.global(qos: .userInitiated).async {
-            defer { finished.signal() }
-            while let batch = state.nextBatch() {
-                let started = Date()
-                let result = Result {
-                    try runner.checkCancellation()
-                    return try translate(batch) {
-                        state.update($0, for: batch, elapsed: Date().timeIntervalSince(started))
+        let state = PipelineState(began: began, runner: runner, corrections: corrections,
+                                  scheduling: scheduling, renderPatches: renderPatches, preview: preview)
+        let finished = DispatchGroup()
+        // The preview may overlap the verified request on a separate Codex
+        // session. Google and small pages retain a single request at a time.
+        for _ in 0..<(scheduling == .verifiedWithPreview ? 2 : 1) {
+            finished.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { finished.leave() }
+                while let batch = state.nextBatch() {
+                    let result = Result {
+                        try runner.checkCancellation()
+                        return try translate(batch.page) { state.update($0, for: batch) }
                     }
+                    if state.finish(result, for: batch) { runner.cancel(); return }
                 }
-                state.finish(result, for: batch, elapsed: Date().timeIntervalSince(started))
-                if case .failure = result { runner.cancel(); return }
             }
         }
         do {
@@ -59,7 +60,8 @@ enum TranslationPipeline {
                 textStyle: block.textStyle, layoutBounds: block.layoutBounds, layoutRegions: block.layoutRegions,
                 vertical: block.vertical, fontSize: block.fontSize, uncertainFragments: nil)
         }
-        return OCRPage(blocks: blocks, skippedCount: ocr.skippedCount, elapsed: ocr.elapsed)
+        return OCRPage(blocks: blocks, skippedCount: ocr.skippedCount, elapsed: ocr.elapsed,
+                       verifiedText: ocr.verifiedText, textOnly: ocr.textOnly, previewBatch: ocr.previewBatch, stages: ocr.stages)
     }
 
     static func correction(for block: OCRBlock, in corrections: [Dialogue]) -> Dialogue? {
@@ -132,21 +134,29 @@ private struct SourceRevision: Hashable {
     }
 }
 
+private struct TranslationBatch {
+    let id: Int
+    let page: OCRPage
+}
+
 private final class PipelineState: @unchecked Sendable {
     private let condition = NSCondition()
     private let began: Date
     private let runner: CommandRunner
     private let preview: (PageTranslation, PageTimings) -> Void
     private let corrections: [String: Dialogue]
+    private let scheduling: TranslationPipeline.Scheduling
+    private let renderPatches: Bool
     private var geometry: OCRPage?
     private var isFinal = false
     private var attempted: Set<SourceRevision> = []
     private var completed: [SourceRevision: Dialogue] = [:]
-    private var streaming: [SourceRevision: Dialogue] = [:]
+    private var streaming: [Int: [SourceRevision: Dialogue]] = [:]
     private var error: Error?
     private var ocrTime = 0.0
     private var translationTime = 0.0
-    private var activeTime = 0.0
+    private var translationBatches = 0
+    private var activeSince: Date?
     private var firstResult: Double?
     private var earlyIDs: Set<String>?
     private var summary = ""
@@ -155,13 +165,18 @@ private final class PipelineState: @unchecked Sendable {
     private var lastPublication: String?
     private var hasPublished = false
 
-    init(began: Date, runner: CommandRunner, corrections: [Dialogue], preview: @escaping (PageTranslation, PageTimings) -> Void) {
+    init(began: Date, runner: CommandRunner, corrections: [Dialogue],
+         scheduling: TranslationPipeline.Scheduling, renderPatches: Bool,
+         preview: @escaping (PageTranslation, PageTimings) -> Void) {
         self.began = began; self.runner = runner; self.preview = preview
         self.corrections = Dictionary(corrections.map { ($0.location, $0) }, uniquingKeysWith: { _, latest in latest })
+        self.scheduling = scheduling; self.renderPatches = renderPatches
     }
 
     private var timings: PageTimings {
-        PageTimings(ocr: ocrTime, codex: translationTime + activeTime, firstResult: firstResult)
+        let activeTime = activeSince.map { Date().timeIntervalSince($0) } ?? 0
+        return PageTimings(ocr: ocrTime, codex: translationTime + activeTime, firstResult: firstResult,
+                    translationBatches: translationBatches, ocrStages: geometry?.stages)
     }
 
     private func page(allowEarlyOnly: Bool) -> PageTranslation? {
@@ -179,7 +194,8 @@ private final class PipelineState: @unchecked Sendable {
             }
             guard ready else { return nil }
             let key = SourceRevision(block)
-            guard let value = streaming[key] ?? completed[key] else { return nil }
+            let pending = streaming.values.lazy.compactMap { $0[key] }.first
+            guard let value = pending ?? completed[key] else { return nil }
             return Dialogue.recognized(block, text: value.translation)
         }
         return PageTranslation(summary: summary, dialogues: dialogues,
@@ -198,7 +214,9 @@ private final class PipelineState: @unchecked Sendable {
         }.joined()
         guard signature != lastPublication else { return }
         lastPublication = signature; hasPublished = true
-        if firstResult == nil, value.dialogues.contains(where: { $0.preserveOriginal != true && $0.replacementAllowed != false }) {
+        if firstResult == nil, value.dialogues.contains(where: {
+            $0.preserveOriginal != true && (!renderPatches || $0.replacementAllowed != false)
+        }) {
             firstResult = Date().timeIntervalSince(began)
         }
         // Serialization also prevents an old network callback overtaking a newer
@@ -208,7 +226,7 @@ private final class PipelineState: @unchecked Sendable {
 
     func accept(_ incoming: OCRPage, final: Bool) {
         let value = TranslationPipeline.applyingCorrections(incoming, corrections: Array(corrections.values))
-        let ready = final ? nil : Set(value.blocks.filter(TranslationPipeline.earlyPatchIsReady).map(\.id))
+        let ready = final || !renderPatches ? nil : Set(value.blocks.filter(TranslationPipeline.earlyPatchIsReady).map(\.id))
         condition.lock()
         guard !runner.isCancelled, !isFinal else { condition.unlock(); return }
         guard Set(value.blocks.map(\.id)).count == value.blocks.count else {
@@ -220,16 +238,29 @@ private final class PipelineState: @unchecked Sendable {
         publish(); condition.broadcast(); condition.unlock()
     }
 
-    func nextBatch() -> OCRPage? {
+    func nextBatch() -> TranslationBatch? {
         condition.lock(); defer { condition.unlock() }
         while !runner.isCancelled, error == nil {
             if let geometry {
-                let blocks = geometry.blocks.filter {
-                    TranslationPipeline.correction(for: $0, in: Array(corrections.values)) == nil && !attempted.contains(SourceRevision($0))
-                }
-                if !blocks.isEmpty {
-                    attempted.formUnion(blocks.map(SourceRevision.init))
-                    return OCRPage(blocks: blocks, skippedCount: 0, elapsed: geometry.elapsed)
+                let verified = isFinal || geometry.verifiedText == true
+                let preview = scheduling == .verifiedWithPreview && !verified
+                    && translationBatches == 0 && geometry.previewBatch == true
+                let mayTranslate = verified || scheduling == .progressive || preview
+                if mayTranslate {
+                    let blocks = geometry.blocks.filter {
+                        TranslationPipeline.correction(for: $0, in: Array(corrections.values)) == nil
+                            && !attempted.contains(SourceRevision($0))
+                    }
+                    if !blocks.isEmpty {
+                        attempted.formUnion(blocks.map(SourceRevision.init))
+                        translationBatches += 1
+                        let batch = TranslationBatch(id: translationBatches,
+                            page: OCRPage(blocks: blocks, skippedCount: 0, elapsed: geometry.elapsed,
+                                          verifiedText: verified, previewBatch: preview))
+                        streaming[batch.id] = [:]
+                        if activeSince == nil { activeSince = Date() }
+                        return batch
+                    }
                 }
             }
             if isFinal { return nil }
@@ -248,28 +279,39 @@ private final class PipelineState: @unchecked Sendable {
         return result
     }
 
-    func update(_ value: PageTranslation, for batch: OCRPage, elapsed: Double) {
+    func update(_ value: PageTranslation, for batch: TranslationBatch) {
         condition.lock(); defer { condition.unlock() }
         guard !runner.isCancelled else { return }
         // Preview callbacks are cumulative within this translation batch. Replace
         // them, rather than accidentally retaining entries a provider withdrew.
-        streaming = mapped(value, for: batch)
-        activeTime = elapsed; publish()
+        streaming[batch.id] = mapped(value, for: batch.page)
+        publish()
     }
 
-    func finish(_ value: Result<PageTranslation, Error>, for batch: OCRPage, elapsed: Double) {
+    func finish(_ value: Result<PageTranslation, Error>, for batch: TranslationBatch) -> Bool {
         condition.lock(); defer { condition.unlock() }
-        translationTime += elapsed; activeTime = 0; streaming = [:]
+        streaming.removeValue(forKey: batch.id)
+        if streaming.isEmpty, let since = activeSince {
+            translationTime += Date().timeIntervalSince(since); activeSince = nil
+        }
         switch value {
         case .success(let translation):
-            for (key, dialogue) in mapped(translation, for: batch) { completed[key] = dialogue }
+            let values = mapped(translation, for: batch.page)
+            for (key, dialogue) in values { completed[key] = dialogue }
+            if batch.page.previewBatch == true {
+                attempted.subtract(batch.page.blocks.map(SourceRevision.init).filter { values[$0] == nil })
+            }
             if !translation.summary.isEmpty { summary = translation.summary }
             if !translation.notes.isEmpty, !notes.contains(translation.notes) { notes.append(translation.notes) }
             publish()
         case .failure(let failure):
-            if error == nil || error is CancellationError { error = failure }
+            if batch.page.previewBatch == true, (failure as? AppError)?.needsUserAction != true {
+                // A missed preview is eligible for translation from verified text.
+                attempted.subtract(batch.page.blocks.map(SourceRevision.init))
+            } else if error == nil || error is CancellationError { error = failure }
         }
         condition.broadcast()
+        return error != nil
     }
 
     func result() throws -> (PageTranslation, PageTimings) {

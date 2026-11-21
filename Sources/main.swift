@@ -245,6 +245,9 @@ func selfTest() throws {
               "quoted braces, escaped quotes and Unicode do not split streamed dialogue")
     let duplicateChunk = firstChunk + #",{"id":"b1","text":"重复"}"#
     let foreignChunk = #"{"status":"ok","message":"","translations":[{"id":"foreign","text":"未知"}"#
+    let translationsFirst = #"{"translations":[{"id":"b1","text":"早上好"}"#
+    try check(TranslationStream.preview(translationsFirst, ocr: originalOCR)?.dialogues.first?.translation == "早上好",
+              "stream previews a completed translation before the response status arrives")
     try check(TranslationStream.preview(duplicateChunk, ocr: originalOCR) == nil
               && TranslationStream.preview(foreignChunk, ocr: originalOCR) == nil,
               "streamed duplicate or foreign IDs never enter the overlay")

@@ -13,6 +13,13 @@ struct BubbleCorrectionTests {
                                 replacementPNG: Data([1, 2, 3]), replacementAllowed: true,
                                 layoutBounds: bounds, vertical: true, fontSize: 22)
         let original = Dialogue.recognized(geometry, text: "早上好")
+        try check(BubbleCorrection.canReuseTranslation(original, recognizedSource: original.original)
+                  && !BubbleCorrection.canReuseTranslation(original, recognizedSource: "こんばんは"),
+                  "recognizing unchanged original text skips an unnecessary translation request")
+        let unreadable = Dialogue.recognized(geometry, text: "□")
+        try check(!BubbleCorrection.canReuseTranslation(unreadable, recognizedSource: geometry.text)
+                  && !BubbleCorrection.canReuseTranslation(BubbleCorrection.restored(original), recognizedSource: geometry.text),
+                  "unconfirmed or manually restored bubbles remain eligible for translation")
         let changed = try BubbleCorrection.edited(original, source: "  こんばんは  ", translation: " 晚上好 ")
         try check(changed.original == "こんばんは" && changed.translation == "晚上好", "manual source and translation edits are paired")
         try check(changed.replacementPNG == original.replacementPNG && changed.bounds?.x == bounds.x

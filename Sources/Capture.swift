@@ -263,9 +263,10 @@ final class ReaderCapture {
         return windows
     }
 
-    func capture(maxDimension: CGFloat = 2600, retainedWindow: CGWindowID? = nil) async throws -> CapturedPage {
+    func capture(maxDimension: CGFloat = 2600, retainedWindow: CGWindowID? = nil,
+                 expectedWindow: CGWindowID? = nil) async throws -> CapturedPage {
         let revision = revision
-        let target = retainedWindow ?? Self.visibleWindowID(processID: source?.processID ?? 0)
+        let target = retainedWindow ?? expectedWindow ?? Self.visibleWindowID(processID: source?.processID ?? 0)
         if let scope = readingScope, target != scope.windowID { throw ReadingScopeError.changed }
         if retainedWindow == nil, selectedID != target || !windows.contains(where: { $0.windowID == target }) {
             _ = try await refresh()

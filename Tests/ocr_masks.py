@@ -131,6 +131,7 @@ class TextHandoffTests(unittest.TestCase):
                 time.sleep(.005)
             draft = json.loads((directory / 'text.json').read_text())
             self.assertTrue(task.is_alive())
+            self.assertTrue(draft['verifiedText'])
             self.assertEqual(draft['skippedCount'], 2)
             self.assertFalse(draft['blocks'][0]['replacementAllowed'])
             self.assertIsNone(draft['blocks'][0]['replacementPNG'])
@@ -141,6 +142,17 @@ class TextHandoffTests(unittest.TestCase):
             self.assertEqual([b['id'] for b in final['page']['blocks']], [b['id'] for b in draft['blocks']])
             self.assertEqual(final['page']['blocks'][0]['replacementPNG'], 'verified-patch')
             self.assertEqual(json.loads((directory / 'text.json').read_text()), draft)
+
+    def test_text_only_completion_needs_neither_erasure_futures_nor_a_patch_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            worker['finish_page'](directory, [self.block()], 0, {}, time.monotonic(), make_patches=False)
+            result = json.loads((directory / 'state.json').read_text())
+            self.assertEqual(result['phase'], 'done')
+            self.assertTrue(result['page']['verifiedText'])
+            self.assertTrue(result['page']['textOnly'])
+            self.assertIsNone(result['page']['blocks'][0].get('replacementPNG'))
+            self.assertFalse((directory / 'text.json').exists())
 
     def test_cancel_during_repair_does_not_wait_for_future_or_publish_done(self):
         with tempfile.TemporaryDirectory() as folder:

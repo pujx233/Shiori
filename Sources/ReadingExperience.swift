@@ -167,6 +167,7 @@ struct GlossaryPlan {
 struct CorrectionSnapshot {
     let translation: PageTranslation
     let profile: WorkProfile?
+    var textOnly: Bool? = nil
 }
 
 struct CorrectionHistory {
