@@ -46,7 +46,7 @@ enum AppCacheManager {
                 let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
                 guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
                 if name == "Translations" {
-                    guard let data = try? Data(contentsOf: file), let entry = try? JSONDecoder().decode(CacheEntry.self, from: data) else { continue }
+                    guard let data = try? Data(contentsOf: file), let entry = try? JSONDecoder().decode(LegacyPageResult.self, from: data) else { continue }
                     // Retain old versions' manual work too, before it has been
                     // migrated into the separate non-evicting corrections store.
                     if entry.translation.dialogues.contains(where: { $0.userEdited == true || $0.userRestoredOriginal == true }) { continue }

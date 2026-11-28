@@ -65,13 +65,13 @@ private final class OCRVisionMailbox: @unchecked Sendable {
     }
 
     func start(image: CGImage, imageFile: URL,
-               recognize: @escaping @Sendable (CGImage, URL, CommandRunner) -> [[String: Any]]) {
+               recognize: @escaping @Sendable (CGImage, URL, CommandRunner) -> [[String: Any]]?) {
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             guard !runner.isCancelled else { return }
             let hints = recognize(image, imageFile, runner)
             lock.lock(); defer { lock.unlock() }
             guard !closed, !runner.isCancelled, !parent.isCancelled else { return }
-            if let data = try? JSONSerialization.data(withJSONObject: hints) {
+            if let data = try? JSONSerialization.data(withJSONObject: hints as Any? ?? NSNull(), options: [.fragmentsAllowed]) {
                 try? data.write(to: directory.appendingPathComponent("hints.json"), options: .atomic)
             }
         }
@@ -108,21 +108,47 @@ struct OCRBlock: Codable {
         return hints[key]
     }
 }
+enum OCRReview: String, Codable {
+    case complete, unavailable
+}
+
+struct OCRRegionCounts: Codable {
+    let detected: Int
+    let recovered: Int
+    let supplemented: Int
+    let grouped: Int
+    let excluded: [String: Int]
+
+    var diagnosticState: [String: Any] {
+        ["detected": detected, "recovered": recovered, "supplemented": supplemented,
+         "grouped": grouped, "excluded": excluded]
+    }
+}
+
 struct OCRStageTimings: Codable {
     let detection: Double
     let recognition: Double
     let verification: Double
     let visionWait: Double
+    var patchWait: Double? = nil
 }
 
 struct OCRPage: Codable {
-    let blocks: [OCRBlock]
+    var blocks: [OCRBlock]
     let skippedCount: Int
     let elapsed: Double
-    var verifiedText: Bool? = nil
     var textOnly: Bool? = nil
-    var previewBatch: Bool? = nil
+    var review: OCRReview = .complete
     var stages: OCRStageTimings? = nil
+    var regions: OCRRegionCounts? = nil
+
+    func hasSameText(as other: OCRPage) -> Bool {
+        review == other.review && blocks.count == other.blocks.count
+            && zip(blocks, other.blocks).allSatisfy { a, b in
+                a.id == b.id && a.text == b.text && a.uncertainFragments == b.uncertainFragments
+                    && a.translationKind == b.translationKind
+            }
+    }
 }
 
 // The serial worker keeps its local models warm between pages. Cancellation and
@@ -130,21 +156,22 @@ struct OCRPage: Codable {
 final class LocalOCR: @unchecked Sendable {
     private let serial = NSLock()
     private let visionPreparation: OCRVisionPreparation
-    private let visionHints: @Sendable (CGImage, URL, CommandRunner) -> [[String: Any]]
+    private let visionHints: @Sendable (CGImage, URL, CommandRunner) -> [[String: Any]]?
     private let root: URL
     private let script: URL
-    private let cache: URL
+    private let recentLock = NSLock()
+    private var recent = RecentPages<String, OCRPage>()
     private var process: Process?
     private var input: FileHandle?
     private var runtime: URL?
     private var log: FileHandle?
     private var deferredPatchesDigest: String?
-    static let engineVersion = "manga-ocr-20"
+    static let engineVersion = "manga-ocr-22"
 
     init(support: URL, resources: URL, engineRoot: URL? = nil,
          visionPreparation: OCRVisionPreparation? = nil,
-         visionHints: (@Sendable (CGImage, CommandRunner) -> [[String: Any]])? = nil,
-         visionFileHints: (@Sendable (CGImage, URL, CommandRunner) -> [[String: Any]])? = nil) throws {
+         visionHints: (@Sendable (CGImage, CommandRunner) -> [[String: Any]]?)? = nil,
+         visionFileHints: (@Sendable (CGImage, URL, CommandRunner) -> [[String: Any]]?)? = nil) throws {
         let helper = Self.visionHelperURL(resources: resources)
         self.visionPreparation = visionPreparation ?? OCRVisionPreparation {
             LocalOCR.prepareVision(runner: $0, helperURL: helper)
@@ -159,10 +186,7 @@ final class LocalOCR: @unchecked Sendable {
             }
         }
         root = engineRoot ?? support.appendingPathComponent("OCR")
-        cache = support.appendingPathComponent("Recognition")
         script = resources.appendingPathComponent("ocr_worker.py")
-        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        trimCache()
     }
     deinit { shutdown() }
 
@@ -234,12 +258,9 @@ final class LocalOCR: @unchecked Sendable {
         try input!.write(contentsOf: request)
     }
 
-    // Atomic cache files can be inspected by the UI without joining the active
-    // recognition job or starting either OCR engine.
-    func cachedRecognition(for page: CapturedPage) -> OCRPage? {
-        let url = cache.appendingPathComponent(page.digest + "-" + Self.engineVersion + ".json")
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(OCRPage.self, from: data)
+    // The UI can read recent geometry without waiting for the active page.
+    func recentRecognition(for page: CapturedPage) -> OCRPage? {
+        recentLock.withLock { recent.lookup(page.digest) }
     }
 
     // A selected region is already localized. Running page detection on this
@@ -297,22 +318,14 @@ final class LocalOCR: @unchecked Sendable {
         throw AppError.message("这个气泡识字超时，请重试。")
     }
 
-    // Called on the recognition queue. Text-ready emits cumulative snapshots as
-    // reliable balloons finish and Vision supplements/rechecks the page. IDs are
-    // stable; text can change after verification. Only completed closed-balloon
-    // patches can render before the final page.
+    // The text callback has the final regions and OCR strings. Only background
+    // repairs can remain pending when translation starts.
     func recognize(page: CapturedPage, runner: CommandRunner, force: Bool = false,
-                   streamDrafts: Bool = true, earlyTranslation: Bool = false,
                    makePatches: Bool = true, progress: (String) -> Void,
                    onTextReady: ((OCRPage) -> Void)? = nil) throws -> OCRPage {
         serial.lock(); defer { serial.unlock() }
         try runner.checkCancellation()
-        let key = page.digest + "-" + Self.engineVersion + ".json"
-        let cached = cache.appendingPathComponent(key)
-        if !force, var result = cachedRecognition(for: page), !makePatches || result.textOnly != true {
-            CacheFiles.touch(cached)
-            result.verifiedText = true
-            try runner.checkCancellation()
+        if !force, let result = recentRecognition(for: page), !makePatches || result.textOnly != true {
             onTextReady?(result)
             try runner.checkCancellation()
             return result
@@ -328,8 +341,7 @@ final class LocalOCR: @unchecked Sendable {
         progress(patchOnly ? "整理画面…" : "检查文字…")
         do {
             try send(["directory": job.path, "kind": patchOnly ? "patches" : "page", "pageDigest": page.digest,
-                      "hintsPending": !patchOnly, "streamDrafts": streamDrafts,
-                      "earlyTranslation": earlyTranslation, "makePatches": makePatches])
+                      "hintsPending": !patchOnly, "makePatches": makePatches])
         }
         catch {
             stopProcess(); cleanup()
@@ -350,7 +362,7 @@ final class LocalOCR: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(90)
         var cancelStart: Date?
         var lastProgress = ""
-        var deliveredText: Data?
+        var deliveredText = false
         struct State: Decodable {
             let phase: String
             var completed: Int?; var total: Int?; var page: OCRPage?; var message: String?
@@ -368,11 +380,10 @@ final class LocalOCR: @unchecked Sendable {
             }
             let state = (try? Data(contentsOf: job.appendingPathComponent("state.json")))
                 .flatMap { try? JSONDecoder().decode(State.self, from: $0) }
-            if !runner.isCancelled,
+            if !runner.isCancelled, !deliveredText,
                let data = try? Data(contentsOf: job.appendingPathComponent("text.json")),
-               data != deliveredText,
                let text = try? JSONDecoder().decode(OCRPage.self, from: data) {
-                deliveredText = data
+                deliveredText = true
                 onTextReady?(text)
             }
             if let state {
@@ -383,17 +394,13 @@ final class LocalOCR: @unchecked Sendable {
                     throw AppError.message(state.message ?? "本地识字失败。")
                 case "done":
                     try runner.checkCancellation()
-                    guard var result = state.page else { throw AppError.message("识字结果不完整。") }
-                    result.verifiedText = true
-                    if deliveredText == nil { onTextReady?(result) }
+                    guard let result = state.page else { throw AppError.message("识字结果不完整。") }
+                    if !deliveredText { onTextReady?(result) }
                     try runner.checkCancellation()
-                    try JSONEncoder().encode(result).write(to: cached, options: .atomic)
-                    trimCache()
-                    if runner.isCancelled {
-                        try? FileManager.default.removeItem(at: cached)
-                        throw CancellationError()
+                    if result.review == .complete {
+                        recentLock.withLock { recent.store(result, for: page.digest) }
+                        if result.textOnly == true, state.retainsPatches == true { deferredPatchesDigest = page.digest }
                     }
-                    if result.textOnly == true, state.retainsPatches == true { deferredPatchesDigest = page.digest }
                     return result
                 default: break
                 }
@@ -408,10 +415,6 @@ final class LocalOCR: @unchecked Sendable {
         }
         stopProcess(); cleanup()
         throw AppError.message("本地识字超时，请重试。")
-    }
-
-    private func trimCache() {
-        CacheFiles.trim(cache, maxBytes: 128 * 1024 * 1024)
     }
 
     static func visionHelperURL(resources: URL) -> URL {
@@ -451,16 +454,16 @@ final class LocalOCR: @unchecked Sendable {
 
     static func textHints(in image: CGImage, runner: CommandRunner? = nil,
                           helperURL: URL? = nil, imageFile: URL? = nil,
-                          helperTimeout: TimeInterval = 25) -> [[String: Any]] {
+                          helperTimeout: TimeInterval = 25) -> [[String: Any]]? {
         let helper = helperURL ?? bundledVisionHelper
-        guard runner?.isCancelled != true else { return [] }
+        guard runner?.isCancelled != true else { return nil }
         // A missing helper is expected in standalone source tests. A present but
         // failed helper never falls back into another expensive in-process run.
         guard FileManager.default.fileExists(atPath: helper.path) else {
             return VisionRecognition.textHints(in: image, isCancelled: { runner?.isCancelled == true },
                 perform: { request, work in performVision(request, runner: runner, perform: work) })
         }
-        guard FileManager.default.isExecutableFile(atPath: helper.path) else { return [] }
+        guard FileManager.default.isExecutableFile(atPath: helper.path) else { return nil }
         // Recognition already owns a PNG in its unique job directory. Borrow it
         // for this request; only the job's owner may remove this file.
         if let imageFile {
@@ -473,17 +476,17 @@ final class LocalOCR: @unchecked Sendable {
                                                     attributes: [.posixPermissions: 0o700])
             defer { try? FileManager.default.removeItem(at: directory) }
             let file = directory.appendingPathComponent("page.png")
-            guard let destination = CGImageDestinationCreateWithURL(file as CFURL, "public.png" as CFString, 1, nil) else { return [] }
+            guard let destination = CGImageDestinationCreateWithURL(file as CFURL, "public.png" as CFString, 1, nil) else { return nil }
             CGImageDestinationAddImage(destination, image, nil)
-            guard CGImageDestinationFinalize(destination) else { return [] }
+            guard CGImageDestinationFinalize(destination) else { return nil }
             return helperTextHints(imageFile: file, helper: helper, runner: runner, timeout: helperTimeout)
         } catch {
-            return []
+            return nil
         }
     }
 
     private static func helperTextHints(imageFile: URL, helper: URL, runner: CommandRunner?,
-                                        timeout: TimeInterval) -> [[String: Any]] {
+                                        timeout: TimeInterval) -> [[String: Any]]? {
         // A helper timeout must not cancel the page's mailbox: it still needs
         // to deliver [] so detector/Manga OCR results can finish normally.
         let childRunner = CommandRunner()
@@ -495,10 +498,10 @@ final class LocalOCR: @unchecked Sendable {
                                              directory: helper.deletingLastPathComponent(), timeout: timeout)
             try childRunner.checkCancellation()
             guard result.status == 0,
-                  let hints = try JSONSerialization.jsonObject(with: result.stdout) as? [[String: Any]] else { return [] }
+                  let hints = try JSONSerialization.jsonObject(with: result.stdout) as? [[String: Any]] else { return nil }
             return hints
         } catch {
-            return []
+            return nil
         }
     }
 

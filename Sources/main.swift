@@ -70,7 +70,7 @@ func selfTest() throws {
     try check(!BrowserContent.isToolbarEditor(role: "AXTextField", frame: CGRect(x: 50, y: 100, width: 100, height: 25), viewport: viewport)
               && !BrowserContent.isToolbarEditor(role: "AXButton", frame: CGRect(x: 50, y: 20, width: 30, height: 25), viewport: viewport),
               "webpage fields and browser navigation buttons do not pause page detection")
-    let cache = try TranslationCache(directory: root.appendingPathComponent("cache"))
+    var recent = RecentPages<PageKey, PageResult>()
     let safeMask = BubbleCover.make(image: image, rect: CGRect(x: 880, y: 220, width: 620, height: 520))
     try check(safeMask != nil, "light speech bubbles can be replaced")
     if let mask = safeMask, let data = mask.dataProvider?.data {
@@ -102,22 +102,17 @@ func selfTest() throws {
     try check(bubble.rect(in: CGSize(width: 800, height: 500)) == CGRect(x: 600, y: 50, width: 160, height: 200),
               "bubble coordinates follow window scaling")
     let translation = PageTranslation(summary: "测试", dialogues: [Dialogue(location: "右", original: "おはよう", translation: "早上好", bounds: bubble)], notes: "")
-    let legacyKey = SHA256.hash(data: Data((page.digest + first.cacheNamespace).utf8)).map { String(format: "%02x", $0) }.joined()
-    let legacyEntry = CacheEntry(id: legacyKey, options: first, pageDigest: page.digest,
-                                translation: translation, createdAt: Date(), elapsed: 1)
-    try JSONEncoder().encode(legacyEntry).write(to: cache.directory.appendingPathComponent(legacyKey + ".json"))
-    try check(cache.lookup(page: page, options: first) == nil,
-              "old full-page cache cannot restore geometry or erasure patches from a previous OCR engine")
-    _ = try cache.save(page: page, options: first, translation: translation, elapsed: 1)
-    try check(cache.lookup(page: page, options: first) != nil, "same page and model reuse cache")
-    try check(cache.lookup(page: page, options: second) == nil, "switching models does not reuse another model's translation")
-    try check(cache.lookup(page: page, options: deep) == nil, "changing reasoning depth has a separate cache")
-    try check(cache.lookup(page: page, options: TranslationOptions(model: "model-a", effort: "low", promptVersion: 1)) == nil,
-              "old translations without positions are not used for overlays")
+    let key = PageKey(digest: page.digest, options: first)
+    recent.store(PageResult(options: first, pageDigest: page.digest, translation: translation, elapsed: 1), for: key)
+    try check(recent.lookup(key)?.translation.dialogues.first?.bounds?.x == 750,
+              "backtracking preserves the same page's bubble positions")
+    try check(recent.lookup(PageKey(digest: page.digest, options: second)) == nil
+              && recent.lookup(PageKey(digest: page.digest, options: deep)) == nil,
+              "changing model or effort requires new translation")
     let modified = NSBitmapImageRep(cgImage: image)
     modified.setColor(NSColor(deviceRed: 0, green: 0, blue: 0, alpha: 1), atX: 20, y: 20)
     let changed = try CapturedPage(image: modified.cgImage!, displaySize: page.displaySize)
-    try check(cache.lookup(page: changed, options: first) == nil, "a small image change cannot reuse an old page's positions")
+    try check(recent.lookup(PageKey(digest: changed.digest, options: first)) == nil, "a small image change cannot reuse an old page's positions")
     try check(changed.isVisuallySimilar(to: page) && changed.hasSameTextRegions(as: page, regions: [bubble]),
               "a pixel change outside the text can preserve an existing translation without relaxing the cache key")
     try check(changed.hasSameContent(as: page), "isolated pixel noise does not resubmit a page")
@@ -175,10 +170,6 @@ func selfTest() throws {
     let textChange = try CapturedPage(image: modifiedText.cgImage!, displaySize: page.displaySize)
     try check(textChange.isVisuallySimilar(to: page) && !textChange.hasSameTextRegions(as: page, regions: [bubble]),
               "a small text change is detected even when the overall page looks similar")
-    let reloaded = try TranslationCache(directory: root.appendingPathComponent("cache"))
-    try check(reloaded.lookup(page: page, options: first)?.translation.dialogues.first?.translation == "早上好", "cache survives relaunch")
-    try check(reloaded.lookup(page: page, options: first)?.translation.dialogues.first?.bounds?.x == 750,
-              "cached translations preserve bubble positions")
     let run = try CommandRunner().run(executable: URL(fileURLWithPath: "/bin/echo"), arguments: ["ok"], directory: root)
     try check(run.status == 0 && String(decoding: run.stdout, as: UTF8.self).contains("ok"), "subprocess output is collected")
     let cancelled = CommandRunner(); cancelled.cancel()
@@ -227,14 +218,10 @@ func selfTest() throws {
             try check(!error.localizedDescription.hasPrefix("FAIL"), "empty, mismatched, duplicate and refused results are rejected")
         }
     }
-    let textCache = try TextTranslationCache(directory: root.appendingPathComponent("text-cache"))
     let originalOCR = OCRPage(blocks: [
         OCRBlock(id: "b1", text: "おはよう", bounds: bubble, replacementPNG: Data([1])),
         OCRBlock(id: "b2", text: "雨ですね", bounds: bubble, replacementPNG: Data([2]))
     ], skippedCount: 0, elapsed: 0)
-    let completeReply = TranslationReply(status: "ok", message: "", translations: [
-        .init(id: "b1", text: "早上好"), .init(id: "b2", text: "下雨了呢")])
-    let completeTranslation = try completeReply.resolve(ocr: originalOCR)
     let firstChunk = #"{"status":"ok","message":"","translations":[{"id":"b1","text":"早上好"}"#
     let incompleteChunk = firstChunk + #",{"id":"b2","text":"还在输"#
     try check(TranslationStream.preview(firstChunk, ocr: originalOCR)?.dialogues.count == 1
@@ -260,54 +247,17 @@ func selfTest() throws {
     } catch let error as AppError {
         try check(!error.localizedDescription.hasPrefix("FAIL"), "final streamed output still requires every expected ID")
     }
-    try textCache.save(ocr: originalOCR, options: first, translation: completeTranslation)
     let movedBounds = DialogueBounds(x: 10, y: 20, width: 100, height: 100)
     let movedOCR = OCRPage(blocks: [
         OCRBlock(id: "new1", text: "おはよう", bounds: movedBounds, replacementPNG: Data([3])),
         OCRBlock(id: "new2", text: "雨ですね", bounds: movedBounds, replacementPNG: Data([4]))
     ], skippedCount: 0, elapsed: 0)
-    let reused = textCache.lookup(ocr: movedOCR, options: first)
-    try check(reused?.dialogues.map(\.translation) == ["早上好", "下雨了呢"], "identical ordered OCR reuses translations after window changes")
-    try check(reused?.dialogues.first?.location == "new1" && reused?.dialogues.first?.bounds?.x == 10
-              && reused?.dialogues.first?.replacementPNG == Data([3]), "reused text always binds to current IDs, coordinates and glyph patches")
-    try textCache.save(ocr: recognized, options: first, translation: unclear)
-    try check(textCache.lookup(ocr: recognized, options: first)?.dialogues.first?.uncertainRanges == unclear.dialogues[0].uncertainRanges,
-              "uncertain-fragment metadata survives text cache reuse")
-    try textCache.save(ocr: recognized, options: second, translation: unreadable)
-    try check(textCache.lookup(ocr: recognized, options: second)?.preservedCount == 1,
-              "an unreadable cached result cannot erase the original on return")
-    try check(textCache.lookup(ocr: movedOCR, options: second) == nil
-              && textCache.lookup(ocr: movedOCR, options: deep) == nil, "text cache isolates model and effort")
-    let reversedOCR = OCRPage(blocks: Array(movedOCR.blocks.reversed()), skippedCount: 0, elapsed: 0)
-    let editedOCR = OCRPage(blocks: [OCRBlock(id: "b1", text: "おはよう！", bounds: bubble), movedOCR.blocks[1]], skippedCount: 0, elapsed: 0)
-    try check(textCache.lookup(ocr: reversedOCR, options: first) == nil
-              && textCache.lookup(ocr: editedOCR, options: first) == nil, "changed text or reading order does not reuse translation context")
-    let partialTranslation = try TranslationReply(status: "partial", message: "文字不清晰", translations: [.init(id: "new1", text: "早上好")]).resolve(ocr: movedOCR)
-    try textCache.save(ocr: movedOCR, options: second, translation: partialTranslation)
-    try check(textCache.lookup(ocr: movedOCR, options: second) == nil, "partial translations are not cached as a complete OCR input")
     let countedOCR = OCRPage(blocks: movedOCR.blocks, skippedCount: 3, elapsed: 0)
     let counted = try TranslationReply(status: "partial", message: "文字不清晰", translations: [.init(id: "new1", text: "早上好")]).resolve(ocr: countedOCR)
     try check(counted.ocrSkippedCount == 3 && counted.untranslatedCount == 1 && counted.skippedCount == 4,
               "unrecognized candidates and untranslated dialogue are counted separately")
     let openOCR = OCRPage(blocks: [OCRBlock(id: "open", text: "雨", bounds: bubble, replacementAllowed: false)], skippedCount: 0, elapsed: 0)
     let openTranslation = try TranslationReply(status: "ok", message: "", translations: [.init(id: "open", text: "下雨")]).resolve(ocr: openOCR)
-    try textCache.save(ocr: openOCR, options: first, translation: openTranslation)
-    try check(textCache.lookup(ocr: openOCR, options: first)?.dialogues.first?.replacementAllowed == false,
-              "open text is translated and cached without borrowing an erasure mask")
-    let limited = root.appendingPathComponent("limited")
-    try FileManager.default.createDirectory(at: limited, withIntermediateDirectories: true)
-    for i in 0..<4 {
-        let file = limited.appendingPathComponent("\(i).json")
-        try Data(repeating: 1, count: 80).write(to: file)
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: Double(i))], ofItemAtPath: file.path)
-    }
-    CacheFiles.touch(limited.appendingPathComponent("0.json"))
-    CacheFiles.trim(limited, maxBytes: 170)
-    let retained = try FileManager.default.contentsOfDirectory(atPath: limited.path)
-    try check(Set(retained) == Set(["0.json", "3.json"]), "byte budget evicts old cache files while retaining recently used entries")
-    CacheFiles.trim(limited, maxBytes: 1000, maxCount: 1)
-    let finalCount = try FileManager.default.contentsOfDirectory(atPath: limited.path).count
-    try check(finalCount == 1, "count limit also applies below the byte budget")
     try MainActor.assumeIsolated {
         try check(FittedText.make("早上好", rect: CGRect(x: 0, y: 0, width: 100, height: 50)) != nil, "complete translation fits")
         let trimmedGap = FittedText.make(" \n🌧明□去", rect: CGRect(x: 0, y: 0, width: 150, height: 60),
@@ -323,8 +273,8 @@ func selfTest() throws {
         _ = NSApplication.shared
         let overlay = MangaOverlay()
         defer { overlay.stop() }
-        let unreadableEntry = CacheEntry(id: "unreadable-result", options: first, pageDigest: page.digest,
-            translation: unreadable, createdAt: Date(), elapsed: 1)
+        let unreadableEntry = PageResult(options: first, pageDigest: page.digest,
+            translation: unreadable, elapsed: 1)
         overlay.show(unreadableEntry, page: page, windowID: 0, processID: ProcessInfo.processInfo.processIdentifier, topInset: 0)
         try check(overlay.renderedCount == 0 && overlay.omittedSummary.isEmpty,
                   "unreadable originals are intentionally preserved, not reported as display failures")
@@ -334,19 +284,19 @@ func selfTest() throws {
                   "connected balloons preserve uncertainty styling across a Unicode split")
         let hiddenTranslation = PageTranslation(summary: "", dialogues: [Dialogue(location: "b1", original: "おはよう",
             translation: "早上好", bounds: DialogueBounds(x: 550, y: 220, width: 387.5, height: 520))], notes: "")
-        let hiddenEntry = CacheEntry(id: "background-result", options: first, pageDigest: page.digest,
-                                    translation: hiddenTranslation, createdAt: Date(), elapsed: 1)
+        let hiddenEntry = PageResult(options: first, pageDigest: page.digest,
+                                    translation: hiddenTranslation, elapsed: 1)
         overlay.show(hiddenEntry, page: page, windowID: 0,
                      processID: ProcessInfo.processInfo.processIdentifier, topInset: 0)
         try check(overlay.renderedCount == 1, "a result arriving while the reader is hidden still lays out its translation")
         try check(overlay.diagnosticState["visible"] as? Bool == false, "prepared translations stay hidden while the reader is hidden")
-        let unfitEntry = CacheEntry(id: "unfit-result", options: first, pageDigest: page.digest,
-                                   translation: tenResult, createdAt: Date(), elapsed: 1)
+        let unfitEntry = PageResult(options: first, pageDigest: page.digest,
+                                   translation: tenResult, elapsed: 1)
         overlay.show(unfitEntry, page: page, windowID: 0, processID: ProcessInfo.processInfo.processIdentifier, topInset: 0)
         try check(overlay.renderedCount == 0 && overlay.omittedSummary.contains("气泡空间不足 10 处"),
                   "display failures are counted separately with a reason, without dropping translations")
-        let openEntry = CacheEntry(id: "open-result", options: first, pageDigest: page.digest,
-                                  translation: openTranslation, createdAt: Date(), elapsed: 1)
+        let openEntry = PageResult(options: first, pageDigest: page.digest,
+                                  translation: openTranslation, elapsed: 1)
         overlay.show(openEntry, page: page, windowID: 0, processID: ProcessInfo.processInfo.processIdentifier, topInset: 0)
         try check(overlay.renderedCount == 0 && overlay.omittedSummary.contains("保留原图 1 处"),
                   "open text is available to copy while its artwork stays unchanged")
@@ -405,7 +355,7 @@ if arguments.contains("--render-panel") || arguments.contains("--self-test") || 
                 let recognized = try ocr.recognize(page: page, runner: CommandRunner(), progress: { fputs($0 + "\n", stderr) })
                 print(String(decoding: try encoder.encode(recognized), as: UTF8.self))
             } else {
-                let google = arguments.contains("--google") ? try GoogleTranslationClient(cacheDirectory: job.appendingPathComponent("Google"), concurrency: 6) : nil
+                let google = arguments.contains("--google") ? GoogleTranslationClient(concurrency: 6) : nil
                 let client = google == nil ? try CodexClient(resources: Bundle.main.resourceURL!, workspace: job) : nil
                 defer { client?.shutdown(); google?.shutdown() }
                 let options = TranslationOptions(model: google == nil ? model : GoogleTranslationClient.model,
@@ -414,10 +364,10 @@ if arguments.contains("--render-panel") || arguments.contains("--self-test") || 
                 let progress: (String) -> Void = { fputs($0 + "\n", stderr) }
                 let result = try TranslationPipeline.run(runner: runner, began: began, recognize: { ready in
                     try ocr.recognize(page: page, runner: runner, progress: progress, onTextReady: ready)
-                }, translate: { recognized, preview in
+                }, translate: { recognized, context, preview in
                     if let google { return try google.translate(ocr: recognized, options: options, runner: runner, progress: progress, preview: preview).0 }
-                    return try client!.translate(ocr: recognized, options: options, runner: runner, progress: progress, preview: preview).0
-                }, preview: { partial, _ in
+                    return try client!.translate(ocr: recognized, options: options, runner: runner, pageContext: context, progress: progress, preview: preview).0
+                }, preview: { partial, _, _ in
                     fputs(String(format: "PREVIEW=%d/%d AT=%.2fs\n", partial.dialogues.count,
                         partial.dialogues.count + partial.untranslatedCount, Date().timeIntervalSince(began)), stderr)
                 })

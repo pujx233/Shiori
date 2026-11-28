@@ -30,16 +30,25 @@ def cancelled(directory):
     return not directory.exists() or (directory / 'cancel').exists()
 
 
-def read_hints(directory, pending=False, on_wait=None):
+def read_hints(directory, pending=False):
     path = directory / 'hints.json'
     deadline = time.monotonic()+30
     while pending and not path.exists() and not cancelled(directory):
-        if on_wait is not None:
-            on_wait()
         if time.monotonic() >= deadline:
-            raise TimeoutError('System OCR did not finish')
+            return None
         time.sleep(.02)
-    return json.loads(path.read_text()) if path.exists() else []
+    if not path.exists():
+        return None
+    try:
+        result = json.loads(path.read_text())
+        if isinstance(result, list) and all(isinstance(hint, dict) and isinstance(hint.get('text'), str)
+                and isinstance(hint.get('confidence'), (int, float)) and isinstance(hint.get('box'), list)
+                and len(hint['box']) == 4 and all(isinstance(value, (int, float)) for value in hint['box'])
+                for hint in result):
+            return result
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def bubble_regions(gray):
@@ -168,7 +177,6 @@ def recognized_boxes(ocr, image, boxes, languages, font_sizes, directory, batch_
             if cancelled(directory):
                 return
             index = indices[offset]
-            write_state(directory, phase='recognizing', completed=first+offset, total=len(boxes))
             yield index, component, box, recognize_text(ocr, crop, languages[component], font_sizes[component], text)
 
 
@@ -183,14 +191,24 @@ def supplement_candidates(candidates, hints):
     result = list(candidates)
     for hint in hints:
         box = hint['box']
+        kana = sum('\u3041' <= char <= '\u30fa' for char in hint['text'])
+        confidence = hint['confidence']
+        kanji = any('\u3400' <= char <= '\u9fff' for char in hint['text'])
+        japanese = (kana >= 3 and confidence >= .5
+                    or kana > 0 and confidence >= .8
+                    or kanji and confidence >= .85)
         matches = [b for b in result if coverage(box, b.xyxy) > .3 or coverage(b.xyxy, box) > .5]
         if matches:
             for block in matches:
-                kana = sum('\u3041' <= char <= '\u30fa' for char in hint['text'])
-                if block.language == 'unknown' or (block.language == 'eng' and hint['confidence'] >= .5
-                    and kana >= 3 and coverage(block.xyxy, box) >= .55):
+                if block.language == 'unknown' and (kana or kanji) and confidence >= .55:
                     block.language = 'ja'
-        elif hint['confidence'] >= .55:
+                elif block.language == 'eng' and japanese and coverage(block.xyxy, box) >= .55:
+                    block.language = 'ja'
+            # An oversized English box must not swallow an independently read
+            # Japanese line beside it. Keep that line's own crop and language.
+            if japanese and hint['confidence'] >= .55 and all(block.language == 'eng' for block in matches):
+                result.append(SimpleNamespace(xyxy=box, language='ja', font_size=min(box[2]-box[0], box[3]-box[1])))
+        elif (kana or kanji) and confidence >= .55:
             result.append(SimpleNamespace(xyxy=box, language='ja', font_size=min(box[2]-box[0], box[3]-box[1])))
     return result
 
@@ -256,14 +274,13 @@ def within_reader_content(box, content):
     return overlap >= .8 * max(1, (x2-x1)*(y2-y1))
 
 
-def recover_candidates(image, raw_mask, candidates):
+def recover_candidates(raw_mask, candidates, content):
     """Recover lettering present in CTD's segmentation but absent from its boxes."""
     import cv2
     import numpy as np
     from comic_text_detector.utils.textblock import TextBlock
     height, width = raw_mask.shape
     binary = (raw_mask > 140).astype(np.uint8)
-    content = reader_content_bounds(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
     if content is not None:
         left, top, right, bottom = content
         binary[:, :left] = 0; binary[:, right:] = 0
@@ -738,11 +755,66 @@ def replacement_patch(image, text_mask, box, ink_labels=None, ink_ids=(), open_t
     return base64.b64encode(encoded).decode('ascii') if ok else None
 
 
-def group_candidates(candidates, labels, stats, exterior):
+def text_column(block):
+    x1, y1, x2, y2 = block.xyxy
+    return bool(getattr(block, 'vertical', y2-y1 > (x2-x1)*1.4))
+
+
+def neighboring_text(first, second, labels, component):
+    """Use the connected white region as a prior, then compare text geometry."""
+    a, b = first.xyxy, second.xyxy
+    width = min(a[2]-a[0], b[2]-b[0])
+    height = min(a[3]-a[1], b[3]-b[1])
+    x_overlap = min(a[2], b[2]) - max(a[0], b[0])
+    y_overlap = min(a[3], b[3]) - max(a[1], b[1])
+    if x_overlap > .6*width and y_overlap > .6*height:
+        return True
+    vertical = text_column(first)
+    if vertical != text_column(second):
+        return False
+    font = max(6, min(first.font_size, second.font_size))
+    if max(first.font_size, second.font_size) > 2.3*font:
+        return False
+    span, cross = (y_overlap, x_overlap) if vertical else (x_overlap, y_overlap)
+    length, breadth = (height, width) if vertical else (width, height)
+    if span >= -.75*font and cross >= .55*breadth:
+        return True
+    if span < .2*length or cross < -3*font:
+        return False
+    if cross >= 0:
+        return True
+    # Check straight paths between the columns/rows. A small break in an
+    # outline connects components, but most paths still cross the black rim.
+    a, b = [list(map(int, rectangle)) for rectangle in (a, b)]
+    if vertical:
+        corridor = labels[max(a[1], b[1]):min(a[3], b[3]), min(a[2], b[2]):max(a[0], b[0])]
+        axis = 1
+    else:
+        corridor = labels[min(a[3], b[3]):max(a[1], b[1]), max(a[0], b[0]):min(a[2], b[2])]
+        axis = 0
+    return corridor.size > 0 and (corridor == component).all(axis=axis).mean() >= .45
+
+
+def group_candidates(candidates, labels, stats, exterior, excluded=None, shared=None):
     """Group closed bubbles, but retain unrenderable text for OCR/translation."""
     import numpy as np
     height, width = labels.shape
     groups, font_sizes, languages = {}, {}, {}
+    interiors = {}
+    if excluded is None:
+        excluded = {}
+
+    def exclude(reason):
+        excluded[reason] = excluded.get(reason, 0) + 1
+
+    def add(key, box, block):
+        font_sizes[key] = max(font_sizes.get(key, 0), float(block.font_size))
+        languages.setdefault(key, set()).add(block.language)
+        if key not in groups:
+            groups[key] = box
+            return
+        old = groups[key]
+        groups[key] = [min(old[0], box[0]), min(old[1], box[1]), max(old[2], box[2]), max(old[3], box[3])]
     typical_font = np.median([float(b.font_size) for b in candidates if float(b.font_size) >= 6] or [20])
     component_text_area = {}
     for block in candidates:
@@ -757,6 +829,7 @@ def group_candidates(candidates, labels, stats, exterior):
     japanese_boxes = [(b.xyxy, float(b.font_size)) for b in candidates if b.language == 'ja']
     for index, block in enumerate(candidates):
         if block.language == 'eng':
+            exclude('language')
             continue
         x1, y1, x2, y2 = [int(v) for v in block.xyxy]
         x1, y1, x2, y2 = max(0, x1), max(0, y1), min(width, x2), min(height, y2)
@@ -796,10 +869,12 @@ def group_candidates(candidates, labels, stats, exterior):
             + max(float(other[1])-y2, y1-float(other[3]), 0) ** 2
             <= (max(float(block.font_size), font) * 1.25) ** 2
             for other, font in japanese_boxes)
-        if not closed and block.language != 'ja' and not near_japanese and not getattr(block, 'recovered', False):
+        has_lines = len(getattr(block, 'lines', [])) > 0
+        if not closed and block.language != 'ja' and not near_japanese and not has_lines and not getattr(block, 'recovered', False):
             # Curved lettering often has an unknown language label. Nearby
             # Japanese dialogue can confirm its reading context; isolated URL/UI
             # text still needs independent Japanese evidence from system OCR.
+            exclude('isolated')
             continue
         if closed:
             box = [max(int(bx)+2, x1-margin), max(int(by)+2, y1-margin),
@@ -809,13 +884,28 @@ def group_candidates(candidates, labels, stats, exterior):
             box = [max(0, x1-margin), max(0, y1-margin), min(width, x2+margin), min(height, y2+margin)]
         if box[2] <= box[0] or box[3] <= box[1]:
             continue
-        font_sizes[component] = max(font_sizes.get(component, 0), float(block.font_size))
-        languages.setdefault(component, set()).add(block.language)
-        if component in groups:
-            old = groups[component]
-            groups[component] = [min(old[0], box[0]), min(old[1], box[1]), max(old[2], box[2]), max(old[3], box[3])]
+        if closed:
+            interiors.setdefault(component, []).append((index, box, block))
         else:
-            groups[component] = box
+            add(component, box, block)
+    for component, members in interiors.items():
+        clusters = []
+        for member in members:
+            nearby = [cluster for cluster in clusters if any(
+                neighboring_text(member[2], value[2], labels, component) for value in cluster)]
+            combined = [member]
+            for cluster in nearby:
+                clusters.remove(cluster)
+                combined.extend(cluster)
+            clusters.append(combined)
+        for cluster in clusters:
+            # A leaking outline can connect multiple balloons. Keep separate
+            # crops while retaining evidence for safe local background repair.
+            key = component if len(clusters) == 1 else -min(member[0] for member in cluster)-1
+            if shared is not None and key < 0:
+                shared[key] = component
+            for _, box, block in cluster:
+                add(key, box, block)
     return groups, font_sizes, languages
 
 
@@ -869,22 +959,21 @@ def unique_blocks(blocks):
     return ordered
 
 
-def publish_draft(directory, blocks, skipped, patches, start, verified=False, preview_batch=False):
-    """Cumulative snapshots retain IDs; only real closed-balloon patches can show."""
+def publish_text(directory, page, patches):
+    """Publish final text once. Drawable patches can arrive after translation starts."""
     if cancelled(directory):
         return
-    result = unique_blocks(blocks)
-    draft = []
-    for block in result:
+    blocks = []
+    for block in page['blocks']:
         candidate = dict(block, replacementPNG=None, replacementAllowed=False)
         future = patches.get(block['id'])
         if block['textStyle'] is None and future is not None and future.done() and not future.cancelled():
-            patch = future.result()
-            if patch is not None:
-                candidate.update(replacementPNG=patch, replacementAllowed=True)
-        draft.append(candidate)
-    write_json(directory, 'text', {'blocks': draft, 'skippedCount': skipped,
-               'elapsed': time.monotonic()-start, 'verifiedText': verified, 'previewBatch': preview_batch})
+            if future.exception() is None:
+                patch = future.result()
+                if patch is not None:
+                    candidate.update(replacementPNG=patch, replacementAllowed=True)
+        blocks.append(candidate)
+    write_json(directory, 'text', dict(page, blocks=blocks))
 
 
 def preserve_overlapping_lettering(blocks):
@@ -907,42 +996,51 @@ def preserve_overlapping_lettering(blocks):
                     break
 
 
-def finish_page(directory, blocks, skipped, patches, start, make_patches=True, retains_patches=False, timings=None):
-    """Finish background work after the last durable text snapshot is published."""
+def finish_page(directory, blocks, skipped, patches, start, make_patches=True, retains_patches=False,
+                timings=None, review='complete', counts=None):
     if cancelled(directory):
         write_state(directory, phase='cancelled')
         return
-    result = unique_blocks(blocks)
+    result = [dict(block) for block in unique_blocks(blocks)]
+    page = {'blocks': result, 'skippedCount': skipped, 'elapsed': time.monotonic()-start,
+            'textOnly': not make_patches, 'review': review, 'stages': timings, 'regions': counts}
+    repair_start = time.monotonic()
     if make_patches:
-        publish_draft(directory, result, skipped, patches, start, verified=True)
+        publish_text(directory, page, patches)
         write_state(directory, phase='repairing')
         for block in result:
-            future = patches[block['id']]
-            while not cancelled(directory):
+            future = patches.get(block['id'])
+            while future is not None and not cancelled(directory):
                 try:
                     patch = future.result(timeout=.05)
-                    block['replacementPNG'] = patch
-                    block['replacementAllowed'] = patch is not None
-                    break
                 except FutureTimeout:
-                    # Python aliases FutureTimeout to built-in TimeoutError. Do not
-                    # retry an actual timeout raised by a completed repair forever.
-                    if future.done():
-                        raise
-                    continue
+                    if not future.done():
+                        continue
+                    # TimeoutError can be raised by the repair itself.
+                    patch = None
+                except Exception:
+                    patch = None
+                block['replacementPNG'] = patch
+                block['replacementAllowed'] = patch is not None
+                break
             if cancelled(directory):
                 write_state(directory, phase='cancelled')
                 return
         preserve_overlapping_lettering(result)
-    write_state(directory, phase='done', retainsPatches=retains_patches, page={'blocks': result, 'skippedCount': skipped,
-                'elapsed': time.monotonic()-start, 'verifiedText': True, 'textOnly': not make_patches, 'stages': timings})
+    page['elapsed'] = time.monotonic()-start
+    if timings is not None:
+        page['stages'] = dict(timings, patchWait=time.monotonic()-repair_start)
+    write_state(directory, phase='done', retainsPatches=retains_patches, page=page)
 
 
-def page_groups(candidates, gray, labels, stats, exterior, ink_labels, ink_stats):
+def page_groups(candidates, gray, labels, stats, exterior, ink_labels, ink_stats, excluded):
     height, width = gray.shape
-    groups, fonts, languages = group_candidates(candidates, labels, stats, exterior)
+    shared = {}
+    groups, fonts, languages = group_candidates(candidates, labels, stats, exterior, excluded, shared)
     filtered = reading_groups(groups, fonts)
     skipped, groups = len(groups)-len(filtered), filtered
+    if skipped:
+        excluded['size'] = skipped
     directions = group_geometry(candidates, groups)
     extra_ink = {}
     for component, box in groups.items():
@@ -964,7 +1062,7 @@ def page_groups(candidates, gray, labels, stats, exterior, ink_labels, ink_stats
                                                      int(pair[1][1]/max(40, height*.08)), -pair[1][0]))
     targets = {component: padded_box(box, gray, labels, stats, component, fonts[component])
                if component > 0 else box for component, box in boxes}
-    return boxes, fonts, languages, directions, extra_ink, targets, skipped
+    return boxes, fonts, languages, directions, extra_ink, targets, skipped, shared
 
 
 def block_identifier(component, box):
@@ -973,7 +1071,7 @@ def block_identifier(component, box):
     return f'c{component}' if component > 0 else 't' + '_'.join(str(int(v)) for v in box)
 
 
-def page_block(component, box, text, uncertain, target, font, direction, gray, labels, stats):
+def page_block(component, box, text, uncertain, target, font, direction, gray, labels, stats, shared=False):
     import numpy as np
     height, width = gray.shape
     closed = component > 0
@@ -982,7 +1080,7 @@ def page_block(component, box, text, uncertain, target, font, direction, gray, l
     def bounds(rect):
         return {'x': rect[0]/width*1000, 'y': rect[1]/height*1000,
                 'width': (rect[2]-rect[0])/width*1000, 'height': (rect[3]-rect[1])/height*1000}
-    style = None if closed else ('outlinedLight' if np.median(gray[y1:y2, x1:x2]) < 145 else 'outlinedDark')
+    style = None if closed or shared else ('outlinedLight' if np.median(gray[y1:y2, x1:x2]) < 145 else 'outlinedDark')
     return {'id': block_identifier(component, box), 'text': text,
             'uncertainFragments': uncertain or None, 'replacementAllowed': False,
             'vertical': direction, 'fontSize': font/height*1000,
@@ -991,7 +1089,7 @@ def page_block(component, box, text, uncertain, target, font, direction, gray, l
 
 
 def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_mask, device, pending, start, patch_jobs,
-                   stream_drafts=True, make_patches=True, early_translation=False):
+                   make_patches=True):
     import cv2
     import numpy as np
     detecting = time.monotonic()
@@ -1001,142 +1099,99 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
     labels, stats, exterior = bubble_regions(gray)
     _, ink_labels, ink_stats, _ = cv2.connectedComponentsWithStats((gray < 215).astype(np.uint8), connectivity=8)
     hints = read_hints(directory)
+    hint_path = directory / 'hints.json'
+
     def resolution_for(values):
         sizes = [min(h['box'][2]-h['box'][0], h['box'][3]-h['box'][1]) for h in values]
         return 1536 if max(width, height) > 1800 or (sizes and np.median(sizes) < 24) else 1024
+
     def detect(resolution):
         write_state(directory, phase='detecting')
         detector.input_size = (resolution, resolution)
         raw, mask, found = detector(image)
-        found = [b for b in found if within_reader_content(b.xyxy, content)]
-        recovered = recover_candidates(image, raw, found)
-        found = separate_caption_lines(found)
+        content_boxes = [block for block in found if within_reader_content(block.xyxy, content)]
+        recovered = recover_candidates(raw, content_boxes, content)
         if recovered:
             mask = cv2.bitwise_or(mask, refine_mask(image, raw, recovered))
-            found += recovered
-        return mask, found
-    resolution = resolution_for(hints)
-    text_mask, candidates = detect(resolution)
+        counts = {'detected': len(found), 'recovered': len(recovered), 'supplemented': 0,
+                  'grouped': 0, 'excluded': {}}
+        if len(content_boxes) < len(found):
+            counts['excluded']['outsidePage'] = len(found)-len(content_boxes)
+        return mask, separate_caption_lines(content_boxes) + recovered, counts
+
+    resolution = resolution_for(hints or [])
+    text_mask, candidates, counts = detect(resolution)
     detection_seconds = time.monotonic() - detecting
     recognition_seconds = 0.0
-    if cancelled(directory):
-        write_state(directory, phase='cancelled'); return
-    early_text, early_patches, early_result, draft_patches = {}, {}, [], {}
-    early_preview = False
-    early_revision = None
+    texts = {}
     batch_size = 8 if device == 'mps' else 1
 
-    # Fast path only uses detector-confirmed Japanese inside a real closed
-    # balloon. Unknown/open/small text keeps the full independent Vision review.
-    if pending and not (directory / 'hints.json').exists():
-        detecting = time.monotonic()
-        boxes, fonts, languages, directions, extra, targets, skipped = page_groups(
-            candidates, gray, labels, stats, exterior, ink_labels, ink_stats)
-        detection_seconds += time.monotonic() - detecting
-        early_preview = early_translation and len(boxes) > 8
-        first = [(c, b) for c, b in boxes if c > 0 and 'ja' in languages[c] and fonts[c] >= 10][:(3 if device == 'mps' else 1)]
-        if make_patches:
-            for component, box in first:
-                future = repairs.submit(replacement_patch, image, text_mask, targets[component],
-                    ink_labels, extra.get(component, []), False, restorer, font_size=fonts[component],
-                    bubble_region=bubble_fill_region(labels, stats, component))
-                signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
-                early_patches[component] = (signature, future)
-                patch_jobs[('early', component)] = future
-        draft_patches = {block_identifier(c, b): early_patches[c][1] for c, b in first if c in early_patches}
-        early_batch_size = min(batch_size, len(first) or 1)
-        recognizing = time.monotonic()
-        for _, component, box, text in recognized_boxes(
-                ocr, image, first, languages, fonts, directory, early_batch_size, text_mask):
-            early_text[(component, tuple(box), fonts[component])] = text
-            if not stream_drafts and not early_preview:
-                continue
-            if japanese_text(text, languages[component]):
-                early_result.append(page_block(component, box, text, [], targets[component], fonts[component],
-                                               directions[component], gray, labels, stats))
-            # Publish a complete decoder batch, retaining reading order later.
-            if len(early_text) % early_batch_size == 0 or len(early_text) == len(first):
-                order = {block_identifier(c, b): i for i, (c, b) in enumerate(first)}
-                early_result.sort(key=lambda block: order[block['id']])
-                publish_draft(directory, early_result, skipped, draft_patches, start, preview_batch=early_preview)
-                early_revision = tuple(future.done() for _, future in early_patches.values())
-        recognition_seconds += time.monotonic() - recognizing
-        if cancelled(directory):
-            write_state(directory, phase='cancelled'); return
-        write_state(directory, phase='verifying')
+    def decode(boxes, fonts, languages, stop_at_hints=False):
+        nonlocal recognition_seconds
+        started = time.monotonic()
+        for completed, (_, component, box, text) in enumerate(recognized_boxes(
+                ocr, image, boxes, languages, fonts, directory, batch_size, text_mask), 1):
+            texts[(component, tuple(box), fonts[component])] = text
+            # Finish the current decoder batch before regrouping changed crops.
+            if stop_at_hints and completed % batch_size == 0 and hint_path.exists():
+                break
+        recognition_seconds += time.monotonic()-started
 
-    def publish_completed_patches():
-        nonlocal early_revision
-        revision = tuple(future.done() for _, future in early_patches.values())
-        if early_result and revision != early_revision:
-            early_revision = revision
-            publish_draft(directory, early_result, skipped, draft_patches, start, preview_batch=early_preview)
-    # A repair can complete after decoding. Publish it while Vision is pending
-    # instead of leaving the already translated balloon hidden until final OCR.
+    if pending and not hint_path.exists() and not cancelled(directory):
+        # During cold Vision the detector's closed Japanese crops are already
+        # available. Their strings are reused only for identical final crops.
+        detecting = time.monotonic()
+        boxes, fonts, languages, *_ = page_groups(
+            candidates, gray, labels, stats, exterior, ink_labels, ink_stats, {})
+        detection_seconds += time.monotonic()-detecting
+        if not hint_path.exists():
+            decode([(c, b) for c, b in boxes if c > 0 and 'ja' in languages[c]],
+                   fonts, languages, stop_at_hints=True)
+
     awaiting_hints = time.monotonic()
-    hints = read_hints(directory, pending, on_wait=publish_completed_patches)
-    hint_wait = time.monotonic() - awaiting_hints
+    if pending and not hint_path.exists():
+        write_state(directory, phase='verifying')
+    hints = read_hints(directory, pending)
+    hint_wait = time.monotonic()-awaiting_hints
     if cancelled(directory):
-        write_state(directory, phase='cancelled'); return
+        write_state(directory, phase='cancelled')
+        return
+    review = 'unavailable' if pending and hints is None else 'complete'
+    hints = hints or []
     detecting = time.monotonic()
     if resolution_for(hints) > resolution:
         resolution = resolution_for(hints)
-        text_mask, candidates = detect(resolution)
-    candidates = supplement_candidates(candidates, [hint for hint in hints if within_reader_content(hint['box'], content)])
-    boxes, fonts, languages, directions, extra, targets, skipped = page_groups(
-        candidates, gray, labels, stats, exterior, ink_labels, ink_stats)
-    detection_seconds += time.monotonic() - detecting
+        text_mask, candidates, counts = detect(resolution)
+    supplemental = supplement_candidates(candidates, [hint for hint in hints if within_reader_content(hint['box'], content)])
+    counts['supplemented'] = len(supplemental)-len(candidates)
+    boxes, fonts, languages, directions, extra, targets, skipped, shared = page_groups(
+        supplemental, gray, labels, stats, exterior, ink_labels, ink_stats, counts['excluded'])
+    counts['grouped'] = len(boxes)
+    detection_seconds += time.monotonic()-detecting
+
     def schedule_patches(jobs):
-        accepted_patches = {}
-        for component, box in sorted(boxes, key=lambda pair: pair[0] < 0):
-            signature = (resolution, tuple(targets[component]), tuple(extra.get(component, [])), fonts[component])
-            earlier = early_patches.get(component)
-            future = earlier[1] if earlier and earlier[0] == signature else repairs.submit(
-                replacement_patch, image, text_mask, targets[component], ink_labels, extra.get(component, []),
-                component < 0, restorer, font_size=fonts[component],
-                bubble_region=bubble_fill_region(labels, stats, component) if component > 0 else None)
-            jobs[('final', component)] = future
-            accepted_patches[block_identifier(component, box)] = future
-        return accepted_patches
-    accepted_patches = schedule_patches(patch_jobs) if make_patches else {}
-    missing = [(c, b) for c, b in boxes if (c, tuple(b), fonts[c]) not in early_text]
-    # A short first section in reading order reaches translation before the
-    # remaining length-bucketed work. Keep the full independent review below.
-    priority = []
-    preview_priority = early_translation and len(boxes) > 8
-    if (stream_drafts or preview_priority) and not early_text:
-        priority = [(c, b) for c, b in missing if c > 0 and fonts[c] >= 10 and 'ja' in languages[c]][:(3 if device == 'mps' else 1)]
-    priority_ids = {c for c, _ in priority}
-    phases = [(priority, min(batch_size, len(priority) or 1)),
-              ([(c, b) for c, b in missing if c not in priority_ids], batch_size)]
-    recognizing = time.monotonic()
-    for phase, phase_batch in phases:
-        for completed, (_, component, box, text) in enumerate(recognized_boxes(
-                ocr, image, phase, languages, fonts, directory, phase_batch, text_mask), 1):
-            early_text[(component, tuple(box), fonts[component])] = text
-            preview_batch = preview_priority and phase is priority
-            if (stream_drafts or preview_batch) and (completed % phase_batch == 0 or completed == len(phase)):
-                # A fast Vision response must not turn the whole page back into a
-                # barrier. Publish completed decoder batches on this path too;
-                # independent verification below retains its original reading order
-                # and retry budget, and can still correct these provisional strings.
-                draft = []
-                for known, bounds in boxes:
-                    value = early_text.get((known, tuple(bounds), fonts[known]))
-                    if (known > 0 and fonts[known] >= 10 and 'ja' in languages[known]
-                            and value is not None and japanese_text(value, languages[known])):
-                        draft.append(page_block(known, bounds, value, [], targets[known], fonts[known],
-                                                directions[known], gray, labels, stats))
-                if draft:
-                    publish_draft(directory, draft, skipped, accepted_patches, start, preview_batch=preview_batch)
-    recognition_seconds += time.monotonic() - recognizing
+        patches = {}
+        interiors = {}
+        for component, box in sorted(boxes, key=lambda pair: pair[0] < 0 and pair[0] not in shared):
+            interior = shared.get(component, component)
+            if interior > 0 and interior not in interiors:
+                interiors[interior] = bubble_fill_region(labels, stats, interior)
+            future = repairs.submit(replacement_patch, image, text_mask, targets[component],
+                ink_labels, extra.get(component, []), interior < 0, restorer, font_size=fonts[component],
+                bubble_region=interiors.get(interior))
+            jobs[component] = future
+            patches[block_identifier(component, box)] = future
+        return patches
+
+    patches = schedule_patches(patch_jobs) if make_patches else {}
+    decode([(c, b) for c, b in boxes if (c, tuple(b), fonts[c]) not in texts], fonts, languages)
     write_state(directory, phase='verifying')
     verifying = time.monotonic()
     result, uncertainty_budget = [], [4]
     for component, box in boxes:
         if cancelled(directory):
             write_state(directory, phase='cancelled'); return
-        text = early_text[(component, tuple(box), fonts[component])]
+        text = texts[(component, tuple(box), fonts[component])]
         original = text
         hint = reliable_hint(box, hints, text, horizontal=not directions[component])
         if hint and component < 0 and len(hint) >= 4:
@@ -1147,17 +1202,21 @@ def recognize_page(directory, image, detector, ocr, restorer, repairs, refine_ma
         if not japanese_text(text, languages[component]):
             if not punctuation_only(text):
                 skipped += 1
+                counts['excluded']['unreadable'] = counts['excluded'].get('unreadable', 0) + 1
+            else:
+                counts['excluded']['punctuation'] = counts['excluded'].get('punctuation', 0) + 1
             continue
         result.append(page_block(component, box, text, uncertain, targets[component], fonts[component],
-                                 directions[component], gray, labels, stats))
+                                 directions[component], gray, labels, stats, shared=component in shared))
     timings = {'detection': detection_seconds, 'recognition': recognition_seconds,
                'verification': time.monotonic() - verifying, 'visionWait': hint_wait}
-    finish_page(directory, result, skipped, accepted_patches, start, make_patches=make_patches,
-                retains_patches=not make_patches, timings=timings)
-    if not make_patches and not cancelled(directory):
+    finish_page(directory, result, skipped, patches, start, make_patches=make_patches,
+                retains_patches=not make_patches and review == 'complete',
+                timings=timings, review=review, counts=counts)
+    if not make_patches and review == 'complete' and not cancelled(directory):
         def restore(next_directory, next_start, jobs):
             patches = schedule_patches(jobs)
-            finish_page(next_directory, result, skipped, patches, next_start)
+            finish_page(next_directory, result, skipped, patches, next_start, review=review, counts=counts)
         return restore
 
 
@@ -1266,8 +1325,7 @@ def main():
             deferred_patches = None
             restore = recognize_page(directory, image, detector, ocr, restorer, repairs, refine_mask,
                                      device, request.get('hintsPending', False), start, patch_jobs,
-                                     stream_drafts=request.get('streamDrafts', True), make_patches=request.get('makePatches', True),
-                                     early_translation=request.get('earlyTranslation', False))
+                                     make_patches=request.get('makePatches', True))
             if restore is not None:
                 deferred_patches = (request.get('pageDigest'), restore)
         except Exception:

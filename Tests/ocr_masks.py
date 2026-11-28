@@ -131,7 +131,7 @@ class TextHandoffTests(unittest.TestCase):
                 time.sleep(.005)
             draft = json.loads((directory / 'text.json').read_text())
             self.assertTrue(task.is_alive())
-            self.assertTrue(draft['verifiedText'])
+            self.assertEqual(draft['review'], 'complete')
             self.assertEqual(draft['skippedCount'], 2)
             self.assertFalse(draft['blocks'][0]['replacementAllowed'])
             self.assertIsNone(draft['blocks'][0]['replacementPNG'])
@@ -149,7 +149,7 @@ class TextHandoffTests(unittest.TestCase):
             worker['finish_page'](directory, [self.block()], 0, {}, time.monotonic(), make_patches=False)
             result = json.loads((directory / 'state.json').read_text())
             self.assertEqual(result['phase'], 'done')
-            self.assertTrue(result['page']['verifiedText'])
+            self.assertEqual(result['page']['review'], 'complete')
             self.assertTrue(result['page']['textOnly'])
             self.assertIsNone(result['page']['blocks'][0].get('replacementPNG'))
             self.assertFalse((directory / 'text.json').exists())
@@ -207,139 +207,93 @@ class TextHandoffTests(unittest.TestCase):
         block = dict(self.block('t1_2_3_4'), textStyle='outlinedDark')
         self.assertEqual(len(worker['unique_blocks']([block, dict(block)])), 1)
 
-    def test_repair_timeout_exception_is_not_confused_with_pending_future(self):
+    def test_failed_repair_preserves_original_without_losing_recognized_text(self):
         with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
             failed = Future(); failed.set_exception(TimeoutError('repair failed'))
-            with self.assertRaises(TimeoutError):
-                worker['finish_page'](Path(folder), [self.block()], 0, {'b1': failed}, time.monotonic())
+            worker['finish_page'](directory, [self.block()], 0, {'b1': failed}, time.monotonic())
+            state = json.loads((directory/'state.json').read_text())
+            self.assertEqual(state['phase'], 'done')
+            self.assertEqual(state['page']['blocks'][0]['text'], self.block()['text'])
+            self.assertFalse(state['page']['blocks'][0]['replacementAllowed'])
 
 
-class ProgressivePageTests(unittest.TestCase):
-    def test_ready_vision_publishes_a_closed_batch_before_the_remaining_page(self):
-        image = np.full((540, 750, 3), 220, np.uint8)
+class WholePageRecognitionTests(unittest.TestCase):
+    def test_delayed_vision_supplements_all_detected_balloons_before_handoff(self):
+        image = np.full((720, 750, 3), 220, np.uint8)
         detected = []
-        for index in range(9):
+        for index in range(10):
             x, y = (index % 3)*250+20, (index // 3)*180+20
             cv2.rectangle(image, (x, y), (x+200, y+130), (0, 0, 0), 2)
             cv2.rectangle(image, (x+2, y+2), (x+198, y+128), (255, 255, 255), -1)
-            detected.append(SimpleNamespace(xyxy=[x+60, y+25, x+120, y+100],
-                                            language='ja', font_size=16, vertical=True))
+            if index < 9:
+                detected.append(SimpleNamespace(xyxy=[x+60, y+25, x+120, y+100],
+                                                language='ja', font_size=16, vertical=True))
+
         class Detector:
             input_size = None
+
             def __call__(self, value):
                 mask = np.zeros(value.shape[:2], np.uint8)
                 return mask, mask, detected
-        release, blocked = threading.Event(), threading.Event()
-        seen = []
-        def recognized(ocr, image, boxes, languages, fonts, directory, batch, mask):
-            time.sleep(.025)
-            for index, (component, box) in enumerate(boxes):
-                if len(seen) == 3:
-                    blocked.set(); release.wait(2)
-                seen.append(component)
-                yield index, component, box, 'おはよう'
-        replacements = {
-            'recover_candidates': lambda *args: [], 'separate_caption_lines': lambda found: found,
-            'recognized_boxes': recognized, 'replacement_patch': lambda *args, **kwargs: 'closed-png',
-            'reliable_hint': lambda *args, **kwargs: None,
-            'restore_voicing': lambda text, *args: text,
-            'reconcile_fragments': lambda ocr, image, box, text, *args: (text, []),
-            'confirm_fragments': lambda *args: [],
-        }
-        with tempfile.TemporaryDirectory() as folder, ThreadPoolExecutor(max_workers=1) as repairs, patch.dict(worker, replacements):
-            directory, errors = Path(folder), []
-            (directory/'hints.json').write_text('[]')
-            def run():
-                try:
-                    worker['recognize_page'](directory, image, Detector(), None, None, repairs, None,
-                        'mps', True, time.monotonic(), {})
-                except BaseException as error:
-                    errors.append(error)
-            task = threading.Thread(target=run); task.start()
-            try:
-                self.assertTrue(blocked.wait(2))
-                self.assertFalse(errors)
-                draft = json.loads((directory/'text.json').read_text())
-                self.assertEqual(len(draft['blocks']), 3)
-                self.assertTrue(all(block['replacementAllowed'] for block in draft['blocks']))
-                self.assertTrue(task.is_alive(), 'the opening section is available before the fourth crop')
-            finally:
-                release.set(); task.join(2)
-            self.assertFalse(task.is_alive()); self.assertFalse(errors)
-            final = json.loads((directory/'state.json').read_text())['page']
-            self.assertEqual(len(final['blocks']), 9)
-            self.assertEqual([block['id'] for block in final['blocks'][:3]],
-                             [block['id'] for block in draft['blocks']])
-            self.assertTrue(all(block['text'] == 'おはよう' for block in final['blocks']))
 
-    def test_closed_balloon_precedes_vision_and_reuses_ocr_and_patch(self):
-        image = np.full((240, 400, 3), 220, np.uint8)
-        for box in [(240, 20, 380, 150), (20, 40, 140, 190)]:
-            cv2.rectangle(image, box[:2], box[2:], (0, 0, 0), 2)
-            cv2.rectangle(image, (box[0]+2, box[1]+2), (box[2]-2, box[3]-2), (255, 255, 255), -1)
-        detected = SimpleNamespace(xyxy=[280, 40, 330, 110], language='ja', font_size=16, vertical=True)
-        class Detector:
-            input_size = None
-            calls = 0
-            def __call__(self, image):
-                self.calls += 1
-                mask = np.zeros(image.shape[:2], np.uint8)
-                return mask, mask, [detected]
-        calls, patches, repair_release = [], [], threading.Event()
-        def recognized(ocr, image, boxes, languages, fonts, directory, batch, mask):
-            time.sleep(.025)  # Give the independent repair future a chance to complete.
-            for index, (component, box) in enumerate(boxes):
-                calls.append((component, tuple(box)))
-                yield index, component, box, 'おはよう' if box[0] > 200 else 'こんにちは'
-        def repair(image, mask, box, *args, **kwargs):
-            patches.append(tuple(box))
-            repair_release.wait(2)
-            return 'closed-png'
-        replacements = {
-            'recover_candidates': lambda *args: [], 'separate_caption_lines': lambda found: found,
-            'recognized_boxes': recognized, 'replacement_patch': repair,
-            'reliable_hint': lambda *args, **kwargs: None,
-            'restore_voicing': lambda text, box, hints: text + ('ね' if box[0] > 200 and hints else ''),
-            'reconcile_fragments': lambda ocr, image, box, text, *args: (text, []),
-            'confirm_fragments': lambda *args: [],
-        }
-        with tempfile.TemporaryDirectory() as folder, ThreadPoolExecutor(max_workers=1) as repairs, patch.dict(worker, replacements):
-            directory, detector, errors = Path(folder), Detector(), []
-            def run():
-                try:
-                    worker['recognize_page'](directory, image, detector, None, None, repairs, None,
-                        'mps', True, time.monotonic(), {})
-                except BaseException as error:
-                    errors.append(error)
-            task = threading.Thread(target=run); task.start()
-            deadline = time.monotonic()+2
-            while not (directory/'text.json').exists() and not errors and time.monotonic() < deadline:
-                time.sleep(.005)
-            self.assertFalse(errors)
-            early = json.loads((directory/'text.json').read_text())
-            self.assertTrue(task.is_alive(), 'Vision is still pending while the first balloon is published')
-            self.assertEqual(len(early['blocks']), 1)
-            self.assertFalse(early['blocks'][0]['replacementAllowed'], 'unfinished repair cannot erase artwork')
-            self.assertEqual(early['blocks'][0]['text'], 'おはよう')
-            repair_release.set()
-            deadline = time.monotonic()+1
-            while time.monotonic() < deadline:
-                ready = json.loads((directory/'text.json').read_text())
-                if ready['blocks'][0]['replacementAllowed']:
-                    break
-                time.sleep(.005)
-            self.assertTrue(ready['blocks'][0]['replacementAllowed'], 'completed patch is published before Vision returns')
-            self.assertTrue(task.is_alive())
-            worker['write_json'](directory, 'hints', [{'text': 'こんにちは', 'confidence': .9, 'box': [50, 70, 100, 140]}])
-            task.join(2)
-            self.assertFalse(task.is_alive()); self.assertFalse(errors)
-            final = json.loads((directory/'state.json').read_text())['page']
-            self.assertEqual(len(final['blocks']), 2, 'Vision-only balloon is included in the final page')
-            verified = next(block for block in final['blocks'] if block['id'] == early['blocks'][0]['id'])
-            self.assertEqual(verified['text'], 'おはようね', 'final review can update text without changing bubble identity')
-            self.assertEqual(len(calls), 2, 'each unchanged crop is decoded only once')
-            self.assertEqual(len(patches), 2, 'the finished early repair is reused')
-            self.assertEqual(detector.calls, 1)
+        for outcome in ['ready', 'unavailable', 'cancelled']:
+            with self.subTest(outcome=outcome):
+                decoded, all_detected = [], threading.Event()
+
+                def recognized(ocr, image, boxes, languages, fonts, directory, batch, mask):
+                    for index, (component, box) in enumerate(boxes):
+                        decoded.append((component, tuple(box), fonts[component]))
+                        if len(decoded) == 9:
+                            all_detected.set()
+                        yield index, component, box, 'おはよう'
+
+                replacements = {
+                    'recover_candidates': lambda *args: [], 'separate_caption_lines': lambda found: found,
+                    'recognized_boxes': recognized, 'reliable_hint': lambda *args, **kwargs: None,
+                    'restore_voicing': lambda text, *args: text,
+                    'reconcile_fragments': lambda ocr, image, box, text, *args: (text, []),
+                    'confirm_fragments': lambda *args: [],
+                    'replacement_patch': lambda *args, **kwargs: 'closed-png',
+                }
+                with tempfile.TemporaryDirectory() as folder, ThreadPoolExecutor(max_workers=1) as repairs, patch.dict(worker, replacements):
+                    directory, errors = Path(folder), []
+
+                    def run():
+                        try:
+                            worker['recognize_page'](directory, image, Detector(), None, None, repairs, None,
+                                'mps', True, time.monotonic(), {})
+                        except Exception as error:
+                            errors.append(error)
+
+                    task = threading.Thread(target=run)
+                    task.start()
+                    try:
+                        self.assertTrue(all_detected.wait(2), 'all detector crops decode while Vision is pending')
+                        self.assertFalse((directory/'text.json').exists(), 'provisional text never starts translation')
+                        if outcome == 'cancelled':
+                            (directory/'cancel').touch()
+                        else:
+                            hints = None if outcome == 'unavailable' else [
+                                {'text': 'こんにちは', 'confidence': .9, 'box': [80, 585, 140, 660]}]
+                            worker['write_json'](directory, 'hints', hints)
+                        task.join(2)
+                        self.assertFalse(task.is_alive()); self.assertFalse(errors)
+                        state = json.loads((directory/'state.json').read_text())
+                        if outcome == 'cancelled':
+                            self.assertEqual(state['phase'], 'cancelled')
+                            self.assertNotIn('page', state)
+                        else:
+                            page = state['page']
+                            expected = 10 if outcome == 'ready' else 9
+                            self.assertEqual(len(page['blocks']), expected)
+                            self.assertEqual(len(decoded), expected, 'unchanged crops decode once')
+                            self.assertEqual(len(set(decoded)), expected)
+                            self.assertEqual(page['review'], 'complete' if outcome == 'ready' else 'unavailable')
+                            self.assertEqual(len(json.loads((directory/'text.json').read_text())['blocks']), expected)
+                    finally:
+                        (directory/'cancel').touch()
+                        task.join(2)
 
     def test_identifiers_do_not_depend_on_reading_order_or_open_group_index(self):
         identity = worker['block_identifier']
@@ -568,14 +522,14 @@ class RecognitionTests(unittest.TestCase):
             def publish():
                 time.sleep(.03)
                 temporary = directory / 'hints.tmp'
-                temporary.write_text('[{"text":"おはよう"}]')
+                temporary.write_text('[{"text":"おはよう","confidence":0.9,"box":[10,10,40,60]}]')
                 temporary.replace(directory / 'hints.json')
             thread = threading.Thread(target=publish); thread.start()
-            self.assertEqual(worker['read_hints'](directory, True), [{'text': 'おはよう'}])
+            self.assertEqual(worker['read_hints'](directory, True)[0]['text'], 'おはよう')
             thread.join()
             (directory / 'hints.json').unlink()
             (directory / 'cancel').touch()
-            self.assertEqual(worker['read_hints'](directory, True), [])
+            self.assertIsNone(worker['read_hints'](directory, True))
 
     def test_batches_preserve_ids_and_stop_before_returning_cancelled_results(self):
         batches = []
@@ -622,6 +576,34 @@ class RecognitionTests(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertTrue(all(b.language == 'ja' for b in result))
 
+    def test_short_japanese_dialogue_overrides_an_english_label_when_independently_confirmed(self):
+        labels = np.ones((100, 120), np.int32)
+        stats = np.array([[0, 0, 0, 0, 0], [0, 0, 120, 100, 12000]], np.int32)
+        for text in ['え？', 'はい', 'ホント？']:
+            with self.subTest(text=text):
+                block = SimpleNamespace(xyxy=[20, 20, 60, 80], font_size=16, language='eng')
+                hints = [{'box': [20, 20, 60, 80], 'text': text, 'confidence': .95}]
+                result = worker['supplement_candidates']([block], hints)
+                groups, _, languages = worker['group_candidates'](result, labels, stats, {0, 1})
+                self.assertEqual(len(result), 1)
+                self.assertEqual(len(groups), 1)
+                self.assertEqual(list(languages.values()), [{'ja'}])
+
+    def test_partial_japanese_hint_uses_its_own_crop_inside_a_larger_english_detection(self):
+        block = SimpleNamespace(xyxy=[10, 10, 110, 90], font_size=16, language='eng')
+        box = [70, 20, 100, 70]
+        result = worker['supplement_candidates']([block], [{'box': box, 'text': 'はい', 'confidence': .95}])
+        self.assertEqual([(b.xyxy, b.language) for b in result], [(block.xyxy, 'eng'), (box, 'ja')])
+
+    def test_weak_short_japanese_or_english_controls_do_not_override_an_english_detection(self):
+        for text, confidence in [('え？', .7), ('はい', .3), ('NEXT', .99)]:
+            with self.subTest(text=text):
+                block = SimpleNamespace(xyxy=[20, 20, 60, 80], font_size=16, language='eng')
+                result = worker['supplement_candidates']([block],
+                    [{'box': block.xyxy, 'text': text, 'confidence': confidence}])
+                self.assertEqual(len(result), 1)
+                self.assertEqual(block.language, 'eng')
+
     def test_open_bubble_is_kept_for_ocr_and_english_controls_are_excluded(self):
         labels = np.ones((100, 120), np.int32)
         stats = np.array([[0, 0, 0, 0, 0], [0, 0, 120, 100, 12000]], np.int32)
@@ -640,6 +622,22 @@ class RecognitionTests(unittest.TestCase):
                   for box in [[25, 25, 45, 75], [65, 25, 85, 75]]]
         groups, _, _ = worker['group_candidates'](blocks, labels, stats, {0, 1})
         self.assertEqual(list(groups), [2])
+
+    def test_leaking_balloons_with_same_interior_keep_separate_text_regions(self):
+        gray = np.full((260, 400), 255, np.uint8)
+        cv2.rectangle(gray, (10, 10), (390, 250), 0, 2)
+        for x in [110, 290]:
+            cv2.ellipse(gray, (x, 130), (70, 100), 0, 0, 360, 0, 2)
+            cv2.rectangle(gray, (x-77, 119), (x-62, 141), 255, -1)
+        blocks = [SimpleNamespace(xyxy=[x-32, 75, x+32, 190], font_size=18, language='ja')
+                  for x in [110, 290]]
+        labels, stats, exterior = worker['bubble_regions'](gray)
+        groups, _, _ = worker['group_candidates'](blocks, labels, stats, exterior)
+        self.assertEqual(labels[110, 110], labels[110, 290], 'the broken outlines share white pixels')
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(key < 0 for key in groups), 'each ambiguous interior uses its own erasure geometry')
+        left, right = sorted(groups.values())
+        self.assertLess(left[2], right[0])
 
     def test_dense_line_uses_bubble_ring_and_merges_with_other_lines(self):
         labels = np.ones((140, 160), np.int32)
@@ -753,7 +751,8 @@ class RecognitionTests(unittest.TestCase):
         mask[30:180, 220:235] = 220  # Missed elongated lettering.
         mask[80:140, 400:440] = 220  # Existing detected dialogue.
         mask[375:395, 410:450] = 220  # Reader control.
-        boxes = worker['recover_candidates'](image, mask, [SimpleNamespace(xyxy=[395,75,445,145])])
+        boxes = worker['recover_candidates'](mask, [SimpleNamespace(xyxy=[395,75,445,145])],
+            worker['reader_content_bounds'](cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)))
         self.assertEqual(len(boxes), 1)
         self.assertLess(boxes[0].xyxy[1], 30)
         labels, stats, exterior = worker['bubble_regions'](cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))

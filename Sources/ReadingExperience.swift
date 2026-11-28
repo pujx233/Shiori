@@ -168,6 +168,9 @@ struct CorrectionSnapshot {
     let translation: PageTranslation
     let profile: WorkProfile?
     var textOnly: Bool? = nil
+    var review: OCRReview = .complete
+    var state: PageProcessingState = .complete
+    var manual: [Dialogue] = []
 }
 
 struct CorrectionHistory {

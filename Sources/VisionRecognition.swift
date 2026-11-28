@@ -42,8 +42,8 @@ enum VisionRecognition {
         }
     }
 
-    static func textHints(in image: CGImage, isCancelled: () -> Bool = { false }, perform: Perform = defaultPerform) -> [[String: Any]] {
-        guard !isCancelled() else { return [] }
+    static func textHints(in image: CGImage, isCancelled: () -> Bool = { false }, perform: Perform = defaultPerform) -> [[String: Any]]? {
+        guard !isCancelled() else { return nil }
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["ja-JP", "en-US"]
@@ -51,11 +51,11 @@ enum VisionRecognition {
         request.minimumTextHeight = 0.004
         guard perform(request, {
             try VNImageRequestHandler(cgImage: image).perform([request])
-        }) else { return [] }
+        }) else { return nil }
         var refinements = 0
         var hints: [[String: Any]] = []
         for observation in request.results ?? [] {
-            guard !isCancelled() else { return [] }
+            guard !isCancelled() else { return nil }
             guard var candidate = observation.topCandidates(1).first, candidate.confidence >= 0.3,
                   candidate.string.unicodeScalars.contains(where: { (0x3040...0x30FF).contains($0.value) || (0x3400...0x9FFF).contains($0.value) }) else { continue }
             let rect = observation.boundingBox
@@ -79,12 +79,12 @@ enum VisionRecognition {
                     candidate = improved
                 }
             }
-            guard !isCancelled() else { return [] }
+            guard !isCancelled() else { return nil }
             hints.append(["text": candidate.string, "confidence": candidate.confidence,
                     "box": [rect.minX * Double(image.width), (1-rect.maxY) * Double(image.height),
                             rect.maxX * Double(image.width), (1-rect.minY) * Double(image.height)]])
         }
-        return isCancelled() ? [] : hints
+        return isCancelled() ? nil : hints
     }
 
 }

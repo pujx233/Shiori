@@ -94,7 +94,7 @@ struct OCRPerformance {
             visionPreparation: OCRVisionPreparation(work: { _ in }), visionFileHints: { image, file, runner in
                 let ticket = observations.beginVision()
                 let hints = LocalOCR.textHints(in: image, runner: runner, helperURL: options.visionHelper, imageFile: file)
-                observations.endVision(ticket, hintCount: hints.count, cancelled: runner.isCancelled)
+                observations.endVision(ticket, hintCount: hints?.count ?? 0, cancelled: runner.isCancelled)
                 return hints
             })
         #else
@@ -102,11 +102,11 @@ struct OCRPerformance {
             visionPreparation: OCRVisionPreparation(work: { _ in }), visionHints: { image, runner in
                 let ticket = observations.beginVision()
                 let hints = LocalOCR.textHints(in: image, runner: runner)
-                observations.endVision(ticket, hintCount: hints.count, cancelled: runner.isCancelled)
+                observations.endVision(ticket, hintCount: hints?.count ?? 0, cancelled: runner.isCancelled)
                 return hints
             })
         #endif
-        let google = options.google ? try GoogleTranslationClient(cacheDirectory: scratch.appendingPathComponent("Google"), concurrency: 6) : nil
+        let google = options.google ? GoogleTranslationClient(concurrency: 6) : nil
         defer { ocr.shutdown(); google?.shutdown() }
         var rows: [[String: Any]] = []
         let startedAt = ISO8601DateFormatter().string(from: Date())
@@ -160,10 +160,10 @@ struct OCRPerformance {
                                         })
                                         recognized.set(result); observations.finishOCR(sample, page: result)
                                         return result
-                                    }, translate: { text, preview in
+                                    }, translate: { text, _, preview in
                                         observations.translationBatch(sample, count: text.blocks.count)
                                         return try google.translate(ocr: text, options: selected, runner: runner, force: true, preview: preview).0
-                                    }, preview: { partial, _ in
+                                    }, preview: { partial, _, _ in
                                         let callbackAt = PerformanceClock.now()
                                         DispatchQueue.main.sync {
                                             MainActor.assumeIsolated { renderProbe.accept(partial, callbackAt: callbackAt) }
@@ -184,6 +184,12 @@ struct OCRPerformance {
                     row["pipelineSeconds"] = PerformanceClock.seconds(since: began)
                     row.merge(observations.snapshot(sample), uniquingKeysWith: { _, new in new })
                     if let final = recognized.read() {
+                        row["review"] = final.review.rawValue
+                        if let regions = final.regions { row["regions"] = regions.diagnosticState }
+                        if let stages = final.stages {
+                            row["ocrStages"] = ["detection": stages.detection, "recognition": stages.recognition,
+                                "verification": stages.verification, "visionWait": stages.visionWait, "patchWait": stages.patchWait ?? 0]
+                        }
                         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
                         try encoder.encode(final).write(to: sampleDirectory.appendingPathComponent("ocr.json"), options: .atomic)
                         let content = try encoder.encode(OCRPage(blocks: final.blocks, skippedCount: final.skippedCount, elapsed: 0))

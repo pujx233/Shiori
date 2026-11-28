@@ -31,7 +31,7 @@ struct GoogleTranslationTests {
                 let codexOptions = TranslationOptions(model: "gpt-6-luna", effort: "low")
                 let start = Date()
                 var first: Double?
-                let (result, elapsed) = try client.translate(ocr: input, options: codexOptions, runner: CommandRunner(), force: true,
+                let (result, elapsed) = try client.translate(ocr: input, options: codexOptions, runner: CommandRunner(),
                     preview: { preview in
                         if first == nil && !preview.dialogues.isEmpty { first = Date().timeIntervalSince(start) }
                     })
@@ -43,7 +43,7 @@ struct GoogleTranslationTests {
                 return
             }
             let concurrency = CommandLine.arguments.contains("--six") ? 6 : 3
-            let client = try GoogleTranslationClient(cacheDirectory: root.appendingPathComponent("live"), concurrency: concurrency)
+            let client = GoogleTranslationClient(concurrency: concurrency)
             defer { client.shutdown() }
             var first: Double?, previews = 0
             let start = Date()
@@ -66,7 +66,7 @@ struct GoogleTranslationTests {
 
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [GoogleProtocolStub.self]
-        let client = try GoogleTranslationClient(cacheDirectory: root.appendingPathComponent("mock"), configuration: configuration)
+        let client = GoogleTranslationClient(configuration: configuration)
         defer { client.shutdown() }
         GoogleProtocolStub.reset([
             "おはよう": .init(fragments: ["早上好"], delay: 0.15),
@@ -93,8 +93,10 @@ struct GoogleTranslationTests {
                   "single-bubble cache survives page changes and always binds current geometry")
         _ = try client.translate(ocr: page([moved]), options: options, runner: CommandRunner(), force: true)
         try check(GoogleProtocolStub.requestCount("おはよう") == 2, "manual retry bypasses the bubble cache")
-        let files = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("mock"), includingPropertiesForKeys: nil)
-        try check(files.count == 4, "persistent cache contains only independently translated strings")
+        let freshClient = GoogleTranslationClient(configuration: configuration)
+        defer { freshClient.shutdown() }
+        _ = try freshClient.translate(ocr: page([moved]), options: options, runner: CommandRunner())
+        try check(GoogleProtocolStub.requestCount("おはよう") == 3, "a new reader session does not reuse disk translations")
 
         GoogleProtocolStub.reset(["待って": .init(fragments: ["等等"], delay: 2)])
         let runner = CommandRunner(), start = Date()
@@ -166,7 +168,7 @@ struct GoogleTranslationTests {
         do { _ = try GoogleTranslationClient.request(text: String(repeating: "あ", count: 2000)); throw AppError.message("FAIL: oversized source accepted") }
         catch { try check(error.localizedDescription.contains("过长"), "oversized source is rejected without silent truncation") }
         let timeoutConfiguration = URLSessionConfiguration.ephemeral; timeoutConfiguration.protocolClasses = [GoogleProtocolStub.self]
-        let short = try GoogleTranslationClient(cacheDirectory: root.appendingPathComponent("budget"), configuration: timeoutConfiguration, pageTimeout: 0.12)
+        let short = GoogleTranslationClient(configuration: timeoutConfiguration, pageTimeout: 0.12)
         defer { short.shutdown() }
         GoogleProtocolStub.reset(["長い": .init(fragments: ["很长"], delay: 3)])
         let budgetStart = Date()

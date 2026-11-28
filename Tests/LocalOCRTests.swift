@@ -11,7 +11,7 @@ struct LocalOCRTests {
             guard let image = NSImage(contentsOfFile: CommandLine.arguments[2])?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
                 throw AppError.message("Cannot read image")
             }
-            let data = try JSONSerialization.data(withJSONObject: LocalOCR.textHints(in: image))
+            let data = try JSONSerialization.data(withJSONObject: LocalOCR.textHints(in: image) ?? [])
             FileHandle.standardOutput.write(data)
             return
         }
@@ -68,17 +68,13 @@ struct LocalOCRTests {
                 continue
             block = {'id':'b1','text':'おはよう','bounds':{'x':10,'y':20,'width':100,'height':200},'replacementAllowed':False}
             draft = {'blocks':[block], 'skippedCount':0, 'elapsed':.1}
-            if mode == 'progressive':
-                write(directory/'text.json', draft)
-                write(directory/'state.json', {'phase':'verifying'})
-                time.sleep(.25)
-                draft['blocks'].append(dict(block, id='b2',text='こんにちは'))
-                draft['elapsed'] = .35
-                if not (directory/'cancel').exists(): write(directory/'text.json', draft)
+            write(directory/'state.json', {'phase':'verifying'})
             while not (directory/'hints.json').exists() and not (directory/'cancel').exists(): time.sleep(.01)
             if (directory/'cancel').exists():
                 write(directory/'state.json', {'phase':'cancelled'})
                 continue
+            hints = json.loads((directory/'hints.json').read_text())
+            draft['review'] = 'unavailable' if hints is None else 'complete'
             if mode != 'legacy':
                 write(directory/'text.json', draft)
                 write(directory/'state.json', {'phase':'repairing'})
@@ -91,7 +87,7 @@ struct LocalOCRTests {
             if not text_only:
                 block['replacementAllowed'] = True
                 block['replacementPNG'] = base64.b64encode(b'patch').decode()
-            page = {'blocks':draft['blocks'], 'skippedCount':0,'elapsed':.6,'textOnly':text_only}
+            page = {'blocks':draft['blocks'], 'skippedCount':0,'elapsed':.6,'textOnly':text_only,'review':draft['review']}
             deferred = page if text_only else None
             write(directory/'state.json', {'phase':'done','retainsPatches':text_only,'page':page})
         """#
@@ -159,8 +155,7 @@ struct LocalOCRTests {
             }, onTextReady: { _ in earlyCallbacks += 1 })
             throw AppError.message("FAIL: pre-Vision cancellation ignored")
         } catch is CancellationError {
-            let cacheFiles = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("Recognition"), includingPropertiesForKeys: nil)
-            try check(earlyCallbacks == 0 && !cacheFiles.contains { $0.lastPathComponent.hasPrefix(newPage.digest) }
+            try check(earlyCallbacks == 0 && ocr.recentRecognition(for: newPage) == nil
                       && Date().timeIntervalSince(beforeVisionStart) < 1.5,
                       "cancellation before Vision still acknowledges the worker and never emits or caches the cancelled page")
         }
@@ -190,16 +185,16 @@ struct LocalOCRTests {
         defer { preparedOCR.shutdown() }
         try preparedOCR.prepare(); try preparedOCR.prepare()
         try check(preparationEntered.wait(timeout: .now() + 2) == .success, "prepare launches one asynchronous Vision initialization attempt")
-        let hitStart = ProcessInfo.processInfo.systemUptime
-        _ = try preparedOCR.recognize(page: page, runner: CommandRunner(), progress: { _ in })
-        try check(ProcessInfo.processInfo.systemUptime - hitStart < 0.2 && preparationCancelled.wait(timeout: .now()) == .timedOut,
-                  "cached page returns immediately while preparation continues")
         var cancelledBeforeRecognition = false
-        _ = try preparedOCR.recognize(page: page, runner: CommandRunner(), force: true, progress: { text in
+        _ = try preparedOCR.recognize(page: page, runner: CommandRunner(), progress: { text in
             if text == "检查文字…" { cancelledBeforeRecognition = preparationCancelled.wait(timeout: .now()) == .success }
         })
         try check(cancelledBeforeRecognition && preparationFinished.wait(timeout: .now()) == .timedOut,
-                  "uncached page cancels preparation before Vision without waiting for its completion")
+                  "first page cancels preparation before Vision without waiting for its completion")
+        let hitStart = ProcessInfo.processInfo.systemUptime
+        _ = try preparedOCR.recognize(page: page, runner: CommandRunner(), progress: { _ in })
+        try check(ProcessInfo.processInfo.systemUptime - hitStart < 0.2,
+                  "the same page reuses its in-memory OCR while the old preparation unwinds")
         try check(String(contentsOf: root.appendingPathComponent("warmups"), encoding: .utf8) == "warmup\n",
                   "only one detector warmup is queued for a worker")
         preparationRelease.signal(); preparationQueue.sync {}
@@ -224,26 +219,23 @@ struct LocalOCRTests {
                   "shutdown cancels preparation and cleans the worker without joining the warmup")
         shutdownRelease.signal(); shutdownQueue.sync {}
 
-        try mode("progressive")
-        let hintsRelease = DispatchSemaphore(value: 0)
-        let progressiveOCR = try LocalOCR(support: root, resources: root, visionHints: { _, _ in
-            _ = hintsRelease.wait(timeout: .now() + 2)
-            return []
+        try mode("normal")
+        let reviewAttempt = DispatchSemaphore(value: 0)
+        reviewAttempt.signal()
+        let recoveringOCR = try LocalOCR(support: root, resources: root, visionHints: { _, _ in
+            reviewAttempt.wait(timeout: .now()) == .success ? nil : []
         })
-        defer { progressiveOCR.shutdown() }
-        var snapshotCounts: [Int] = [], firstSnapshot: Double?
-        let progressiveStart = ProcessInfo.processInfo.systemUptime
-        let progressivePage = try progressiveOCR.recognize(page: page, runner: CommandRunner(), force: true,
-            progress: { _ in }, onTextReady: { draft in
-                if firstSnapshot == nil { firstSnapshot = ProcessInfo.processInfo.systemUptime - progressiveStart }
-                snapshotCounts.append(draft.blocks.count)
-                if draft.blocks.count == 2 { hintsRelease.signal() }
-            })
-        try check(snapshotCounts == [1, 2] && (firstSnapshot ?? 9) < 1.0 && progressivePage.blocks.count == 2,
-                  "multiple cumulative drafts arrive before Vision finishes without duplicate callbacks")
-        try check(progressiveOCR.cachedRecognition(for: page)?.blocks.count == 2,
-                  "cached correction candidates can be read without starting or waiting for OCR")
-        progressiveOCR.shutdown()
+        defer { recoveringOCR.shutdown() }
+        let degraded = try recoveringOCR.recognize(page: page, runner: CommandRunner(), progress: { _ in })
+        try check(degraded.review == .unavailable && degraded.blocks.count == 1
+                    && recoveringOCR.recentRecognition(for: page) == nil,
+                  "a detector-only page is visible but is not promoted to recent results")
+        let recovered = try recoveringOCR.recognize(page: page, runner: CommandRunner(), progress: { _ in })
+        try check(recovered.review == .complete && recoveringOCR.recentRecognition(for: page)?.blocks.count == 1,
+                  "retry performs independent review after a degraded result")
+        try check(!FileManager.default.fileExists(atPath: root.appendingPathComponent("Recognition").path),
+                  "page OCR never creates a persistent results directory")
+        recoveringOCR.shutdown()
 
         try mode("fast")
         let textOnly = try ocr.recognize(page: page, runner: CommandRunner(), force: true,
@@ -252,7 +244,7 @@ struct LocalOCRTests {
         let reused = try ocr.recognize(page: page, runner: CommandRunner(), makePatches: false,
                                       progress: { _ in repeatedRecognition = true })
         let upgraded = try ocr.recognize(page: page, runner: CommandRunner(), progress: { _ in })
-        try check(!repeatedRecognition && textOnly.textOnly == true && reused.textOnly == true && textOnly.verifiedText == true
+        try check(!repeatedRecognition && textOnly.textOnly == true && reused.textOnly == true && textOnly.review == .complete
                     && textOnly.blocks.allSatisfy { $0.replacementPNG == nil },
                   "text-only recognition stays reusable without falsely claiming erasure patches")
         try check(upgraded.textOnly != true && upgraded.blocks.first?.replacementPNG == Data("patch".utf8),
@@ -260,7 +252,7 @@ struct LocalOCRTests {
         try check(FileManager.default.fileExists(atPath: root.appendingPathComponent("repairs").path),
                   "the latest text-only page is repaired without screenshot encoding or new Vision OCR")
 
-        try mode("progressive")
+        try mode("normal")
         let lateRelease = DispatchSemaphore(value: 0), lateEntered = DispatchSemaphore(value: 0)
         let lateFinished = DispatchSemaphore(value: 0), lateCancelled = DispatchSemaphore(value: 0)
         let lateOCR = try LocalOCR(support: root, resources: root, visionFileHints: { _, imageFile, runner in
@@ -275,14 +267,16 @@ struct LocalOCRTests {
         defer { lateOCR.shutdown() }
         let lateRunner = CommandRunner(), lateStart = ProcessInfo.processInfo.systemUptime
         do {
-            _ = try lateOCR.recognize(page: page, runner: lateRunner, force: true, progress: { _ in }, onTextReady: { _ in
-                lateRunner.cancel()
+            _ = try lateOCR.recognize(page: page, runner: lateRunner, force: true, progress: { text in
+                if text == "补充识字…", lateEntered.wait(timeout: .now() + 1) == .success {
+                    lateRunner.cancel()
+                }
             })
-            throw AppError.message("FAIL: progressive cancellation ignored")
+            throw AppError.message("FAIL: pending Vision cancellation ignored")
         } catch is CancellationError {
-            try check(lateEntered.wait(timeout: .now()) == .success && lateCancelled.wait(timeout: .now()) == .success
+            try check(lateCancelled.wait(timeout: .now()) == .success
                       && ProcessInfo.processInfo.systemUptime - lateStart < 1.5,
-                      "cancelled early page returns while Vision is still unwinding")
+                      "cancelled page returns while Vision is still unwinding")
         }
         let cancelledDirectory = try String(contentsOf: root.appendingPathComponent("last-job"), encoding: .utf8)
         try check(!FileManager.default.fileExists(atPath: cancelledDirectory), "cancelled job directory is removed")

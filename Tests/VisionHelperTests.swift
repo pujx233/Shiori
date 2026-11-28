@@ -47,7 +47,7 @@ struct VisionHelperTests {
 
         try mode("normal")
         let hints = LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper)
-        try check(hints.count == 1 && hints[0]["text"] as? String == "今日は晴れです。", "helper returns structured local OCR hints")
+        try check(hints?.count == 1 && hints?.first?["text"] as? String == "今日は晴れです。", "helper returns structured local OCR hints")
         try check(try inputIsRemoved(), "successful helper request removes its private image directory")
         LocalOCR.prepareVision(runner: CommandRunner(), helperURL: helper)
         let calls = try String(contentsOf: root.appendingPathComponent("calls"), encoding: .utf8)
@@ -61,58 +61,58 @@ struct VisionHelperTests {
         try callerPNG.write(to: callerImage)
         let borrowed = LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper, imageFile: callerImage)
         let borrowedPath = try String(contentsOf: root.appendingPathComponent("last-input"), encoding: .utf8)
-        try check(borrowed.count == 1 && borrowedPath == callerImage.path && (try Data(contentsOf: callerImage)) == callerPNG,
+        try check(borrowed?.count == 1 && borrowedPath == callerImage.path && (try Data(contentsOf: callerImage)) == callerPNG,
                   "existing PNG goes directly to the helper and remains owned by its caller")
 
         for failure in ["fail", "invalid"] {
             try mode(failure)
             let began = Date()
             let value = LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper)
-            try check(value.isEmpty && Date().timeIntervalSince(began) < 1.5,
+            try check(value == nil && Date().timeIntervalSince(began) < 1.5,
                       "helper " + failure + " does not restart OCR in process")
             try check(try inputIsRemoved(), "helper " + failure + " removes the temporary image")
             let borrowedFailure = LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper, imageFile: callerImage)
-            try check(borrowedFailure.isEmpty && (try Data(contentsOf: callerImage)) == callerPNG,
+            try check(borrowedFailure == nil && (try Data(contentsOf: callerImage)) == callerPNG,
                       "helper " + failure + " preserves the borrowed PNG")
         }
         try mode("slow")
         let runner = CommandRunner(), began = Date()
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { runner.cancel() }
         let cancelled = LocalOCR.textHints(in: image, runner: runner, helperURL: helper)
-        try check(cancelled.isEmpty && Date().timeIntervalSince(began) < 3.5,
+        try check(cancelled == nil && Date().timeIntervalSince(began) < 3.5,
                   "unresponsive cancelled helper is killed without an in-process fallback")
         try check(try inputIsRemoved(), "cancelled helper cannot leave a screenshot directory")
         let pid = Int32(try String(contentsOf: root.appendingPathComponent("pid"), encoding: .utf8))!
         try check(kill(pid, 0) != 0, "cancelled helper process has exited")
         try mode("normal")
-        try check(LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper).count == 1,
+        try check(LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper)?.count == 1,
                   "next page can immediately start a fresh helper after cancellation")
 
         try mode("slow")
         let timeoutRunner = CommandRunner(), timeoutBegan = Date()
         let timedOut = LocalOCR.textHints(in: image, runner: timeoutRunner, helperURL: helper, helperTimeout: 0.15)
-        try check(timedOut.isEmpty && !timeoutRunner.isCancelled && Date().timeIntervalSince(timeoutBegan) < 3.5,
-                  "helper timeout leaves the page runner alive to publish empty hints")
+        try check(timedOut == nil && !timeoutRunner.isCancelled && Date().timeIntervalSince(timeoutBegan) < 3.5,
+                  "helper timeout leaves the page runner alive to report unavailable hints")
         try check(try inputIsRemoved(), "timed-out helper removes its temporary screenshot")
         try mode("normal")
-        try check(LocalOCR.textHints(in: image, runner: timeoutRunner, helperURL: helper).count == 1,
+        try check(LocalOCR.textHints(in: image, runner: timeoutRunner, helperURL: helper)?.count == 1,
                   "page runner remains reusable after a helper timeout")
 
         try mode("slow")
         let borrowedRunner = CommandRunner()
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { borrowedRunner.cancel() }
-        try check(LocalOCR.textHints(in: image, runner: borrowedRunner, helperURL: helper, imageFile: callerImage).isEmpty
+        try check(LocalOCR.textHints(in: image, runner: borrowedRunner, helperURL: helper, imageFile: callerImage) == nil
                   && (try Data(contentsOf: callerImage)) == callerPNG,
                   "cancelling a helper request preserves the caller's image")
         let borrowedTimeoutRunner = CommandRunner()
         try check(LocalOCR.textHints(in: image, runner: borrowedTimeoutRunner, helperURL: helper,
-                                     imageFile: callerImage, helperTimeout: 0.15).isEmpty
+                                     imageFile: callerImage, helperTimeout: 0.15) == nil
                   && !borrowedTimeoutRunner.isCancelled && (try Data(contentsOf: callerImage)) == callerPNG,
                   "helper timeout preserves the borrowed image and leaves its page runner reusable")
         try files.removeItem(at: callerImage)
         try mode("normal")
         let missingBegan = Date()
-        try check(LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper, imageFile: callerImage).isEmpty
+        try check(LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper, imageFile: callerImage) == nil
                   && !files.fileExists(atPath: callerImage.path) && Date().timeIntervalSince(missingBegan) < 1.5,
                   "removed job image cannot be recreated or replaced with a stale image fallback")
 
@@ -136,9 +136,9 @@ struct VisionHelperTests {
                 if (directory/'cancel').exists(): break
                 time.sleep(.01)
             hints = json.loads((directory/'hints.json').read_text())
-            assert hints == [] or hints[0]['text'] == '今日は晴れです。'
+            assert hints is None or hints[0]['text'] == '今日は晴れです。'
             assert (directory/'page.png').exists()
-            state = {'phase':'done','page':{'blocks':[],'skippedCount':0,'elapsed':.1}}
+            state = {'phase':'done','page':{'blocks':[],'skippedCount':0,'elapsed':.1,'review':'unavailable' if hints is None else 'complete'}}
             (directory/'state.tmp').write_text(json.dumps(state))
             (directory/'state.tmp').replace(directory/'state.json')
         """#
@@ -150,8 +150,8 @@ struct VisionHelperTests {
         let pageRunner = CommandRunner(), pageBegan = Date()
         let completed = try ocr.recognize(page: CapturedPage(image: image), runner: pageRunner, force: true, progress: { _ in })
         ocr.shutdown()
-        try check(completed.blocks.isEmpty && !pageRunner.isCancelled && Date().timeIntervalSince(pageBegan) < 4,
-                  "helper timeout publishes empty hints through the mailbox and the OCR page completes")
+        try check(completed.blocks.isEmpty && completed.review == .unavailable && !pageRunner.isCancelled && Date().timeIntervalSince(pageBegan) < 4,
+                  "helper timeout publishes unavailability through the mailbox and the OCR page completes")
 
         // Use the packaged default, without either injectable Vision closure.
         // The worker verifies its PNG still exists after receiving the hints.
@@ -171,12 +171,12 @@ struct VisionHelperTests {
 
         try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: helper.path)
         let invalidBegan = Date()
-        try check(LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper).isEmpty
+        try check(LocalOCR.textHints(in: image, runner: CommandRunner(), helperURL: helper) == nil
                   && Date().timeIntervalSince(invalidBegan) < 0.1,
                   "present non-executable helper does not trigger the test fallback")
         let alreadyCancelled = CommandRunner(); alreadyCancelled.cancel()
         try check(LocalOCR.textHints(in: image, runner: alreadyCancelled,
-                                    helperURL: root.appendingPathComponent("missing")).isEmpty,
+                                    helperURL: root.appendingPathComponent("missing")) == nil,
                   "already-cancelled request does not enter missing-helper fallback")
     }
 }

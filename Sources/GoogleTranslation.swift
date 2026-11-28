@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 // The public web endpoint is also used by Easydict's GTX translator. This is
 // intentionally independent of Google Cloud credentials and has no SLA. A denied
@@ -7,14 +6,14 @@ import CryptoKit
 final class GoogleTranslationClient: @unchecked Sendable {
     static let model = "google-translate"
     private let session: URLSession
-    private let cache: GoogleBubbleCache
+    private let recent = NSCache<NSString, NSString>()
     private let serial = NSLock()
     private let concurrency: Int
     private let pageTimeout: TimeInterval
 
-    init(cacheDirectory: URL, configuration: URLSessionConfiguration? = nil,
-         concurrency: Int = 3, pageTimeout: TimeInterval = 25) throws {
-        cache = try GoogleBubbleCache(directory: cacheDirectory)
+    init(configuration: URLSessionConfiguration? = nil, concurrency: Int = 3, pageTimeout: TimeInterval = 25) {
+        recent.countLimit = 128
+        recent.totalCostLimit = 2 * 1024 * 1024
         let settings = configuration ?? .ephemeral
         settings.httpMaximumConnectionsPerHost = min(6, max(1, concurrency))
         settings.timeoutIntervalForRequest = 10
@@ -27,6 +26,10 @@ final class GoogleTranslationClient: @unchecked Sendable {
         session = URLSession(configuration: settings)
         self.concurrency = min(6, max(1, concurrency))
         self.pageTimeout = pageTimeout
+    }
+
+    private static func cacheKey(source: String, namespace: String) -> NSString {
+        (String(namespace.utf8.count) + ":" + namespace + source) as NSString
     }
 
     deinit { session.invalidateAndCancel() }
@@ -55,7 +58,7 @@ final class GoogleTranslationClient: @unchecked Sendable {
         var jobIndex: [String: Int] = [:]
         var active: [Int: URLSessionDataTask] = [:]
         var next = 0, failures: [String] = []
-        defer { active.values.forEach { $0.cancel() }; cache.trim() }
+        defer { active.values.forEach { $0.cancel() } }
 
         func page() -> PageTranslation {
             let missing = ocr.blocks.count - accepted.count
@@ -78,7 +81,7 @@ final class GoogleTranslationClient: @unchecked Sendable {
                 accepted[block.id] = Dialogue.recognized(block, text: old.translation)
                 continue
             }
-            if !force, let text = cache.lookup(source: source, namespace: namespace), Self.usable(source: source, translation: text) {
+            if !force, let text = recent.object(forKey: Self.cacheKey(source: source, namespace: namespace)) as String?, Self.usable(source: source, translation: text) {
                 accepted[block.id] = Dialogue.recognized(block, text: text)
                 continue
             }
@@ -132,7 +135,8 @@ final class GoogleTranslationClient: @unchecked Sendable {
                         failures.append("部分原文未能翻译。"); continue
                     }
                     for block in job.blocks { accepted[block.id] = Dialogue.recognized(block, text: text) }
-                    cache.save(source: job.source, namespace: job.namespace, translation: text)
+                    recent.setObject(text as NSString, forKey: Self.cacheKey(source: job.source, namespace: job.namespace),
+                                     cost: job.source.utf8.count + text.utf8.count)
                     preview?(page())
                 case .failure(let error):
                     if let problem = error as? GoogleTranslationError, problem.stopsPage {
@@ -258,32 +262,4 @@ private enum GoogleTranslationError: LocalizedError {
         case .status(let code): return "Google 服务暂时不可用（\(code)）。"
         }
     }
-}
-
-private final class GoogleBubbleCache {
-    private let directory: URL
-    private struct Entry: Codable { let source: String; let namespace: String; let translation: String }
-    init(directory: URL) throws {
-        self.directory = directory
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        trim()
-    }
-    private func file(source: String, namespace: String) -> URL {
-        let bytes = try! JSONEncoder().encode([namespace, source])
-        let key = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent(key + ".json")
-    }
-    func lookup(source: String, namespace: String) -> String? {
-        let url = file(source: source, namespace: namespace)
-        guard let data = try? Data(contentsOf: url), let entry = try? JSONDecoder().decode(Entry.self, from: data),
-              entry.source == source, entry.namespace == namespace else { return nil }
-        CacheFiles.touch(url)
-        return entry.translation
-    }
-    func save(source: String, namespace: String, translation: String) {
-        guard let data = try? JSONEncoder().encode(Entry(source: source, namespace: namespace, translation: translation)) else { return }
-        try? data.write(to: file(source: source, namespace: namespace), options: .atomic)
-    }
-    func trim() { CacheFiles.trim(directory, maxBytes: 2 * 1024 * 1024, maxCount: 800) }
 }

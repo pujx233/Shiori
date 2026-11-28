@@ -19,7 +19,11 @@ struct VisionHelperMain {
                     throw NSError(domain: "ShioriVision", code: 1,
                                   userInfo: [NSLocalizedDescriptionKey: "无法读取识字图片。"])
                 }
-                hints = VisionRecognition.textHints(in: image)
+                guard let recognized = VisionRecognition.textHints(in: image) else {
+                    throw NSError(domain: "ShioriVision", code: 3,
+                                  userInfo: [NSLocalizedDescriptionKey: "系统文字补检失败。"])
+                }
+                hints = recognized
             } else {
                 throw NSError(domain: "ShioriVision", code: 2,
                               userInfo: [NSLocalizedDescriptionKey: "Usage: ShioriVision --prepare | --image PATH"])

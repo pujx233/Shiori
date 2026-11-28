@@ -22,12 +22,14 @@ struct ReadingScope: Equatable {
         let host = parts.host?.lowercased() ?? ""
         parts.host = host
         let segments = parts.path.split(separator: "/").map(String.init)
-        // Each E-Hentai image has a different image key and page suffix. Keep
-        // the gallery ID, which does not change when moving between its pages.
+        // A gallery's thumbnail page and image reader share the same work.
+        // Image keys and page suffixes change while reading that gallery.
         if ["e-hentai.org", "exhentai.org"].contains(host), segments.count == 3,
-           segments[0] == "s", let gallery = segments[2].split(separator: "-").first,
-           !gallery.isEmpty, gallery.allSatisfy(\.isNumber) {
-            parts.path = "/gallery/" + gallery; parts.query = nil; parts.fragment = nil
+           ["s", "g"].contains(segments[0]) {
+            let gallery = segments[0] == "g" ? segments[1] : String(segments[2].prefix { $0 != "-" })
+            if !gallery.isEmpty, gallery.allSatisfy(\.isNumber) {
+                parts.path = "/gallery/" + gallery; parts.query = nil; parts.fragment = nil
+            }
         } else if ["shonenjumpplus.com", "tonarinoyj.jp", "comic-days.com", "comic-action.com"].contains(host),
                   segments.first == "episode" {
             parts.fragment = nil

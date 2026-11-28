@@ -1,17 +1,6 @@
 import Foundation
 import CoreGraphics
 
-// OCR snapshots cross the recognition and translation queues. The text-only
-// context is read once per batch; no capture or UI work runs under this lock.
-final class RecognitionSnapshot: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: OCRPage?
-    private var complete = false
-    func update(_ page: OCRPage, final: Bool = false) { lock.lock(); value = page; complete = final; lock.unlock() }
-    func read() -> OCRPage? { lock.lock(); defer { lock.unlock() }; return value }
-    func snapshot() -> (page: OCRPage?, final: Bool) { lock.lock(); defer { lock.unlock() }; return (value, complete) }
-}
-
 enum BubbleCorrection {
     static func block(from dialogue: Dialogue, source: String? = nil) throws -> OCRBlock {
         guard let bounds = dialogue.bounds else { throw AppError.message("这个气泡的位置不完整。") }

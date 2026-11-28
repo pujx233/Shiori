@@ -35,9 +35,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var statusDot: NSImageView!
     private var statusItem: NSStatusItem!
     private var client: CodexClient?
-    private var previewClient: CodexClient?
     private var google: GoogleTranslationClient?
-    private var cache: TranslationCache?
+    private var recentPages = RecentPages<PageKey, PageResult>()
+    private var corrections: CorrectionStore?
     private var ocr: LocalOCR?
     private var requestDigest: String?
     private var pageFailure: (digest: String, message: String)?
@@ -59,7 +59,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var probeCaptures = 0
     private var fullCaptures = 0
     private var latestPage: CapturedPage?
-    private var shownEntry: CacheEntry?
+    private var shownEntry: PageResult?
     private var runner: CommandRunner?
     private var requestID: UUID?
     private var captureBusy = false
@@ -113,8 +113,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         do {
             let support = try AppStorage.directory()
             workProfiles = try WorkProfileStore(directory: support)
-            cache = try TranslationCache(directory: support.appendingPathComponent("Translations"))
-            google = try GoogleTranslationClient(cacheDirectory: support.appendingPathComponent("GoogleTranslations"), concurrency: 6)
+            corrections = try CorrectionStore(root: support)
+            google = GoogleTranslationClient(concurrency: 6)
             ocr = try LocalOCR(support: support, resources: Bundle.main.resourceURL!)
             if let ocr {
                 let makePatches = overlayButton.state == .on
@@ -122,12 +122,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
             do {
                 let workspace = support.appendingPathComponent("Jobs")
-                let textCache = support.appendingPathComponent("TextTranslations")
                 let resources = Bundle.main.resourceURL!
-                client = try CodexClient(resources: resources, workspace: workspace, textCacheDirectory: textCache)
-                previewClient = try? CodexClient(resources: resources, workspace: workspace.appendingPathComponent("Preview"),
-                                                 textCacheDirectory: textCache, shareReadingContextWith: client)
-                if options.provider == .codex { prepareCodexClients() }
+                client = try CodexClient(resources: resources, workspace: workspace)
+                if options.provider == .codex { prepareCodex() }
             } catch { modelError = error.localizedDescription }
             if let data = defaults.data(forKey: "modelCatalog"),
                let saved = try? JSONDecoder().decode([ModelInfo].self, from: data), !saved.isEmpty {
@@ -175,7 +172,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         servicePanel?.cancelServices()
         _ = translationGroup.wait(timeout: .now() + 4)
         client?.shutdown()
-        previewClient?.shutdown()
         google?.shutdown()
         ocr?.shutdown()
     }
@@ -407,10 +403,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         updateStatus()
     }
     @objc private func toggleModelOptions() { modelOptionsExpanded.toggle(); updateProviderUI() }
-    private func prepareCodexClients() {
-        for service in [client, previewClient].compactMap({ $0 }) {
-            DispatchQueue.global(qos: .utility).async { try? service.prepare() }
-        }
+    private func prepareCodex() {
+        guard let client else { return }
+        DispatchQueue.global(qos: .utility).async { try? client.prepare() }
     }
 
     @objc private func providerChanged() {
@@ -419,7 +414,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         detailLabel.stringValue = ""
         updateProviderUI()
         if options.provider == .codex {
-            prepareCodexClients()
+            prepareCodex()
             if models.isEmpty { refreshModels() }
         }
         setStatus(readingEnabled ? "等待翻译…" : "就绪")
@@ -654,6 +649,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                     "page": latestPage?.digest ?? "", "request": requestDigest ?? "", "settling": tracker.isSettling,
                     "viewport": latestPage.map { NSStringFromRect($0.contentRect) } ?? "",
                     "timings": shownEntry?.timings?.diagnosticState ?? [:],
+                    "ocrReview": shownEntry?.review.rawValue ?? "",
                     "captures": ["probe": probeCaptures, "full": fullCaptures]]
                 if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]) {
                     try? data.write(to: URL(fileURLWithPath: "/private/tmp/Shiori-diagnostics.json"), options: .atomic)
@@ -830,6 +826,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             self.ocr?.shutdown()
             let support = try AppStorage.directory()
             self.ocr = try LocalOCR(support: support, resources: Bundle.main.resourceURL!)
+            self.recentPages = RecentPages()
+            self.shownEntry = nil; self.correctionCandidates = nil; self.overlay.hide()
             self.setStatus("本地组件已就绪")
         }
         servicePanel = controller; popover.performClose(nil)
@@ -846,7 +844,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
-    private func prepareOverlayIfNeeded(_ entry: CacheEntry) {
+    private func prepareOverlayIfNeeded(_ entry: PageResult) {
         guard overlayButton.state == .on, entry.textOnly == true, entry.options == options,
               let page = latestPage, page.digest == entry.pageDigest else { return }
         submit(page, force: false)
@@ -854,35 +852,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func submit(_ page: CapturedPage, force: Bool, refreshOCR: Bool = false, editOnReady: Bool = false) {
         guard runner == nil else { return }
-        guard let cache, let ocr else { setStatus("翻译组件尚未就绪", error: true); return }
-        let client = client, previewClient = previewClient, google = google
-        let selected = options
-        let makePatches = overlayButton.state == .on
-        let scheduling: TranslationPipeline.Scheduling
-        if selected.provider == .google { scheduling = .progressive }
-        else { scheduling = previewClient == nil ? .verified : .verifiedWithPreview }
+        guard let ocr else { setStatus("翻译组件尚未就绪", error: true); return }
         guard translationAvailable else {
             stopWork(); setStatus("请先加载可用模型", error: true); return
         }
+        let client = client, google = google, selected = options
+        let makePatches = overlayButton.state == .on
         if selected.provider == .codex {
             defaults.set(selected.model, forKey: "selectedModel"); defaults.set(selected.effort, forKey: "effort")
         }
         pageFailure = nil
         tracker.markSubmitted(page.digest)
-        let previous = shownEntry.flatMap { $0.pageDigest == page.digest && $0.options == selected ? $0 : nil }
-            ?? cache.lookup(page: page, options: selected)
-        let cached = force ? nil : previous
-        let corrections = cache.manualCorrections(page: page, options: selected,
-            legacyContext: (capture.source?.identity ?? "") + "|" + capture.windowTitle)
-            + (previous?.translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true } ?? [])
-        if let entry = cached {
-            if let recognized = ocr.cachedRecognition(for: page) { setCorrectionCandidates(recognized, digest: page.digest) }
-            show(entry, cached: true)
-            if entry.translation.untranslatedCount == 0, !makePatches || entry.textOnly != true {
+        let key = PageKey(digest: page.digest, options: selected)
+        let previous = recentPages.lookup(key)
+        if !force, let previous {
+            if let recognized = previous.recognition { setCorrectionCandidates(recognized, digest: page.digest) }
+            show(previous, cached: true)
+            if !makePatches || previous.textOnly != true {
                 if editOnReady { beginBubbleCorrection(for: page) }
                 return
             }
         }
+        let manual = corrections?.corrections(for: page, options: selected,
+            legacyContext: (capture.source?.identity ?? "") + "|" + capture.windowTitle) ?? []
         let taskID = UUID(), jobRunner = CommandRunner(), began = Date()
         requestID = taskID; runner = jobRunner; requestDigest = page.digest; startTime = began
         spinner.isHidden = false; spinner.startAnimation(nil); detailLabel.stringValue = ""
@@ -900,113 +892,94 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
         }
         let group = translationGroup
-        let recognition = RecognitionSnapshot()
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             defer { group.leave() }
             let result = Result {
-                try TranslationPipeline.run(runner: jobRunner, began: began, corrections: corrections,
-                    scheduling: scheduling, renderPatches: makePatches, recognize: { textReady in
-                    var ready = false
-                    let final = try ocr.recognize(page: page, runner: jobRunner, force: refreshOCR,
-                        streamDrafts: scheduling == .progressive, earlyTranslation: scheduling == .verifiedWithPreview,
-                        makePatches: makePatches,
-                        progress: { if !ready { report($0) } }, onTextReady: {
-                            let adjusted = TranslationPipeline.applyingCorrections($0, corrections: corrections)
-                            recognition.update(adjusted); ready = true; textReady(adjusted)
-                        })
-                    let adjusted = TranslationPipeline.applyingCorrections(final, corrections: corrections)
-                    recognition.update(adjusted, final: true)
-                    return adjusted
-                }, translate: { recognized, preview in
-                    let accepted = DispatchQueue.main.sync { () -> Bool in
-                        MainActor.assumeIsolated {
-                            guard let self, self.requestID == taskID else { return false }
-                            return self.latestPage?.digest == page.digest
+                try TranslationPipeline.run(runner: jobRunner, began: began, corrections: manual, renderPatches: makePatches,
+                    recognize: { textReady in
+                        try ocr.recognize(page: page, runner: jobRunner, force: refreshOCR,
+                            makePatches: makePatches, progress: report, onTextReady: textReady)
+                    }, translate: { recognized, context, preview in
+                        // Only a successful text-only result on the same page
+                        // can supply translations when enabling its overlay.
+                        let seed = !force && previous?.textOnly == true && previous?.recognition?.hasSameText(as: context) == true
+                            ? previous?.translation : nil
+                        if selected.provider == .google, let google {
+                            return try google.translate(ocr: recognized, options: selected, runner: jobRunner,
+                                force: force, seed: seed, progress: report, preview: preview).0
                         }
-                    }
-                    guard accepted else { throw CancellationError() }
-                    if selected.provider == .google, let google {
-                        return try google.translate(ocr: recognized, options: selected, runner: jobRunner,
-                            force: force, seed: cached?.translation, progress: report, preview: preview).0
-                    }
-                    guard let client else { throw AppError.configuration("请先安装并登录 Codex。") }
-                    let context = recognition.snapshot()
-                    let isWholePage = (context.final || context.page?.verifiedText == true)
-                        && context.page?.blocks.map(\.id) == recognized.blocks.map(\.id)
-                    let service = recognized.previewBatch == true ? previewClient ?? client : client
-                    return try service.translate(ocr: recognized, options: selected, runner: jobRunner,
-                        force: force, seed: cached?.translation, rememberResult: false,
-                        pageContext: context.page, cacheResult: isWholePage, progress: report, preview: preview).0
-                }, preview: { partial, timings in
-                    let elapsed = Date().timeIntervalSince(began)
-                    DispatchQueue.main.async {
-                        guard let self, self.requestID == taskID, self.options == selected,
-                              self.latestPage?.digest == page.digest else { return }
-                        self.shownEntry = CacheEntry(id: "preview-\(taskID)-\(partial.dialogues.count)", options: selected,
-                            pageDigest: page.digest, translation: partial, createdAt: Date(), elapsed: elapsed,
-                            timings: timings, textOnly: makePatches ? nil : true)
-                        self.updateOverlay()
-                        let total = partial.dialogues.count + partial.untranslatedCount
-                        self.setStatus("已译 \(partial.translatedCount)/\(total)")
-                    }
-                })
+                        guard let client else { throw AppError.configuration("请先安装并登录 Codex。") }
+                        return try client.translate(ocr: recognized, options: selected, runner: jobRunner,
+                            seed: seed, pageContext: context, progress: report, preview: preview).0
+                    }, preview: { partial, timings, review in
+                        DispatchQueue.main.async {
+                            guard let self, self.requestID == taskID, self.options == selected,
+                                  self.latestPage?.digest == page.digest else { return }
+                            self.shownEntry = PageResult(options: selected, pageDigest: page.digest, translation: partial,
+                                elapsed: Date().timeIntervalSince(began), timings: timings, textOnly: !makePatches,
+                                review: review, state: .translating)
+                            self.updateOverlay()
+                            let total = partial.dialogues.count + partial.untranslatedCount
+                            let progress = "已译 \(partial.translatedCount)/\(total)"
+                            self.setStatus(review == .complete ? progress : "补检未完成 · " + progress)
+                        }
+                    })
             }
             DispatchQueue.main.async {
                 guard let self, self.requestID == taskID else { return }
                 self.finishBusyState()
-                if let recognized = recognition.read() { self.setCorrectionCandidates(recognized, digest: page.digest) }
+                guard self.options == selected, self.latestPage?.digest == page.digest else {
+                    self.setStatus("等待翻译当前页…")
+                    return
+                }
                 switch result {
-                case .success(let (translation, timings)):
-                    do {
-                        if selected.provider == .codex {
-                            client?.remember(page: translation, options: selected, ocr: recognition.read())
-                        }
-                        guard let currentCache = self.cache else { return }
-                        let entry = try currentCache.save(page: page, options: selected, translation: translation,
-                            elapsed: Date().timeIntervalSince(began), timings: timings,
-                            textOnly: recognition.read()?.textOnly, persistManual: false)
-                        if self.options == selected, self.latestPage?.digest == page.digest {
-                            self.show(entry, cached: false)
-                            if editOnReady, self.overlayButton.state == .on {
-                                self.beginBubbleCorrection(for: page)
-                            } else { self.prepareOverlayIfNeeded(entry) }
-                        } else { self.setStatus("等待翻译当前页…") }
-                    } catch { self.setStatus("保存译文失败：\(error.localizedDescription)", error: true) }
+                case .success(let processed):
+                    let translation = processed.translation
+                    let recognized = processed.recognition
+                    let state: PageProcessingState = translation.untranslatedCount == 0 ? .complete : .interrupted
+                    let entry = PageResult(options: selected, pageDigest: page.digest, translation: translation,
+                        elapsed: Date().timeIntervalSince(began), timings: processed.timings, textOnly: recognized.textOnly,
+                        review: recognized.review, state: state, recognition: recognized)
+                    if entry.isReusable {
+                        self.recentPages.store(entry, for: key)
+                        if selected.provider == .codex { client?.remember(page: translation, options: selected) }
+                    }
+                    self.setCorrectionCandidates(recognized, digest: page.digest)
+                    self.show(entry, cached: false)
+                    if editOnReady, self.overlayButton.state == .on {
+                        self.beginBubbleCorrection(for: page)
+                    } else {
+                        self.prepareOverlayIfNeeded(entry)
+                    }
                 case .failure(let error):
                     if error is CancellationError {
                         self.tracker.release(page.digest); self.pageFailure = nil
-                        self.overlay.hide()
-                        self.setStatus(self.readingEnabled ? "正在检查新页面…" : "已停止")
+                        self.overlay.hide(); self.setStatus(self.readingEnabled ? "正在检查新页面…" : "已停止")
                         return
                     }
-                    if let partial = self.shownEntry, partial.pageDigest == page.digest,
-                       !partial.translation.dialogues.isEmpty {
-                        let previous = partial.translation
-                        let kept = PageTranslation(summary: "", dialogues: previous.dialogues,
-                            notes: error.localizedDescription, skippedCount: previous.skippedCount,
-                            ocrSkippedCount: previous.ocrSkippedCount)
-                        // A full streaming preview is not a successful final
-                        // response. Persist only incomplete seeds after failure.
-                        if kept.untranslatedCount > 0, let saved = try? self.cache?.save(page: page, options: selected, translation: kept,
-                            elapsed: Date().timeIntervalSince(began), timings: partial.timings,
-                            textOnly: partial.textOnly, persistManual: false) {
-                            self.shownEntry = saved
-                        }
-                        self.updateOverlay()
-                    } else { self.shownEntry = nil; self.overlay.hide() }
-                    self.pageFailure = (page.digest, error.localizedDescription)
-                    if (error as? AppError)?.needsUserAction == true { self.stopWork() }
-                    self.setStatus(error is CancellationError ? "已停止" : error.localizedDescription,
-                                   error: !(error is CancellationError))
-                    if self.readingEnabled {
-                        self.statusLabel.toolTip = error.localizedDescription + "\n右键 Shiori 图标可重试此页。"
+                    if let previous {
+                        self.shownEntry = previous
+                    } else if self.shownEntry?.pageDigest == page.digest, self.shownEntry?.options == selected {
+                        self.shownEntry?.state = .interrupted
+                    } else {
+                        self.shownEntry = nil
                     }
+                    if let recognized = previous?.recognition ?? ocr.recentRecognition(for: page) {
+                        self.setCorrectionCandidates(recognized, digest: page.digest)
+                    }
+                    self.updateOverlay()
+                    let message = error.localizedDescription
+                    self.pageFailure = (page.digest, message)
+                    if (error as? AppError)?.needsUserAction == true { self.stopWork() }
+                    self.setStatus(message, error: true)
+                    self.statusLabel.toolTip = message + "\n右键 Shiori 图标可重试此页。"
                 }
             }
         }
     }
-    private func show(_ entry: CacheEntry, cached: Bool) {
+
+    private func show(_ entry: PageResult, cached: Bool) {
         shownEntry = entry; modelError = nil; updateOverlay()
         if let failure = pageFailure, failure.digest == entry.pageDigest {
             setStatus(failure.message, error: true); return
@@ -1018,12 +991,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let partial = overlayButton.state == .on
             ? "已译 \(translated)/\(total) · 显示 \(rendered)"
             : "已翻译 \(translated)/\(total) 处"
-        let status = total == 0 ? "未检测到日文" : entry.translation.pendingCount > 0
-            ? "已译 \(translated) · \(entry.translation.pendingCount) 处待确认"
-            : (overlayButton.state == .on && rendered < translated) ? partial : "翻译完成"
-        setStatus(status, error: total > 0 && translated == 0 && entry.translation.preservedCount == 0)
+        let status: String
+        if entry.review == .unavailable {
+            status = "补检未完成 · 已译 \(translated) 处"
+        } else if entry.state == .interrupted {
+            status = "本页未完成 · 已译 \(translated) 处"
+        } else if entry.state == .translating {
+            status = partial
+        } else if total == 0 {
+            status = "未检测到日文"
+        } else if entry.translation.pendingCount > 0 {
+            status = "已译 \(translated) · \(entry.translation.pendingCount) 处待确认"
+        } else {
+            status = overlayButton.state == .on && rendered < translated ? partial : "翻译完成"
+        }
+        setStatus(status, error: entry.review == .unavailable || entry.state == .interrupted)
         let unrecognized = entry.translation.ocrSkippedCount ?? 0
         var details = ["检测到 \(total) 处候选文字：已译 \(translated) 处，未译 \(entry.translation.untranslatedCount) 处，未识字 \(unrecognized) 处。"]
+        if entry.review == .unavailable { details.append("系统文字补检未完成，可在「阅读」菜单重新识字。") }
+        if entry.state == .interrupted { details.append("可右键 Shiori 图标重新翻译此页。") }
         if entry.translation.unclearCount > 0 {
             details.append("\(entry.translation.unclearCount) 处待确认，其中 \(entry.translation.preservedCount) 处保留原图。")
         }
@@ -1093,7 +1079,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func beginBubbleCorrection(for page: CapturedPage) {
-        if correctionCandidates?.digest != page.digest, let recognized = ocr?.cachedRecognition(for: page) {
+        if correctionCandidates?.digest != page.digest, let recognized = ocr?.recentRecognition(for: page) {
             setCorrectionCandidates(recognized, digest: page.digest)
         }
         updateOverlay()
@@ -1102,17 +1088,33 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func saveCorrection(_ dialogue: Dialogue, page: CapturedPage, selected: TranslationOptions) throws {
         guard let current = shownEntry, current.pageDigest == page.digest, current.options == selected,
-              let cache else { throw AppError.message("页面已改变，请重新选择气泡。") }
+              let corrections else { throw AppError.message("页面已改变，请重新选择气泡。") }
         let order = correctionCandidates?.digest == page.digest
             ? correctionCandidates!.dialogues.map(\.location) : current.translation.dialogues.map(\.location)
         let previousProfile = workProfiles?.profile(id: activeWorkID)
-        let updated = BubbleCorrection.replacing(dialogue, in: current.translation, order: order)
-        let entry = try cache.save(page: page, options: selected, translation: updated,
-                                   elapsed: current.elapsed, timings: current.timings, textOnly: current.textOnly)
+        let saved = corrections.corrections(for: page, options: selected,
+            legacyContext: (capture.source?.identity ?? "") + "|" + capture.windowTitle)
+        var edited = dialogue
+        edited.correctionEngine = LocalOCR.engineVersion
+        let manual = saved.filter { $0.location != edited.location } + [edited]
+        try corrections.save(manual, for: page, options: selected)
+        let updated = BubbleCorrection.replacing(edited, in: current.translation, order: order)
+        let entry = PageResult(options: selected, pageDigest: page.digest, translation: updated,
+            elapsed: current.elapsed, timings: current.timings, textOnly: current.textOnly,
+            review: current.review, state: current.state, recognition: current.recognition)
         correctionHistory.record(CorrectionSnapshot(translation: current.translation, profile: previousProfile,
-                                                     textOnly: current.textOnly), page: page.digest)
-        if var profile = previousProfile { profile.learn(dialogue); try? workProfiles?.save(profile) }
-        if updated.untranslatedCount == 0, pageFailure?.digest == page.digest { pageFailure = nil }
+            textOnly: current.textOnly, review: current.review, state: current.state, manual: saved), page: page.digest)
+        if var profile = previousProfile { profile.learn(edited); try? workProfiles?.save(profile) }
+        updateRecentAfterCorrection(entry, page: page)
+    }
+
+    private func updateRecentAfterCorrection(_ entry: PageResult, page: CapturedPage) {
+        let key = PageKey(digest: page.digest, options: entry.options)
+        recentPages.remove(key)
+        if entry.isReusable {
+            recentPages.store(entry, for: key)
+            if pageFailure?.digest == page.digest { pageFailure = nil }
+        }
         show(entry, cached: true)
     }
 
@@ -1182,8 +1184,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                     if selected.provider == .google, let google {
                         result = try google.translate(ocr: single, options: selected, runner: jobRunner, force: true).0
                     } else if let client {
-                        result = try client.translate(ocr: single, options: selected, runner: jobRunner, force: true,
-                                                      rememberResult: false, pageContext: context, cacheResult: false).0
+                        result = try client.translate(ocr: single, options: selected, runner: jobRunner, pageContext: context).0
                     } else { throw AppError.message("翻译服务尚未就绪。") }
                     try jobRunner.checkCancellation()
                     guard let value = result.dialogues.first(where: { $0.location == id }) else {
@@ -1235,22 +1236,31 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 guard self.operationEpoch == epoch, current.hasSameContent(as: page) else {
                     throw AppError.message("页面已改变，请回到要修正的那一页。")
                 }
+                guard let corrections = self.corrections else { return }
+                let manual = corrections.corrections(for: page, options: entry.options)
                 let snapshot = CorrectionSnapshot(translation: entry.translation,
-                    profile: self.workProfiles?.profile(id: self.activeWorkID), textOnly: entry.textOnly)
+                    profile: self.workProfiles?.profile(id: self.activeWorkID), textOnly: entry.textOnly,
+                    review: entry.review, state: entry.state, manual: manual)
                 var history = self.correctionHistory
                 guard let restored = redo ? history.redo(current: snapshot, page: page.digest)
                     : history.undo(current: snapshot, page: page.digest) else { return }
-                guard let saved = try self.cache?.save(page: page, options: entry.options,
-                    translation: restored.translation, elapsed: entry.elapsed, timings: entry.timings,
-                    textOnly: restored.textOnly) else { return }
+                try corrections.save(restored.manual, for: page, options: entry.options)
+                let saved = PageResult(options: entry.options, pageDigest: page.digest, translation: restored.translation,
+                    elapsed: entry.elapsed, timings: entry.timings, textOnly: restored.textOnly,
+                    review: restored.review, state: restored.state, recognition: entry.recognition)
                 if let profile = restored.profile { try self.workProfiles?.save(profile) }
-                self.correctionHistory = history; self.show(saved, cached: true)
+                self.correctionHistory = history
+                self.updateRecentAfterCorrection(saved, page: page)
                 self.setStatus(redo ? "已重做气泡修正" : "已撤销气泡修正")
                 self.prepareOverlayIfNeeded(saved)
             } catch { self.setStatus(error.localizedDescription, error: true) }
         }
     }
-    private func cancelTranslation() { runner?.cancel(); finishBusyState() }
+    private func cancelTranslation() {
+        runner?.cancel()
+        if shownEntry?.state == .translating { shownEntry?.state = .interrupted }
+        finishBusyState()
+    }
     private func resetTracking() {
         lastReaderProbe = nil
         settlingProbe?.cancel(); settlingProbe = nil; didConfirmCandidate = false
@@ -1287,7 +1297,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         CGRequestScreenCaptureAccess()
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
     }
-    @objc private func openCache() { if let cache { NSWorkspace.shared.open(cache.directory) } }
 }
 
 private enum PanelPalette {

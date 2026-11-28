@@ -13,7 +13,7 @@ struct ReaderIntegration {
         let work = output.appendingPathComponent("runtime")
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         let ocr = try LocalOCR(support: work, resources: resources, engineRoot: support.appendingPathComponent("OCR"))
-        let google = try GoogleTranslationClient(cacheDirectory: work.appendingPathComponent("Google"), concurrency: 6)
+        let google = GoogleTranslationClient(concurrency: 6)
         let codex = try CodexClient(resources: resources, workspace: work.appendingPathComponent("Codex"))
         defer { ocr.shutdown(); google.shutdown(); codex.shutdown(); try? FileManager.default.removeItem(at: work) }
         let launch = Date(); try ocr.prepare(); let processLaunch = Date().timeIntervalSince(launch)
@@ -29,9 +29,9 @@ struct ReaderIntegration {
             let selected = TranslationOptions(model: GoogleTranslationClient.model, effort: "none", provider: .google)
             let result = try TranslationPipeline.run(runner: runner, began: began, recognize: { ready in
                 try ocr.recognize(page: page, runner: runner, progress: { _ in }, onTextReady: { textReady = Date().timeIntervalSince(began); ready($0) })
-            }, translate: { text, preview in
+            }, translate: { text, _, preview in
                 try google.translate(ocr: text, options: selected, runner: runner, preview: preview).0
-            }, preview: { _, _ in })
+            }, preview: { _, _, _ in })
             let total = Date().timeIntervalSince(began)
             let rendered = try OverlayPreview.render(result.0, image: image, destination: output.appendingPathComponent(name + "-google.png"), scale: 1)
             try encoder.encode(result.0).write(to: output.appendingPathComponent(name + "-google.json"))

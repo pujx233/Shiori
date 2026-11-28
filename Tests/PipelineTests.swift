@@ -22,11 +22,11 @@ struct PipelineTests {
             lock.lock(); let early = previews.count; lock.unlock()
             try check(early == 0, "unfinished repairs never reach the overlay")
             return final
-        }, translate: { page, preview in
+        }, translate: { page, _, preview in
             let translated = PageTranslation(summary: "", dialogues: [Dialogue.recognized(page.blocks[0], text: "早上好")], notes: "", skippedCount: 1, ocrSkippedCount: 1)
             preview(translated); started.signal()
             return translated
-        }, preview: { page, _ in lock.lock(); previews.append(page); lock.unlock() })
+        }, preview: { page, _, _ in lock.lock(); previews.append(page); lock.unlock() })
         try check(result.0.dialogues.first?.replacementPNG == patch, "early translation binds final background patches")
         try check(result.0.skippedCount == 1 && result.0.untranslatedCount == 0, "OCR omissions retain their own count")
         try check(result.1.firstResult != nil, "first visible result is timed after geometry is ready")
@@ -59,7 +59,7 @@ struct PipelineTests {
             try check(early[0].skippedCount == 3 && early[0].ocrSkippedCount == 1, "unready backgrounds remain pending without losing OCR omissions")
             Thread.sleep(forTimeInterval: 0.04)
             return repaired
-        }, translate: { _, preview in preview(allText); return allText }, preview: { page, _ in
+        }, translate: { _, _, preview in preview(allText); return allText }, preview: { page, _, _ in
             lock.lock(); mixedPreviews.append(page); lock.unlock(); firstVisible.signal()
         })
         try check(fast.0.dialogues.count == 3 && fast.0.untranslatedCount == 0, "final repairs add remaining backgrounds without losing early text")
@@ -75,9 +75,9 @@ struct PipelineTests {
                 ready(mixed)
                 guard earlyShown.wait(timeout: .now() + 2) == .success else { throw AppError.message("No early preview") }
                 cancelledEarly.cancel(); return repaired
-            }, translate: { _, preview in
+            }, translate: { _, _, preview in
                 preview(allText); Thread.sleep(forTimeInterval: 0.08); preview(allText); return allText
-            }, preview: { _, _ in lock.lock(); cancelPreviews += 1; lock.unlock(); earlyShown.signal() })
+            }, preview: { _, _, _ in lock.lock(); cancelPreviews += 1; lock.unlock(); earlyShown.signal() })
             throw AppError.message("FAIL: cancelled early pipeline succeeded")
         } catch is CancellationError {
             try check(cancelPreviews == 1, "cancelled early page suppresses late translation and final geometry previews")
@@ -85,11 +85,11 @@ struct PipelineTests {
         let wrong = OCRPage(blocks: [OCRBlock(id: "a", text: "違うページ", bounds: bounds)], skippedCount: 0, elapsed: 0)
         try check(TranslationPipeline.bind(result.0, to: wrong).dialogues.isEmpty, "different OCR text cannot inherit an old translation")
         var invoked = false
-        let empty = try TranslationPipeline.run(runner: CommandRunner(), recognize: { _ in OCRPage(blocks: [], skippedCount: 2, elapsed: 0) }, translate: { _, _ in invoked = true; return result.0 }, preview: { _, _ in })
+        let empty = try TranslationPipeline.run(runner: CommandRunner(), recognize: { _ in OCRPage(blocks: [], skippedCount: 2, elapsed: 0) }, translate: { _, _, _ in invoked = true; return result.0 }, preview: { _, _, _ in })
         try check(!invoked && empty.0.skippedCount == 2, "empty OCR never makes a network request")
         let cancelled = CommandRunner()
         do {
-            _ = try TranslationPipeline.run(runner: cancelled, recognize: { _ in cancelled.cancel(); return final }, translate: { _, _ in throw AppError.message("Must not run") }, preview: { _, _ in })
+            _ = try TranslationPipeline.run(runner: cancelled, recognize: { _ in cancelled.cancel(); return final }, translate: { _, _, _ in throw AppError.message("Must not run") }, preview: { _, _, _ in })
             throw AppError.message("FAIL: cancelled pipeline succeeded")
         } catch is CancellationError { try check(true, "cancellation prevents translation launch") }
         let failed = CommandRunner()
@@ -100,7 +100,7 @@ struct PipelineTests {
                 while !failed.isCancelled && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
                 try failed.checkCancellation()
                 throw AppError.message("Repairs were not cancelled on translation failure")
-            }, translate: { _, _ in throw AppError.configuration("Service denied") }, preview: { _, _ in })
+            }, translate: { _, _, _ in throw AppError.configuration("Service denied") }, preview: { _, _, _ in })
             throw AppError.message("FAIL: service error succeeded")
         } catch let error as AppError {
             try check(error.needsUserAction && error.localizedDescription == "Service denied", "service failure cancels repairs and preserves the original error")
@@ -117,284 +117,104 @@ struct PipelineTests {
         func wait(_ semaphore: DispatchSemaphore, _ label: String) throws {
             guard semaphore.wait(timeout: .now() + 2) == .success else { throw AppError.message("FAIL: " + label) }
         }
-        let initial = block("first", "早い"), added = block("added", "後から"), removed = block("removed", "消える")
-        let firstBatch = DispatchSemaphore(value: 0), releaseFirst = DispatchSemaphore(value: 0)
-        var batches: [[String]] = [], incrementalPreviews: [PageTranslation] = []
-        let incremental = try TranslationPipeline.run(runner: CommandRunner(), recognize: { ready in
-            ready(page([initial]))
-            try wait(firstBatch, "first batch begins before final OCR")
-            ready(page([initial, removed]))
-            ready(page([initial, added], skipped: 2))
-            ready(page([initial, added], skipped: 2))
-            releaseFirst.signal()
-            return page([added, initial], skipped: 2)
-        }, translate: { input, preview in
-            lock.lock(); batches.append(input.blocks.map(\.id)); let index = batches.count; lock.unlock()
-            let value = translated(input)
-            if index == 1 {
-                preview(value); firstBatch.signal()
-                try wait(releaseFirst, "recognizer releases first batch")
-            }
-            return value
-        }, preview: { value, _ in lock.lock(); incrementalPreviews.append(value); lock.unlock() })
-        try check(batches == [["first"], ["added"]], "cumulative OCR translates additions once and skips an obsolete queued region")
-        try check(incremental.0.dialogues.map(\.location) == ["added", "first"], "incremental translation follows final reading order")
-        try check(incremental.0.skippedCount == 2 && incremental.0.untranslatedCount == 0, "batch accounting preserves only final OCR omissions")
-        try check(incrementalPreviews.first?.dialogues.map(\.location) == ["first"], "first reliable bubble appears before OCR supplements it")
-
-        let verifiedRequest = DispatchSemaphore(value: 0)
-        var verifiedBatches: [[String]] = []
-        var verified = page([added, initial])
-        verified.verifiedText = true
-        let verifiedResult = try TranslationPipeline.run(runner: CommandRunner(), scheduling: .verified, renderPatches: false,
+        let first = block("first", "早い")
+        let second = block("second", "後から")
+        let send = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        var requests: [[String]] = []
+        let whole = page([first, second], skipped: 2)
+        let singleRequest = try TranslationPipeline.run(runner: CommandRunner(), renderPatches: false,
             recognize: { ready in
-                ready(page([initial, removed]))
-                guard verifiedRequest.wait(timeout: .now() + 0.15) == .timedOut else {
-                    throw AppError.message("FAIL: a provisional OCR snapshot triggered a Codex request")
-                }
-                ready(verified)
-                try wait(verifiedRequest, "verified text starts translation before patches complete")
-                return verified
-            }, translate: { input, preview in
-                verifiedBatches.append(input.blocks.map(\.id))
-                let result = translated(input)
-                preview(result)
-                verifiedRequest.signal()
-                return result
-            }, preview: { _, _ in })
-        try check(verifiedBatches == [["added", "first"]], "verified mode sends one ordered translation batch")
-        try check(verifiedResult.1.firstResult != nil, "text-only previews do not wait for drawable patches")
-
-        let previewStarted = DispatchSemaphore(value: 0), releasePreview = DispatchSemaphore(value: 0)
-        let remainderStarted = DispatchSemaphore(value: 0)
-        var offered = page([initial])
-        offered.previewBatch = true
-        let overlapping = try TranslationPipeline.run(runner: CommandRunner(), scheduling: .verifiedWithPreview,
-            renderPatches: false, recognize: { ready in
-                ready(offered)
-                try wait(previewStarted, "preview Codex request begins on the offered text")
-                ready(page([initial, removed]))
-                ready(verified)
-                try wait(remainderStarted, "verified request starts while the preview is still running")
-                releasePreview.signal()
-                return verified
-            }, translate: { input, preview in
-                let output = translated(input)
-                preview(output)
-                if input.previewBatch == true {
-                    guard input.blocks.map(\.id) == ["first"] else { throw AppError.message("Invalid preview subset") }
-                    previewStarted.signal()
-                    try wait(releasePreview, "preview finishes after the second request starts")
-                } else {
-                    guard input.blocks.map(\.id) == ["added"] else { throw AppError.message("Invalid verified subset") }
-                    remainderStarted.signal()
-                }
-                return output
-            }, preview: { _, _ in })
-        try check(overlapping.0.dialogues.map(\.location) == ["added", "first"]
-                  && overlapping.1.translationBatches == 2, "overlapping replies preserve all results in final reading order")
-
-        let withoutPreview = try TranslationPipeline.run(runner: CommandRunner(), scheduling: .verifiedWithPreview,
-            recognize: { ready in ready(page([initial])); return verified },
-            translate: { input, _ in
-                guard input.previewBatch != true, input.blocks.map(\.id) == ["added", "first"] else {
-                    throw AppError.message("Unverified text entered a full-page request")
-                }
+                ready(whole)
+                try wait(send, "whole-page translation starts before background repairs")
+                release.signal()
+                return whole
+            }, translate: { input, context, preview in
+                requests.append(input.blocks.map(\.id))
+                guard context.blocks.count == 2 else { throw AppError.message("Missing context") }
+                preview(translated(input)); send.signal()
+                try wait(release, "allow the whole-page request to finish")
                 return translated(input)
-            }, preview: { _, _ in })
-        try check(withoutPreview.1.translationBatches == 1, "the parallel scheduler uses one request without an eligible preview")
+            }, preview: { _, _, _ in })
+        try check(requests == [["first", "second"]] && singleRequest.timings.translationBatches == 1,
+                  "final text reaches one request in page reading order")
+        try check(singleRequest.translation.ocrSkippedCount == 2
+                    && singleRequest.translation.untranslatedCount == 0, "OCR omissions remain separate from translation omissions")
 
-        let previewFailed = DispatchSemaphore(value: 0)
-        let recoveredPreview = try TranslationPipeline.run(runner: CommandRunner(), scheduling: .verifiedWithPreview,
-            recognize: { ready in
-                ready(offered)
-                try wait(previewFailed, "failed optional preview returns before verified text")
-                return verified
-            }, translate: { input, _ in
-                if input.previewBatch == true {
-                    previewFailed.signal()
-                    throw AppError.message("Temporary request failure")
-                }
-                return translated(input)
-            }, preview: { _, _ in })
-        try check(recoveredPreview.0.dialogues.map(\.location) == ["added", "first"],
-                  "a failed optional preview leaves all verified dialogue translatable")
-
-        let correctionStarted = DispatchSemaphore(value: 0), releaseCorrection = DispatchSemaphore(value: 0)
-        let corrected = block("first", "訂正"), newest = block("first", "最終訂正")
-        var correctionBatches: [[String]] = [], correctionPreviews: [PageTranslation] = []
-        var correctionBoundary = 0
-        let correction = try TranslationPipeline.run(runner: CommandRunner(), recognize: { ready in
-            ready(page([initial]))
-            try wait(correctionStarted, "old text streams before OCR correction")
-            lock.lock(); correctionBoundary = correctionPreviews.count; lock.unlock()
-            ready(page([corrected]))
-            ready(page([newest, added]))
-            releaseCorrection.signal()
-            return page([newest, added])
-        }, translate: { input, preview in
-            lock.lock(); correctionBatches.append(input.blocks.map(\.text)); let index = correctionBatches.count; lock.unlock()
-            let value = translated(input)
-            if index == 1 {
-                preview(value); correctionStarted.signal()
-                try wait(releaseCorrection, "correction releases old request")
-                preview(value)
-            }
-            return value
-        }, preview: { value, _ in lock.lock(); correctionPreviews.append(value); lock.unlock() })
-        try check(correctionBatches == [["早い"], ["最終訂正", "後から"]], "a source revision translates once while superseded queued OCR is discarded")
-        try check(correctionPreviews.dropFirst(correctionBoundary).first?.dialogues.isEmpty == true,
-                  "changed OCR retracts the old overlay before replacement text returns")
-        try check(correctionPreviews.dropFirst(correctionBoundary).allSatisfy { !$0.dialogues.contains { $0.original == initial.text } },
-                  "late preview and final callbacks cannot restore superseded source text")
-        try check(correction.0.dialogues.map(\.original) == [newest.text, added.text], "final contains only current source revisions")
-
-        let uncertainStarted = DispatchSemaphore(value: 0), releaseUncertain = DispatchSemaphore(value: 0)
-        var uncertain = initial; uncertain.uncertainFragments = [initial.text]
-        var uncertaintyCalls = 0
-        let uncertainResult = try TranslationPipeline.run(runner: CommandRunner(), recognize: { ready in
-            ready(page([initial])); try wait(uncertainStarted, "initial certainty begins")
-            ready(page([uncertain])); releaseUncertain.signal(); return page([uncertain])
-        }, translate: { input, _ in
-            uncertaintyCalls += 1
-            if uncertaintyCalls == 1 { uncertainStarted.signal(); try wait(releaseUncertain, "uncertainty releases request") }
-            return PageTranslation(summary: "", dialogues: input.blocks.map {
-                Dialogue.recognized($0, text: $0.uncertainFragments == nil ? "确定译文" : "□")
-            }, notes: "")
-        }, preview: { _, _ in })
-        try check(uncertaintyCalls == 2 && uncertainResult.0.dialogues.first?.preserveOriginal == true,
-                  "changed confidence cannot inherit an apparently certain translation")
-
-        let removalReady = DispatchSemaphore(value: 0)
-        var removalPreviews: [PageTranslation] = [], removalCalls = 0
-        let removal = try TranslationPipeline.run(runner: CommandRunner(), recognize: { ready in
-            ready(page([initial])); try wait(removalReady, "early translation precedes removal")
-            return page([], skipped: 1)
-        }, translate: { input, preview in
-            removalCalls += 1; let value = translated(input); preview(value); removalReady.signal(); return value
-        }, preview: { value, _ in lock.lock(); removalPreviews.append(value); lock.unlock() })
-        try check(removalCalls == 1 && removal.0.dialogues.isEmpty && removal.0.ocrSkippedCount == 1,
-                  "an empty final OCR page discards early false detections without another request")
-        try check(removalPreviews.last?.dialogues.isEmpty == true, "a removed final bubble clears its early overlay")
-
-        var incompleteCalls = 0, incompletePreviews: [PageTranslation] = []
-        let incomplete = try TranslationPipeline.run(runner: CommandRunner(), recognize: { _ in page([initial, added]) }, translate: { input, preview in
-            incompleteCalls += 1; preview(translated(input))
-            return translated(page([initial]))
-        }, preview: { value, _ in incompletePreviews.append(value) })
-        try check(incompleteCalls == 1 && incomplete.0.untranslatedCount == 1, "an incomplete provider final does not start an unbounded retry loop")
-        try check(incompletePreviews.last?.dialogues.map(\.location) == [initial.id], "streaming text absent from provider final is withdrawn")
-
-        let cancelIncremental = CommandRunner(), cancelStarted = DispatchSemaphore(value: 0), cancelRelease = DispatchSemaphore(value: 0)
-        var cancelCalls = 0, latePreviews = 0
+        let startedChange = DispatchSemaphore(value: 0)
         do {
-            _ = try TranslationPipeline.run(runner: cancelIncremental, recognize: { ready in
-                ready(page([initial])); try wait(cancelStarted, "cancel test begins first batch")
-                ready(page([initial, added])); cancelIncremental.cancel(); cancelRelease.signal()
-                return page([initial, added])
-            }, translate: { input, preview in
-                cancelCalls += 1; cancelStarted.signal(); try wait(cancelRelease, "cancel releases network")
-                preview(translated(input)); return translated(input)
-            }, preview: { _, _ in latePreviews += 1 })
-            throw AppError.message("FAIL: incremental cancellation succeeded")
-        } catch is CancellationError {
-            try check(cancelCalls == 1 && latePreviews == 0, "cancellation stops both late previews and queued supplement requests")
+            _ = try TranslationPipeline.run(runner: CommandRunner(), recognize: { ready in
+                ready(whole)
+                try wait(startedChange, "validated text begins translation")
+                return page([block("first", "誤った別の原文"), second])
+            }, translate: { input, _, _ in
+                startedChange.signal(); return translated(input)
+            }, preview: { _, _, _ in })
+            throw AppError.message("FAIL: changed final text reused the old request")
+        } catch let error as AppError {
+            try check(error.localizedDescription.contains("叠层内容不一致"), "patch-only completion rejects unexpected changed text")
         }
-        var duplicateCalls = 0
+
+        var incompletePreviews: [PageTranslation] = []
+        let incomplete = try TranslationPipeline.run(runner: CommandRunner(),
+            recognize: { _ in whole },
+            translate: { input, _, preview in
+                preview(translated(input))
+                return translated(page([first]))
+            }, preview: { value, _, _ in incompletePreviews.append(value) })
+        try check(incomplete.translation.untranslatedCount == 1
+                    && incompletePreviews.last?.dialogues.map(\.location) == [first.id],
+                  "an omitted provider final withdraws its streaming result and leaves the page incomplete")
+
         do {
-            _ = try TranslationPipeline.run(runner: CommandRunner(), recognize: { _ in page([initial, initial]) }, translate: { input, _ in
-                duplicateCalls += 1; return translated(input)
-            }, preview: { _, _ in })
+            _ = try TranslationPipeline.run(runner: CommandRunner(), recognize: { _ in page([first, first]) },
+                translate: { _, _, _ in throw AppError.message("Should not start translating duplicate IDs") },
+                preview: { _, _, _ in })
             throw AppError.message("FAIL: duplicate OCR ids succeeded")
         } catch let error as AppError {
-            try check(duplicateCalls == 0 && error.localizedDescription.contains("重复气泡"), "duplicate final IDs fail before a network request")
+            try check(error.localizedDescription.contains("重复气泡"), "duplicate final IDs fail before a network request")
         }
-        var manual = Dialogue.recognized(block("first", "人工确认的原文"), text: "人工译文□")
+        var manual = Dialogue.recognized(block("first", "人工確認"), text: "手动译文□")
         manual.userEdited = true
-        var restored = Dialogue.recognized(added, text: "旧译文")
+        var restored = Dialogue.recognized(second, text: "旧译文")
         restored.preserveOriginal = true; restored.userRestoredOriginal = true
-        var absent = Dialogue.recognized(block("absent", "不在本页"), text: "不会注入")
+        var absent = Dialogue.recognized(block("absent", "別の頁"), text: "不在本页")
         absent.userEdited = true
-        var rawManual = initial; rawManual.uncertainFragments = [initial.text]
-        var rawRestored = added; rawRestored.replacementPNG = nil; rawRestored.replacementAllowed = false
-        let rawContext = page([rawManual, rawRestored, removed], skipped: 2)
-        let fixedContext = TranslationPipeline.applyingCorrections(rawContext, corrections: [manual, restored, absent])
-        try check(fixedContext.blocks.map(\.text) == [manual.original, restored.original, removed.text]
-                  && fixedContext.blocks[0].uncertainFragments == nil && fixedContext.skippedCount == 2,
-                  "manual source replaces OCR uncertainty in page context without adding absent IDs")
-        let shifted = DialogueBounds(x: 200, y: 300, width: 150, height: 180)
-        let finalManual = OCRBlock(id: initial.id, text: "Vision后来给出的原文", bounds: shifted,
-                                  replacementPNG: validPatch, replacementAllowed: true,
-                                  uncertainFragments: ["原文"])
-        let firstAutomatic = block("automatic-first", "自動一"), secondAutomatic = block("automatic-second", "自動二")
-        let manualStarted = DispatchSemaphore(value: 0), manualRelease = DispatchSemaphore(value: 0)
-        var manualBatches: [[String]] = [], manualPreviews: [PageTranslation] = []
-        let manualResult = try TranslationPipeline.run(runner: CommandRunner(), corrections: [manual, restored, absent], recognize: { ready in
-            ready(page([rawManual, rawRestored, firstAutomatic]))
-            try wait(manualStarted, "automatic supplement begins alongside manual bubbles")
-            ready(page([finalManual, rawRestored, firstAutomatic, secondAutomatic]))
-            manualRelease.signal()
-            return page([finalManual, rawRestored, firstAutomatic, secondAutomatic])
-        }, translate: { input, preview in
-            lock.lock(); manualBatches.append(input.blocks.map(\.id)); let index = manualBatches.count; lock.unlock()
-            if index == 1 {
-                manualStarted.signal(); try wait(manualRelease, "manual review releases supplement")
-            }
-            let result = translated(input); preview(result); return result
-        }, preview: { value, _ in lock.lock(); manualPreviews.append(value); lock.unlock() })
-        try check(manualBatches == [[firstAutomatic.id], [secondAutomatic.id]],
-                  "concurrent partial-page supplements never resend manually edited or restored bubbles")
-        let reboundManual = manualResult.0.dialogues.first { $0.location == initial.id }
-        try check(reboundManual?.original == manual.original && reboundManual?.translation == manual.translation
-                  && reboundManual?.userEdited == true && reboundManual?.uncertainRanges == manual.uncertainRanges,
-                  "later OCR and translation keep manual source, translation, flags and uncertainty ranges")
-        try check(reboundManual?.bounds?.x == shifted.x && reboundManual?.bounds?.height == shifted.height
-                  && reboundManual?.replacementPNG == finalManual.replacementPNG,
-                  "manual text binds newly recognized positions and repaired pixels")
-        try check(manualPreviews.first?.dialogues.first(where: { $0.location == added.id })?.userRestoredOriginal == true
-                  && manualResult.0.dialogues.first(where: { $0.location == added.id })?.preserveOriginal == true,
-                  "restore-original survives early snapshots even before a replacement patch exists")
-        try check(manualResult.0.dialogues.count == 4 && manualResult.0.untranslatedCount == 0
-                  && !manualResult.0.dialogues.contains(where: { $0.location == absent.location }),
-                  "supplements complete the page without injecting corrections for absent regions")
-        var manualOnlyRequests = 0
-        let manualOnly = try TranslationPipeline.run(runner: CommandRunner(), corrections: [manual], recognize: { _ in page([initial]) }, translate: { input, _ in
-            manualOnlyRequests += 1; return translated(input)
-        }, preview: { _, _ in })
-        try check(manualOnlyRequests == 0 && manualOnly.0.dialogues.first?.userEdited == true,
-                  "a page containing only manual corrections makes no network request")
-        let repairStarted = DispatchSemaphore(value: 0), releaseRepair = DispatchSemaphore(value: 0)
-        var unreadyManual = rawManual; unreadyManual.replacementPNG = nil; unreadyManual.replacementAllowed = false
-        var repairPreviews: [PageTranslation] = []
-        let repairedManual = try TranslationPipeline.run(runner: CommandRunner(), corrections: [manual], recognize: { ready in
-            ready(page([unreadyManual, firstAutomatic]))
-            try wait(repairStarted, "manual text waits for safe local repairs")
-            lock.lock(); let earlyManual = repairPreviews.first?.dialogues.first { $0.location == initial.id }; lock.unlock()
-            try check(earlyManual?.userEdited == true && earlyManual?.translation == manual.translation
-                      && earlyManual?.replacementAllowed == false,
-                      "unrepaired manual text remains in partial cache without erasing original artwork")
-            releaseRepair.signal(); return page([finalManual, firstAutomatic])
-        }, translate: { input, _ in
-            repairStarted.signal(); try wait(releaseRepair, "local repairs release supplement"); return translated(input)
-        }, preview: { value, _ in lock.lock(); repairPreviews.append(value); lock.unlock() })
-        try check(repairedManual.0.dialogues.first?.replacementAllowed == true
-                  && repairedManual.0.dialogues.first?.userEdited == true,
-                  "finished repairs restore manual rendering without losing edit metadata")
-        let emptyManual = try TranslationPipeline.run(runner: CommandRunner(), corrections: [manual], recognize: { ready in
-            ready(page([initial])); return page([])
-        }, translate: { _, _ in throw AppError.message("Manual region must not translate") }, preview: { _, _ in })
-        try check(emptyManual.0.dialogues.isEmpty, "a correction is removed when final OCR withdraws its region")
-        var cleanRequests = 0
-        let clean = try TranslationPipeline.run(runner: CommandRunner(), recognize: { _ in page([initial]) }, translate: { input, _ in
-            cleanRequests += 1; return translated(input)
-        }, preview: { _, _ in })
-        try check(cleanRequests == 1 && clean.0.dialogues.first?.userEdited != true
-                  && clean.0.dialogues.first?.original == initial.text,
-                  "an explicit new run without page corrections does not inherit manual edits")
+        let automatic = block("auto", "確認しました")
+        var manualDraft = first; manualDraft.replacementPNG = nil; manualDraft.replacementAllowed = false
+        let current = page([first, second, automatic])
+        let corrected = try TranslationPipeline.run(runner: CommandRunner(), corrections: [manual, restored, absent],
+            recognize: { ready in
+                ready(page([manualDraft, second, automatic])); return current
+            }, translate: { input, context, _ in
+                guard input.blocks.map(\.id) == ["auto"], context.blocks.first?.text == manual.original else {
+                    throw AppError.message("Invalid correction/context")
+                }
+                return translated(input)
+            }, preview: { _, _, _ in })
+        let rebound = corrected.translation.dialogues.first
+        try check(rebound?.original == manual.original && rebound?.translation == manual.translation
+                    && rebound?.replacementPNG == validPatch && rebound?.uncertainRanges == manual.uncertainRanges,
+                  "manual correction uses current pixels while preserving the edited text and uncertainty")
+        try check(corrected.translation.dialogues.count == 3
+                    && corrected.translation.dialogues[1].userRestoredOriginal == true,
+                  "restored originals stay visible and absent corrections cannot add a region")
+        let manualOnly = try TranslationPipeline.run(runner: CommandRunner(), corrections: [manual],
+            recognize: { _ in page([first]) },
+            translate: { _, _, _ in throw AppError.message("Manual regions do not need a request") },
+            preview: { _, _, _ in })
+        try check(manualOnly.timings.translationBatches == 0 && manualOnly.translation.dialogues.first?.userEdited == true,
+                  "a page containing only manual corrections completes locally")
+
         func scope(_ raw: String) -> ReadingScope { ReadingScope(windowID: 5, documentURL: URL(string: raw)!) }
         try check(scope("https://shonenjumpplus.com/episode/42?page=1#viewer") == scope("https://shonenjumpplus.com/episode/42?page=8"), "known episode pagination stays in scope")
         try check(scope("https://shonenjumpplus.com/episode/42") != scope("https://shonenjumpplus.com/episode/43"), "other episode pauses automatic reading")
         try check(scope("https://e-hentai.org/s/abc/123-1") == scope("https://e-hentai.org/s/xyz/123-20"), "gallery image keys do not break pagination")
+        try check(scope("https://exhentai.org/g/123/token/?p=1") == scope("https://exhentai.org/s/xyz/123-20"),
+                  "opening an image after starting at gallery thumbnails keeps reading enabled")
+        try check(scope("https://e-hentai.org/g/123/token/") != scope("https://e-hentai.org/s/xyz/456-1"),
+                  "a different gallery remains outside the original reading session")
+        try check(scope("https://exhentai.org/g/123-invalid/token/") != scope("https://exhentai.org/s/xyz/123-1"),
+                  "a malformed gallery identifier cannot authorize another reader page")
         try check(scope("https://reader.example/?p=1") != scope("https://reader.example/?p=2"), "unknown query routes remain distinct")
         try check(scope("https://reader.example/#/one") != scope("https://reader.example/#/two"), "SPA fragment routes remain distinct")
         try check(!scope("https://reader.example/").accepts(windowID: 6, documentURL: URL(string: "https://reader.example/")), "another window cannot enter the reading session")

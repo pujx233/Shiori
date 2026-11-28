@@ -31,7 +31,7 @@ struct CancellationTests {
                 guard !Thread.isMainThread, let image = LocalOCR.visionPreparationImage() else { return }
                 let started = ProcessInfo.processInfo.systemUptime
                 let hints = LocalOCR.textHints(in: image)
-                guard hints.contains(where: { ($0["text"] as? String)?.contains("今日は晴れ") == true }) else { return }
+                guard hints?.contains(where: { ($0["text"] as? String)?.contains("今日は晴れ") == true }) == true else { return }
                 recognized.increment()
                 print("Vision preparation fixture smoke: Japanese recognized, seconds=\(ProcessInfo.processInfo.systemUptime - started)")
             }

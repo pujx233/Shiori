@@ -78,12 +78,12 @@ final class MangaOverlay {
         background.addSubview(peekLabel)
     }
 
-    func show(_ entry: CacheEntry, page: CapturedPage, windowID: CGWindowID, processID: pid_t, topInset: CGFloat) {
+    func show(_ entry: PageResult, page: CapturedPage, windowID: CGWindowID, processID: pid_t, topInset: CGFloat) {
         if selecting && (self.windowID != windowID || pageDigest != page.digest) { endCorrection() }
         if pageDigest != nil && pageDigest != page.digest { canvas.setCorrectionCandidates([]) }
         self.windowID = windowID; self.processID = processID; self.topInset = topInset
         pageDigest = page.digest
-        let identity = entry.id + String(entry.createdAt.timeIntervalSince1970)
+        let identity = entry.id
         if entryID != identity || contentRect != page.contentRect {
             let began = Date()
             sourceSize = page.displaySize

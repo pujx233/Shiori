@@ -50,9 +50,9 @@ final class ServicesPanel: NSWindowController, NSWindowDelegate {
         let help = NSTextField(wrappingLabelWithString: "首次安装约需 2 GB 空间。")
         help.isHidden = OCRInstallation.isReady
         help.font = .systemFont(ofSize: 11); help.textColor = .secondaryLabelColor; add(help)
-        heading("缓存")
+        heading("旧版缓存")
         storage.font = .systemFont(ofSize: 12); add(storage)
-        buttons([button("清理缓存", #selector(clearCache))])
+        buttons([button("清理旧版缓存", #selector(clearCache))])
         heading("更新")
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
         updateStatus.stringValue = "当前版本 \(version)"; updateStatus.font = .systemFont(ofSize: 12); add(updateStatus)

@@ -334,15 +334,51 @@ struct PageTracker {
     mutating func reset() { current = nil; candidate = nil; submitted = nil; isSettling = false }
 }
 
-struct CacheEntry: Codable {
-    let id: String
+enum PageProcessingState {
+    case translating, complete, interrupted
+}
+
+struct PageKey: Equatable {
+    let digest: String
+    let options: TranslationOptions
+}
+
+struct PageResult {
+    let id = UUID().uuidString
     let options: TranslationOptions
     let pageDigest: String
     let translation: PageTranslation
-    let createdAt: Date
     let elapsed: Double
     var timings: PageTimings? = nil
     var textOnly: Bool? = nil
+    var review: OCRReview = .complete
+    var state: PageProcessingState = .complete
+    var recognition: OCRPage? = nil
+
+    var isReusable: Bool {
+        state == .complete && review == .complete && translation.untranslatedCount == 0
+    }
+}
+
+// Each owner keeps at most its current and previous page. A failed attempt
+// never replaces a reusable result. Nothing in this store is written to disk.
+struct RecentPages<Key: Equatable, Value> {
+    private var pages: [(key: Key, value: Value)] = []
+
+    mutating func lookup(_ key: Key) -> Value? {
+        guard let index = pages.firstIndex(where: { $0.key == key }) else { return nil }
+        let found = pages.remove(at: index)
+        pages.append(found)
+        return found.value
+    }
+
+    mutating func store(_ value: Value, for key: Key) {
+        remove(key)
+        pages.append((key, value))
+        if pages.count > 2 { pages.removeFirst() }
+    }
+
+    mutating func remove(_ key: Key) { pages.removeAll { $0.key == key } }
 }
 
 struct PageTimings: Codable {
@@ -351,185 +387,95 @@ struct PageTimings: Codable {
     let firstResult: Double?
     var translationBatches: Int? = nil
     var ocrStages: OCRStageTimings? = nil
+    var ocrRegions: OCRRegionCounts? = nil
     var diagnosticState: [String: Any] {
         var values: [String: Any] = ["ocr": ocr, "codex": codex]
         if let firstResult { values["firstResult"] = firstResult }
         if let translationBatches { values["translationBatches"] = translationBatches }
+        if let ocrRegions { values["ocrRegions"] = ocrRegions.diagnosticState }
         if let stages = ocrStages {
             values["ocrStages"] = ["detection": stages.detection, "recognition": stages.recognition,
-                                    "verification": stages.verification, "visionWait": stages.visionWait]
+                                    "verification": stages.verification, "visionWait": stages.visionWait,
+                                    "patchWait": stages.patchWait ?? 0]
         }
         return values
     }
 }
 
-final class TranslationCache {
-    let directory: URL
-    private let manualDirectory: URL
-    private struct ManualEntry: Codable { let pageDigest: String; let context: String; let dialogues: [Dialogue] }
-
-    init(directory: URL) throws {
-        self.directory = directory
-        manualDirectory = directory.deletingLastPathComponent().appendingPathComponent("Corrections")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        try FileManager.default.createDirectory(at: manualDirectory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        let marker = manualDirectory.appendingPathComponent(".migrated-v1")
-        if !FileManager.default.fileExists(atPath: marker.path) {
-            let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-            let entries = files.filter { $0.pathExtension == "json" }.compactMap { file -> CacheEntry? in
-                guard let data = try? Data(contentsOf: file) else { return nil }
-                return try? JSONDecoder().decode(CacheEntry.self, from: data)
-            }.sorted { $0.createdAt < $1.createdAt }
-            for entry in entries {
-                let manual = entry.translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true }.map { dialogue -> Dialogue in
-                    var value = dialogue; value.replacementPNG = nil; value.correctionEngine = "legacy"; return value
-                }
-                if !manual.isEmpty {
-                    let file = manualFile(entry.pageDigest, entry.options.context)
-                    let previous = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(ManualEntry.self, from: $0) }
-                    let latest = Set(manual.map(\.location))
-                    let merged = (previous?.dialogues ?? []).filter { !latest.contains($0.location) } + manual
-                    let record = ManualEntry(pageDigest: entry.pageDigest, context: entry.options.context, dialogues: merged)
-                    try JSONEncoder().encode(record).write(to: file, options: .atomic)
-                }
-            }
-            try Data().write(to: marker, options: .atomic)
-        }
-        CacheFiles.trim(directory, maxBytes: 120 * 1024 * 1024)
-    }
-
-    func lookup(page: CapturedPage, options: TranslationOptions) -> CacheEntry? {
-        let key = Self.key(page.digest, options)
-        let file = directory.appendingPathComponent(key + ".json")
-        guard let data = try? Data(contentsOf: file),
-              let entry = try? JSONDecoder().decode(CacheEntry.self, from: data),
-              entry.id == key, entry.pageDigest == page.digest, entry.options == options else { return nil }
-        CacheFiles.touch(file)
-        return entry
-    }
-
-    static func key(_ digest: String, _ options: TranslationOptions) -> String {
-        // Whole-page entries include OCR geometry and erasure patches. Rebuild
-        // those after an engine update while retaining independent text caches.
-        SHA256.hash(data: Data((digest + options.cacheNamespace + "|" + LocalOCR.engineVersion).utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
-    func save(page: CapturedPage, options: TranslationOptions, translation: PageTranslation, elapsed: Double,
-              timings: PageTimings? = nil, textOnly: Bool? = nil, persistManual: Bool = true) throws -> CacheEntry {
-        let entry = CacheEntry(id: Self.key(page.digest, options), options: options,
-                              pageDigest: page.digest, translation: translation, createdAt: Date(), elapsed: elapsed,
-                              timings: timings, textOnly: textOnly)
-        let data = try JSONEncoder().encode(entry)
-        try data.write(to: directory.appendingPathComponent(entry.id + ".json"), options: .atomic)
-        // Automatic recognition may omit a previously corrected bubble. Only
-        // explicit edits and undo replace the durable manual snapshot.
-        if persistManual {
-            let manual = translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true }.map { dialogue -> Dialogue in
-                var value = dialogue; value.replacementPNG = nil; value.correctionEngine = LocalOCR.engineVersion; return value
-            }
-            let manualURL = manualFile(page.digest, options.context)
-            if manual.isEmpty {
-                if FileManager.default.fileExists(atPath: manualURL.path) { try FileManager.default.removeItem(at: manualURL) }
-            } else {
-                let record = ManualEntry(pageDigest: page.digest, context: options.context, dialogues: manual)
-                try JSONEncoder().encode(record).write(to: manualURL, options: .atomic)
-            }
-        }
-        CacheFiles.trim(directory, maxBytes: 120 * 1024 * 1024)
-        return entry
-    }
-    private func manualFile(_ digest: String, _ context: String) -> URL {
-        let key = SHA256.hash(data: Data((digest + "|" + context).utf8)).map { String(format: "%02x", $0) }.joined()
-        return manualDirectory.appendingPathComponent(key + ".json")
-    }
-    func manualCorrections(page: CapturedPage, options: TranslationOptions, legacyContext: String? = nil) -> [Dialogue] {
-        func read(_ context: String) -> [Dialogue]? {
-            guard let data = try? Data(contentsOf: manualFile(page.digest, context)),
-              let entry = try? JSONDecoder().decode(ManualEntry.self, from: data),
-                  entry.pageDigest == page.digest, entry.context == context else { return nil }
-            return entry.dialogues
-        }
-        return read(options.context) ?? legacyContext.flatMap(read) ?? []
-    }
+// Read old page files only for migration and explicit storage cleanup.
+struct LegacyPageResult: Codable {
+    let options: TranslationOptions
+    let pageDigest: String
+    let translation: PageTranslation
+    let createdAt: Date
 }
 
-// Image geometry and local erasure patches are never reused by the text cache.
-// An exact match of the whole ordered OCR input preserves the model's page context.
-struct TextTranslationCache: Sendable {
-    let directory: URL
-    private struct Entry: Codable {
-        let options: TranslationOptions
-        let sources: [String]
-        let translations: [String]
-        let notes: String
-    }
+final class CorrectionStore {
+    private let directory: URL
+    private struct Record: Codable { let pageDigest: String; let context: String; let dialogues: [Dialogue] }
 
-    init(directory: URL) throws {
-        self.directory = directory
+    init(root: URL) throws {
+        directory = root.appendingPathComponent("Corrections")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        CacheFiles.trim(directory, maxBytes: 8 * 1024 * 1024)
+        let marker = directory.appendingPathComponent(".migrated-v1")
+        guard !FileManager.default.fileExists(atPath: marker.path) else { return }
+        let legacy = root.appendingPathComponent("Translations")
+        let files = (try? FileManager.default.contentsOfDirectory(at: legacy, includingPropertiesForKeys: nil)) ?? []
+        let entries = files.filter { $0.pathExtension == "json" }.compactMap { file -> LegacyPageResult? in
+            guard let data = try? Data(contentsOf: file) else { return nil }
+            return try? JSONDecoder().decode(LegacyPageResult.self, from: data)
+        }.sorted { $0.createdAt < $1.createdAt }
+        for entry in entries {
+            let manual = entry.translation.dialogues.filter { $0.userEdited == true || $0.userRestoredOriginal == true }.map { dialogue in
+                var value = dialogue
+                value.correctionEngine = "legacy"
+                return value
+            }
+            guard !manual.isEmpty else { continue }
+            let context = entry.options.context
+            let latest = Set(manual.map(\.location))
+            let previous = read(entry.pageDigest, context: context) ?? []
+            try write(previous.filter { !latest.contains($0.location) } + manual,
+                      digest: entry.pageDigest, context: context)
+        }
+        try Data().write(to: marker, options: .atomic)
     }
 
-    private func file(_ ocr: OCRPage, _ options: TranslationOptions) -> URL {
-        // JSON array encoding preserves string boundaries, order and repeated dialogue.
-        let input = [[options.cacheNamespace]] + ocr.blocks.map { [$0.text, $0.translationKind ?? ""] + ($0.uncertainFragments ?? []) }
-        let data = try! JSONEncoder().encode(input)
-        let key = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    private func file(_ digest: String, context: String) -> URL {
+        let key = SHA256.hash(data: Data((digest + "|" + context).utf8)).map { String(format: "%02x", $0) }.joined()
         return directory.appendingPathComponent(key + ".json")
     }
 
-    func lookup(ocr: OCRPage, options: TranslationOptions) -> PageTranslation? {
-        let url = file(ocr, options)
-        guard !ocr.blocks.isEmpty, let data = try? Data(contentsOf: url),
-              let entry = try? JSONDecoder().decode(Entry.self, from: data), entry.options == options,
-              entry.sources == ocr.blocks.map(\.text), entry.translations.count == ocr.blocks.count,
-              entry.translations.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else { return nil }
-        CacheFiles.touch(url)
-        let dialogues = zip(ocr.blocks, entry.translations).map { Dialogue.recognized($0.0, text: $0.1) }
-        return PageTranslation(summary: "", dialogues: dialogues, notes: entry.notes,
-                               skippedCount: ocr.skippedCount, ocrSkippedCount: ocr.skippedCount)
+    private func read(_ digest: String, context: String) -> [Dialogue]? {
+        guard let data = try? Data(contentsOf: file(digest, context: context)),
+              let entry = try? JSONDecoder().decode(Record.self, from: data),
+              entry.pageDigest == digest, entry.context == context else { return nil }
+        return entry.dialogues
     }
 
-    func save(ocr: OCRPage, options: TranslationOptions, translation: PageTranslation) throws {
-        let dialogues = translation.dialogues
-        guard !ocr.blocks.isEmpty, dialogues.count == ocr.blocks.count,
-              Set(dialogues.map(\.location)).count == dialogues.count,
-              translation.skippedCount == ocr.skippedCount else { return }
-        let mapped = Dictionary(uniqueKeysWithValues: dialogues.map { ($0.location, $0) })
-        var texts: [String] = []
-        for block in ocr.blocks {
-            guard let dialogue = mapped[block.id], dialogue.original == block.text,
-                  !dialogue.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-            texts.append(dialogue.translation)
+    private func write(_ dialogues: [Dialogue], digest: String, context: String) throws {
+        let file = file(digest, context: context)
+        if dialogues.isEmpty {
+            if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            return
         }
-        let entry = Entry(options: options, sources: ocr.blocks.map(\.text), translations: texts, notes: translation.notes)
-        try JSONEncoder().encode(entry).write(to: file(ocr, options), options: .atomic)
-        CacheFiles.trim(directory, maxBytes: 8 * 1024 * 1024)
-    }
-}
-
-enum CacheFiles {
-    static func touch(_ file: URL) {
-        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
-    }
-
-    static func trim(_ directory: URL, maxBytes: Int, maxCount: Int = 300) {
-        let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
-        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys))) ?? []
-        let ordered = files.filter { $0.pathExtension == "json" }.compactMap { url -> (URL, Int, Date)? in
-            guard let values = try? url.resourceValues(forKeys: keys), values.isRegularFile == true,
-                  let bytes = values.fileSize else { return nil }
-            return (url, bytes, values.contentModificationDate ?? .distantPast)
-        }.sorted { $0.2 > $1.2 }
-        var bytes = 0, count = 0
-        for (url, size, _) in ordered {
-            if count < maxCount, bytes + size <= maxBytes {
-                count += 1; bytes += size
-            } else { try? FileManager.default.removeItem(at: url) }
+        let texts = dialogues.map { dialogue in
+            var value = dialogue
+            value.replacementPNG = nil
+            return value
         }
+        let entry = Record(pageDigest: digest, context: context, dialogues: texts)
+        try JSONEncoder().encode(entry).write(to: file, options: .atomic)
+    }
+
+    func corrections(for page: CapturedPage, options: TranslationOptions, legacyContext: String? = nil) -> [Dialogue] {
+        read(page.digest, context: options.context)
+            ?? legacyContext.flatMap { read(page.digest, context: $0) } ?? []
+    }
+
+    func save(_ dialogues: [Dialogue], for page: CapturedPage, options: TranslationOptions) throws {
+        try write(dialogues, digest: page.digest, context: options.context)
     }
 }
 
@@ -652,15 +598,11 @@ final class CodexClient: Sendable {
     let executable: URL
     let workspace: URL
     let resources: URL
-    let textCache: TextTranslationCache
     private let session: CodexSession
-    private let memory: ReadingMemory
+    private let memory = ReadingMemory()
 
-    init(resources: URL, workspace: URL, textCacheDirectory: URL? = nil,
-         shareReadingContextWith: CodexClient? = nil) throws {
+    init(resources: URL, workspace: URL) throws {
         self.resources = resources; self.workspace = workspace
-        memory = shareReadingContextWith?.memory ?? ReadingMemory()
-        textCache = try TextTranslationCache(directory: textCacheDirectory ?? workspace.appendingPathComponent("TextTranslations"))
         let choices = [
             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
@@ -690,27 +632,20 @@ final class CodexClient: Sendable {
         try session.models()
     }
 
-    func remember(page: PageTranslation, options: TranslationOptions, ocr: OCRPage? = nil) {
+    func remember(page: PageTranslation, options: TranslationOptions) {
         memory.remember(page, scope: options.readingScope)
-        if let ocr { try? textCache.save(ocr: ocr, options: options, translation: page) }
     }
 
-    func translate(ocr: OCRPage, options: TranslationOptions, runner: CommandRunner, force: Bool = false,
-                   seed: PageTranslation? = nil,
-                   rememberResult: Bool = true, pageContext: OCRPage? = nil, cacheResult: Bool = true,
+    func translate(ocr: OCRPage, options: TranslationOptions, runner: CommandRunner,
+                   seed: PageTranslation? = nil, pageContext: OCRPage? = nil,
                    progress: @escaping (String) -> Void = { _ in },
                    preview: ((PageTranslation) -> Void)? = nil) throws -> (PageTranslation, Double) {
         try runner.checkCancellation()
-        if cacheResult, !force, let cached = textCache.lookup(ocr: ocr, options: options) {
-            if rememberResult { memory.remember(cached, scope: options.readingScope) }
-            progress("正在回填…")
-            return (cached, 0)
-        }
         let instructions = try String(contentsOf: resources.appendingPathComponent("translator.txt"), encoding: .utf8)
         let baseSchema = try JSONSerialization.jsonObject(with: Data(contentsOf: resources.appendingPathComponent("translation.schema.json"))) as! [String: Any]
         let began = Date()
         var accepted: [String: Dialogue] = [:], notes = ""
-        if !force, let seed {
+        if let seed {
             for block in ocr.blocks {
                 if let old = seed.dialogues.first(where: { $0.location == block.id && $0.original == block.text }),
                    TranslationReply.usable(source: block.text, translated: old.translation) {
@@ -808,8 +743,6 @@ final class CodexClient: Sendable {
         }
         try runner.checkCancellation()
         let translation = page()
-        if cacheResult { try? textCache.save(ocr: ocr, options: options, translation: translation) }
-        if rememberResult { memory.remember(translation, scope: options.readingScope) }
         preview?(translation)
         return (translation, Date().timeIntervalSince(began))
     }

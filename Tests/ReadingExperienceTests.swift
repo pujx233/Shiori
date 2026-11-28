@@ -78,37 +78,34 @@ struct ReadingExperienceTests {
             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
         context.setFillColor(NSColor.white.cgColor); context.fill(CGRect(x: 0, y: 0, width: 200, height: 160))
         let page = try CapturedPage(image: context.makeImage()!)
-        let cache = try TranslationCache(directory: folder.appendingPathComponent("Translations"))
+        let corrections = try CorrectionStore(root: folder)
         manual.replacementPNG = Data([1, 2, 3])
-        _ = try cache.save(page: page, options: first, translation: PageTranslation(summary: "", dialogues: [manual], notes: ""), elapsed: 1)
-        let saved = cache.manualCorrections(page: page, options: first)
+        try corrections.save([manual], for: page, options: first)
+        let saved = corrections.corrections(for: page, options: first)
         try check(saved.count == 1 && saved[0].replacementPNG == nil, "durable manual corrections store text and location without duplicating image patches")
-        let imageCacheFile = cache.directory.appendingPathComponent(TranslationCache.key(page.digest, first) + ".json")
-        try FileManager.default.removeItem(at: imageCacheFile)
         var anotherModel = first; anotherModel.model = "another-model"
-        try check(cache.manualCorrections(page: page, options: anotherModel).first?.translation == "葵酱", "manual work survives image cache eviction and a model change")
-        _ = try cache.save(page: page, options: first, translation: PageTranslation(summary: "", dialogues: [], notes: "interrupted"), elapsed: 1, persistManual: false)
-        try check(cache.manualCorrections(page: page, options: first).first?.translation == "葵酱", "an interrupted retranslation cannot erase a durable correction omitted from its partial result")
-
+        let reopened = try CorrectionStore(root: folder)
+        try check(reopened.corrections(for: page, options: anotherModel).first?.translation == "葵酱",
+                  "manual corrections survive relaunch independently of the selected model")
         let migration = folder.appendingPathComponent("migration/Translations")
         try FileManager.default.createDirectory(at: migration, withIntermediateDirectories: true)
         let newer = try BubbleCorrection.edited(manual, source: "葵", translation: "小葵")
         var second = Dialogue(location: "another-bubble", original: "先生", translation: "老师", bounds: bounds)
         second.userEdited = true
-        let newest = CacheEntry(id: "new", options: first, pageDigest: page.digest,
-            translation: PageTranslation(summary: "", dialogues: [newer], notes: ""), createdAt: Date(timeIntervalSince1970: 200), elapsed: 1)
-        let older = CacheEntry(id: "old", options: first, pageDigest: page.digest,
-            translation: PageTranslation(summary: "", dialogues: [manual, second], notes: ""), createdAt: Date(timeIntervalSince1970: 100), elapsed: 1)
+        let newest = LegacyPageResult(options: first, pageDigest: page.digest,
+            translation: PageTranslation(summary: "", dialogues: [newer], notes: ""), createdAt: Date(timeIntervalSince1970: 200))
+        let older = LegacyPageResult(options: first, pageDigest: page.digest,
+            translation: PageTranslation(summary: "", dialogues: [manual, second], notes: ""), createdAt: Date(timeIntervalSince1970: 100))
         try JSONEncoder().encode(newest).write(to: migration.appendingPathComponent("a.json"))
         try JSONEncoder().encode(older).write(to: migration.appendingPathComponent("b.json"))
-        let migrated = try TranslationCache(directory: migration).manualCorrections(page: page, options: first)
+        let migrated = try CorrectionStore(root: migration.deletingLastPathComponent()).corrections(for: page, options: first)
         try check(migrated.count == 2 && migrated.first(where: { $0.location == manual.location })?.translation == "小葵", "legacy migration preserves separate bubbles and uses the latest explicit correction regardless of file order")
 
         let block = OCRBlock(id: "new-detector-id", text: "葵", bounds: bounds, replacementAllowed: false)
         var translated = false
         let rebound = try TranslationPipeline.run(runner: CommandRunner(), corrections: saved, recognize: { _ in
             OCRPage(blocks: [block], skippedCount: 0, elapsed: 0)
-        }, translate: { _, _ in translated = true; return originalPage }, preview: { _, _ in })
+        }, translate: { _, _, _ in translated = true; return originalPage }, preview: { _, _, _ in })
         try check(!translated && rebound.0.dialogues.first?.location == block.id && rebound.0.dialogues.first?.translation == "葵酱", "detector ID changes rebind a manual correction to the same physical bubble without translating again")
         let elsewhere = OCRBlock(id: manual.location, text: "別の文字", bounds: DialogueBounds(x: 700, y: 100, width: 100, height: 100))
         var oldEngine = saved[0]; oldEngine.correctionEngine = "manga-ocr-18"
@@ -122,11 +119,11 @@ struct ReadingExperienceTests {
         let model = models.appendingPathComponent("model.bin"); try Data("model".utf8).write(to: model)
         _ = try AppCacheManager.clear(root: folder)
         try check(!FileManager.default.fileExists(atPath: recognition.appendingPathComponent("page.json").path), "storage cleanup removes generated recognition cache")
-        try check(FileManager.default.fileExists(atPath: model.path) && cache.manualCorrections(page: page, options: first).count == 1
+        try check(FileManager.default.fileExists(atPath: model.path) && corrections.corrections(for: page, options: first).count == 1
             && FileManager.default.fileExists(atPath: folder.appendingPathComponent("WorkProfiles.json").path), "cleanup preserves installed models, profiles and manual corrections")
 
-        _ = try cache.save(page: page, options: first, translation: originalPage, elapsed: 1)
-        try check(cache.manualCorrections(page: page, options: first).isEmpty, "explicit undo to the unedited snapshot removes only that page's manual archive")
+        try corrections.save([], for: page, options: first)
+        try check(corrections.corrections(for: page, options: first).isEmpty, "explicit undo to the unedited snapshot removes only that page's manual archive")
 
         try check(ReleaseVersion("v1.10.0")! > ReleaseVersion("1.9.9")! && ReleaseVersion("1.5")! == ReleaseVersion("1.5.0")!, "release versions compare numerically")
         try check(ReleaseVersion("1.5.0-beta") == nil && ReleaseVersion("../../1.5") == nil, "nonrelease versions cannot form an update package path")
